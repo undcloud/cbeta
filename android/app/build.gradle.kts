@@ -27,7 +27,9 @@ android {
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
-        versionName = flutter.versionName
+        // Displayed app version. pubspec.yaml requires a three-part version
+        // (1.0.0), so the public version name is set explicitly here.
+        versionName = "1.0"
     }
 
     buildTypes {
