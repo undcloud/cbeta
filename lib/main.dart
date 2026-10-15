@@ -15,6 +15,7 @@ import 'package:http/http.dart' as http;
 import 'package:icu_kit/icu_kit.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -423,15 +424,177 @@ Future<void> _showAbout(BuildContext context) {
   return showDialog<void>(
     context: context,
     builder: (context) => AlertDialog(
-      title: const Text('關於我們'),
-      content: const SizedBox(height: 100),
+      title: Text(_displayText('關於我們', context)),
+      content: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: 480,
+          maxHeight: MediaQuery.sizeOf(context).height * 0.68,
+        ),
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _AboutSection(
+                title: '專案介紹',
+                children: [
+                  Text(
+                    _displayText(
+                      '本 App 是一款基於 CBETA 提供的 API 開發的佛典閱讀與檢索應用程式，旨在為使用者提供便利的佛教經典瀏覽與查詢體驗。',
+                      context,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _displayText(
+                      '本專案為獨立開發的開源專案，非 CBETA Online 官方開發或維護之應用程式。',
+                      context,
+                    ),
+                  ),
+                ],
+              ),
+              _AboutSection(
+                title: '資料來源',
+                children: [
+                  _AboutLabelText(
+                    label: '經文與檢索資料來源：',
+                    value: '中華電子佛典協會（CBETA）相關資料服務及 API',
+                  ),
+                  const SizedBox(height: 8),
+                  _AboutLink(
+                    label: '資料服務：https://cbdata.dila.edu.tw/',
+                    url: 'https://cbdata.dila.edu.tw/',
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _displayText(
+                      '本 App 使用上述資料服務提供的 API，經文內容及相關資料的權利與使用規範，依原資料提供方的相關規定辦理。',
+                      context,
+                    ),
+                  ),
+                ],
+              ),
+              _AboutSection(
+                title: '開發資訊',
+                children: [
+                  _AboutLabelText(label: '開發者：', value: 'undcloud'),
+                  const SizedBox(height: 8),
+                  _AboutLink(
+                    label: '開源專案：https://github.com/undcloud/cbeta',
+                    url: 'https://github.com/undcloud/cbeta',
+                  ),
+                  const SizedBox(height: 8),
+                  Text(_displayText('歡迎前往 GitHub 查看原始碼、提出問題或提供改進建議。', context)),
+                ],
+              ),
+              _AboutSection(
+                title: '聯絡我們',
+                children: [
+                  Text(
+                    _displayText('如果您在使用過程中遇到問題，或有任何建議，歡迎透過微信聯絡我。', context),
+                  ),
+                  const SizedBox(height: 8),
+                  _AboutLabelText(label: '微信聯絡：', value: 'undcloud'),
+                ],
+              ),
+              _AboutSection(
+                title: '資料版本',
+                children: [
+                  Text(
+                    _displayText('CBETA 資料版本：請以實際使用的 API 所提供之資料版本為準。', context),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
       actions: [
-        const _ScriptDisplayButton(),
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('關閉'),
+          child: Text(_displayText('關閉', context)),
         ),
       ],
+    ),
+  );
+}
+
+class _AboutSection extends StatelessWidget {
+  const _AboutSection({required this.title, required this.children});
+
+  final String title;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 20),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          _displayText(title, context),
+          style: Theme.of(
+            context,
+          ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 8),
+        ...children,
+      ],
+    ),
+  );
+}
+
+class _AboutLabelText extends StatelessWidget {
+  const _AboutLabelText({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) => Text.rich(
+    TextSpan(
+      children: [
+        TextSpan(
+          text: _displayText(label, context),
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+        TextSpan(text: _displayText(value, context)),
+      ],
+    ),
+  );
+}
+
+class _AboutLink extends StatelessWidget {
+  const _AboutLink({required this.label, required this.url});
+
+  final String label;
+  final String url;
+
+  @override
+  Widget build(BuildContext context) => InkWell(
+    onTap: () async {
+      final messenger = ScaffoldMessenger.of(context);
+      try {
+        final opened = await launchUrl(
+          Uri.parse(url),
+          mode: LaunchMode.externalApplication,
+        );
+        if (!opened && context.mounted) {
+          messenger.showSnackBar(SnackBar(content: Text('無法開啟連結：$url')));
+        }
+      } catch (error) {
+        if (!context.mounted) return;
+        messenger.showSnackBar(SnackBar(content: Text('開啟連結失敗：$error')));
+      }
+    },
+    child: Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Text(
+        _displayText(label, context),
+        style: TextStyle(
+          color: Theme.of(context).colorScheme.primary,
+          decoration: TextDecoration.underline,
+        ),
+      ),
     ),
   );
 }
@@ -480,7 +643,6 @@ class _DisplaySettingsPanel extends StatelessWidget {
               trailing: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const _ScriptDisplayButton(),
                   IconButton(
                     tooltip: _displayText('關閉', context),
                     onPressed: () => Navigator.of(context).pop(),
@@ -6784,7 +6946,6 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       appBar: AppBar(
         title: const Text('選擇佛經'),
         backgroundColor: scriptureDisplaySettings.surfaceColor,
-        actions: const [_SettingsButton()],
         leading: IconButton(
           tooltip: _displayText('返回', context),
           onPressed: () {

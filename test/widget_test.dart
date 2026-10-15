@@ -834,6 +834,44 @@ void main() {
     );
   });
 
+  testWidgets('about dialog shows project, data source, and contact details', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await tester.pumpWidget(const CbetaSearchApp());
+    await tester.tap(find.text('關於我們'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('專案介紹'), findsOneWidget);
+    expect(find.text('資料來源'), findsOneWidget);
+    expect(find.text('開發資訊'), findsOneWidget);
+    expect(find.text('聯絡我們'), findsOneWidget);
+    expect(find.text('資料版本'), findsOneWidget);
+    expect(find.textContaining('非 CBETA Online 官方開發或維護之應用程式'), findsOneWidget);
+    expect(find.textContaining('https://cbdata.dila.edu.tw/'), findsOneWidget);
+    expect(
+      find.textContaining('https://github.com/undcloud/cbeta'),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.byTooltip('切換簡體／繁體'),
+      ),
+      findsNothing,
+    );
+    expect(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.byTooltip('切换简体／繁体'),
+      ),
+      findsNothing,
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+  });
+
   testWidgets('searches are saved and can be selected again', (tester) async {
     SharedPreferences.setMockInitialValues({});
     await scriptureDisplaySettings.load();
@@ -1328,6 +1366,13 @@ void main() {
       await tester.tap(find.byTooltip('選擇佛經'));
       await tester.pumpAndSettle();
       expect(find.text('選擇佛經'), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byType(AppBar).last,
+          matching: find.byTooltip('介面設定'),
+        ),
+        findsNothing,
+      );
       final firstOpenRequests = catalogRequests;
 
       await tester.tapAt(const Offset(700, 40));
@@ -2154,6 +2199,15 @@ void main() {
     expect(find.text('宣紙'), findsOneWidget);
     expect(find.text('顯示勘校'), findsOneWidget);
     expect(find.text('顯示首行'), findsOneWidget);
+    final settingsHeader = find.widgetWithText(ListTile, '介面設定');
+    expect(
+      find.descendant(of: settingsHeader, matching: find.byTooltip('切換簡體／繁體')),
+      findsNothing,
+    );
+    expect(
+      find.descendant(of: settingsHeader, matching: find.byTooltip('切换简体／繁体')),
+      findsNothing,
+    );
     await tester.scrollUntilVisible(
       find.text('更新離線經文'),
       200,
