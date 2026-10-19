@@ -4994,6 +4994,43 @@ String _catalogResultWorkId(Map<String, dynamic> result) {
   return match == null ? '' : '${match.group(1)}${match.group(2)}';
 }
 
+/// 取得作品的卷清單。
+///
+/// 多數作品以 `juan` 欄位提供卷資料；部分作品（例如印順法師著作等 Y 系列）
+/// 只提供 `mulu` 目錄樹，此時改由目錄樹依卷彙整出可讀取的卷。
+List<Map<String, dynamic>> _tocJuanEntries(Map<String, dynamic>? toc) {
+  final juans = (toc?['juan'] as List<dynamic>? ?? const [])
+      .whereType<Map<String, dynamic>>()
+      .toList();
+  if (juans.isNotEmpty) return juans;
+
+  void collect(List<dynamic> entries, Map<int, Map<String, dynamic>> byJuan) {
+    for (final entry in entries.whereType<Map<String, dynamic>>()) {
+      final juan = int.tryParse('${entry['juan'] ?? ''}');
+      final lb = '${entry['lb'] ?? ''}';
+      if (juan != null) {
+        final current = byJuan[juan];
+        if (current == null ||
+            (lb.isNotEmpty && lb.compareTo('${current['lb'] ?? ''}') < 0)) {
+          byJuan[juan] = {
+            'file': entry['file'],
+            'juan': juan,
+            'lb': entry['lb'],
+            'title': '第$juan卷',
+          };
+        }
+      }
+      collect(entry['children'] as List<dynamic>? ?? const [], byJuan);
+    }
+  }
+
+  final byJuan = <int, Map<String, dynamic>>{};
+  collect(toc?['mulu'] as List<dynamic>? ?? const [], byJuan);
+  return byJuan.values.toList()..sort(
+    (left, right) => (left['juan'] as int).compareTo(right['juan'] as int),
+  );
+}
+
 String _searchResultWorkId(ScriptureSearchResult result) {
   final passageWork = result.passages.firstOrNull?.work;
   if (passageWork != null && passageWork.isNotEmpty) return passageWork;
@@ -5121,9 +5158,7 @@ Future<ScripturePassage> _resolveWorkPassageOnline(
   final toc = (payload['results'] as List<dynamic>? ?? const [])
       .whereType<Map<String, dynamic>>()
       .firstOrNull;
-  final juans = (toc?['juan'] as List<dynamic>? ?? const [])
-      .whereType<Map<String, dynamic>>()
-      .toList();
+  final juans = _tocJuanEntries(toc);
   if (juans.isEmpty) throw const FormatException('此作品沒有可讀取的卷');
 
   final availableJuans =
@@ -7027,9 +7062,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       final result = (payload['results'] as List<dynamic>? ?? const [])
           .whereType<Map<String, dynamic>>()
           .firstOrNull;
-      final juans = (result?['juan'] as List<dynamic>? ?? const [])
-          .whereType<Map<String, dynamic>>()
-          .toList();
+      final juans = _tocJuanEntries(result);
       if (juans.isEmpty) throw FormatException('此作品沒有可讀取的卷');
       final availableJuans =
           juans
