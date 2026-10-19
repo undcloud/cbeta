@@ -931,6 +931,118 @@ void main() {
     }, () => client);
   });
 
+  testWidgets('offline search falls back to locally saved scriptures', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureVolumeStore.write(
+      const CachedScriptureVolume(
+        work: 'T0001',
+        juan: '1',
+        html:
+            '<div id="body">'
+            '<p class="juan">長阿含經卷第一</p>'
+            '<span class="lb" id="T01n0001_p0001a01"></span>'
+            '<span class="t">般若波羅蜜多心經</span>'
+            '</div>',
+      ),
+    );
+    final client = MockClient((request) async {
+      throw const SocketException('offline');
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(const CbetaSearchApp());
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField).first, '般若波羅蜜');
+      await tester.tap(find.byTooltip('搜尋經文'));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('離線模式'), findsWidgets);
+      expect(
+        find.text('般若波羅蜜多心經', findRichText: true),
+        findsOneWidget,
+      );
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+    }, () => client);
+  });
+
+  testWidgets('offline search shows local catalog matches separately', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureVolumeStore.write(
+      const CachedScriptureVolume(
+        work: 'T0001',
+        juan: '1',
+        html:
+            '<div id="body">'
+            '<p class="juan">長阿含經卷第一</p>'
+            '<span class="lb" id="T01n0001_p0001a01"></span>'
+            '<span class="t">正文內容</span>'
+            '</div>',
+      ),
+    );
+    final client = MockClient((request) async {
+      throw const SocketException('offline');
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(const CbetaSearchApp());
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField).first, '長阿含');
+      await tester.tap(find.byTooltip('搜尋經文'));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('離線模式'), findsWidgets);
+      expect(find.text('T0001 長阿含經'), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+    }, () => client);
+  });
+
+  testWidgets('offline Goto search opens a locally saved line', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureVolumeStore.write(
+      const CachedScriptureVolume(
+        work: 'T0001',
+        juan: '1',
+        html:
+            '<div id="body">'
+            '<span class="lb" id="T01n0001_p0001a01"></span>'
+            '<span class="t">離線行號經文</span>'
+            '</div>',
+      ),
+    );
+    final client = MockClient((request) async {
+      throw const SocketException('offline');
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(const CbetaSearchApp());
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField).first, 'T01n0001_p0001a01');
+      await tester.testTextInput.receiveAction(TextInputAction.search);
+      await tester.pumpAndSettle();
+
+      expect(find.text('離線行號經文', findRichText: true), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+    }, () => client);
+  });
+
   testWidgets('homepage Goto search opens a passage without keyword search', (
     tester,
   ) async {

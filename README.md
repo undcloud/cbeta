@@ -80,8 +80,3 @@ Copyright (C) 2026 undcloud
 
 CBETA 搜尋服務未開放瀏覽器跨域存取，因此搜尋目前僅能在桌面或行動版 App 使用，Flutter Web 版會顯示提示訊息。
 
-Linux 桌面版除 Flutter Linux toolchain 外，使用 ICU 原生排序時也需要與系統 Clang 版本相符的 LLVM linker 和工具集。在 Ubuntu 24.04／Clang 18 環境中可安裝：
-
-```sh
-sudo apt-get install lld-18 llvm-18
-```

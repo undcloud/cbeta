@@ -1254,9 +1254,10 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
   List<_ReaderBookmark> recentReadings = [];
   List<_ReaderBookmark> homeBookmarks = [];
   List<String> recentSearches = [];
-  bool showAllRecentReadings = false;
+  int recentReadingsVisibleCount = _initialRecentReadingsCount;
   bool showAllHomeBookmarks = false;
   bool aiMode = false;
+  bool offlineSearchActive = false;
 
   @override
   void initState() {
@@ -1369,6 +1370,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
       catalogSearchSucceeded = false;
       catalogSearchResults = const [];
       showAllCatalogResults = false;
+      offlineSearchActive = false;
       isLoading = true;
       isKeywordSearchPending = true;
       isCatalogSearchPending = true;
@@ -1394,6 +1396,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
       final batch = await _searchAllInOne(query, start: 0);
       if (!mounted || token != requestToken) return;
       setState(() {
+        offlineSearchActive = false;
         keywordSearchSucceeded = true;
         results = batch.results;
         nextStart = batch.nextStart;
@@ -1411,6 +1414,15 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
       });
     } catch (error) {
       if (!mounted || token != requestToken) return;
+      if (_isNetworkFailure(error)) {
+        await _applyOfflineKeywordResults(
+          query,
+          token,
+          start: 0,
+          replace: true,
+        );
+        return;
+      }
       setState(() => keywordSearchError = '全文搜尋失敗：$error');
     } finally {
       if (mounted && token == requestToken) {
@@ -1443,6 +1455,19 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
       });
     } catch (error) {
       if (!mounted || token != requestToken) return;
+      if (_isNetworkFailure(error)) {
+        // 離線時改以本地已儲存經卷的經名／作譯者查詢經目。
+        final matches = await _searchOfflineCatalog(query);
+        if (!mounted || token != requestToken) return;
+        setState(() {
+          offlineSearchActive = true;
+          catalogSearchSucceeded = true;
+          catalogSearchError = null;
+          catalogSearchResults = matches;
+          _prioritizeSearchResultsByCatalog();
+        });
+        return;
+      }
       setState(() => catalogSearchError = '經目查詢失敗：$error');
     } finally {
       if (mounted && token == requestToken) {
@@ -1456,6 +1481,34 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
         });
       }
     }
+  }
+
+  Future<void> _applyOfflineKeywordResults(
+    String query,
+    int token, {
+    required int start,
+    required bool replace,
+  }) async {
+    final batch = await _searchOfflineVolumes(query, start: start);
+    if (!mounted || token != requestToken) return;
+    setState(() {
+      offlineSearchActive = true;
+      keywordSearchSucceeded = true;
+      keywordSearchError = null;
+      results = replace ? batch.results : [...results, ...batch.results];
+      nextStart = batch.nextStart;
+      totalFound = batch.totalFound;
+      totalTermHits = batch.totalTermHits;
+      hasMore = nextStart < totalFound && batch.results.isNotEmpty;
+      _prioritizeSearchResultsByCatalog();
+      _FullTextSearchCache.remember(
+        query,
+        results: results,
+        nextStart: nextStart,
+        totalFound: totalFound,
+        totalTermHits: totalTermHits,
+      );
+    });
   }
 
   void _updateCombinedSearchError() {
@@ -1541,7 +1594,9 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
       loadMoreError = null;
     });
     try {
-      final batch = await _searchAllInOne(submittedQuery, start: nextStart);
+      final batch = offlineSearchActive
+          ? await _searchOfflineVolumes(submittedQuery, start: nextStart)
+          : await _searchAllInOne(submittedQuery, start: nextStart);
       if (!mounted || token != requestToken) return;
       setState(() {
         results = [...results, ...batch.results];
@@ -1561,6 +1616,18 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
       });
     } catch (error) {
       if (!mounted || token != requestToken) return;
+      if (!offlineSearchActive && _isNetworkFailure(error)) {
+        await _applyOfflineKeywordResults(
+          submittedQuery,
+          token,
+          start: 0,
+          replace: true,
+        );
+        if (mounted && token == requestToken) {
+          setState(() => isLoadingMore = false);
+        }
+        return;
+      }
       setState(() {
         loadMoreError = '載入更多結果失敗：$error';
         isLoadingMore = false;
@@ -1581,6 +1648,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
       catalogSearchError = null;
       keywordSearchSucceeded = false;
       catalogSearchSucceeded = false;
+      offlineSearchActive = false;
       isLoading = false;
       isKeywordSearchPending = false;
       isCatalogSearchPending = false;
@@ -1763,19 +1831,16 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
             _HomeHistorySection(
               title: '最近閱讀',
               icon: Icons.history_rounded,
-              items: recentReadings
-                  .take(showAllRecentReadings ? recentReadings.length : 5)
-                  .toList(),
+              items: recentReadings.take(recentReadingsVisibleCount).toList(),
               onTap: _openHistoryItem,
               onClear: _clearRecentReadingsAndOfflineScriptures,
-              onMore: recentReadings.length > 5
+              onMore: recentReadings.length > recentReadingsVisibleCount
                   ? () => setState(
-                      () => showAllRecentReadings = !showAllRecentReadings,
+                      () =>
+                          recentReadingsVisibleCount += _recentReadingsPageSize,
                     )
                   : null,
-              moreLabel: showAllRecentReadings
-                  ? '收起'
-                  : '顯示全部 (${recentReadings.length})',
+              moreLabel: '顯示全部 (${recentReadings.length})',
             ),
           if (homeBookmarks.isNotEmpty)
             _HomeHistorySection(
@@ -1875,7 +1940,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
 
     final catalogResultsToShow = showAllCatalogResults
         ? catalogSearchResults
-        : catalogSearchResults.take(5).toList();
+        : catalogSearchResults.take(2).toList();
     final partialWarning = _partialSearchWarning();
     final partialWarningWidgets = partialWarning == null
         ? const <Widget>[]
@@ -1896,9 +1961,10 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
           child: Padding(
             padding: const EdgeInsets.all(24),
             child: _NoResults(
-              message:
-                  '找不到「$submittedQuery」相關經文'
-                  '${partialWarning == null ? '' : '\n$partialWarning'}',
+              message: offlineSearchActive
+                  ? '離線模式下，本地已儲存的經目與經文中找不到「$submittedQuery」'
+                  : '找不到「$submittedQuery」相關經文'
+                        '${partialWarning == null ? '' : '\n$partialWarning'}',
             ),
           ),
         ),
@@ -1906,13 +1972,23 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
     }
 
     final children = <Widget>[
+      if (offlineSearchActive)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Text(
+            '目前為離線模式，顯示本地已儲存的經目與經文',
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF687671)),
+          ),
+        ),
       ...partialWarningWidgets,
       for (final match in catalogResultsToShow)
         _CatalogSearchMatch(
           result: match,
           onTap: () => _openCatalogSearchResult(match),
         ),
-      if (catalogSearchResults.length > 5)
+      if (catalogSearchResults.length > 2)
         Center(
           child: TextButton(
             onPressed: () =>
@@ -4955,6 +5031,19 @@ Future<ScripturePassage> _resolveGotoPassage(String input) async {
   if (!isCbetaGotoExpression(linehead)) {
     throw const FormatException('請輸入有效的 CBETA 行號或引文');
   }
+  try {
+    return await _resolveGotoPassageOnline(linehead);
+  } catch (error) {
+    if (_isNetworkFailure(error)) {
+      final local = await _resolveGotoPassageLocally(linehead);
+      if (local != null) return local;
+      throw FormatException('離線模式下，本地尚未儲存「$linehead」所在的經卷');
+    }
+    rethrow;
+  }
+}
+
+Future<ScripturePassage> _resolveGotoPassageOnline(String linehead) async {
   final response = await http
       .get(
         Uri.https('cbdata.dila.edu.tw', '/stable/juans/goto', {
@@ -4998,6 +5087,29 @@ Future<ScripturePassage> _resolveWorkPassage(
 }) async {
   final work = '${item['work'] ?? _catalogResultWorkId(item)}';
   if (work.isEmpty) throw const FormatException('經目資料缺少作品編號');
+  try {
+    return await _resolveWorkPassageOnline(
+      work,
+      item,
+      targetLinehead: targetLinehead,
+    );
+  } catch (error) {
+    if (_isNetworkFailure(error)) {
+      final local = await _localWorkPassage(
+        work,
+        targetLinehead: targetLinehead,
+      );
+      if (local != null) return local;
+    }
+    rethrow;
+  }
+}
+
+Future<ScripturePassage> _resolveWorkPassageOnline(
+  String work,
+  Map<String, dynamic> item, {
+  String? targetLinehead,
+}) async {
   final response = await http
       .get(Uri.https('cbdata.dila.edu.tw', '/stable/works/toc', {'work': work}))
       .timeout(const Duration(seconds: 20));
@@ -5136,6 +5248,273 @@ class _SearchBatch {
   final int nextStart;
   final int totalFound;
   final int totalTermHits;
+}
+
+/// 判斷錯誤是否來自網路連線不可用，而非遠端服務回傳的錯誤。
+bool _isNetworkFailure(Object error) =>
+    error is SocketException ||
+    error is TimeoutException ||
+    error is http.ClientException ||
+    error is HandshakeException;
+
+int _countOccurrences(String haystack, String needle) {
+  if (needle.isEmpty) return 0;
+  var count = 0;
+  var index = haystack.indexOf(needle);
+  while (index >= 0) {
+    count += 1;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
+/// 在無網路連線時，改以本地已儲存的離線經卷進行全文比對，
+/// 盡量沿用與線上搜尋相同的結果結構與分頁行為。
+Future<_SearchBatch> _searchOfflineVolumes(
+  String query, {
+  int start = 0,
+  int pageSize = 20,
+}) async {
+  final needle = query.trim().toLowerCase();
+  if (needle.isEmpty) {
+    return const _SearchBatch(
+      results: [],
+      nextStart: 0,
+      totalFound: 0,
+      totalTermHits: 0,
+    );
+  }
+  final volumes = await scriptureVolumeStore.list();
+  volumes.sort((left, right) {
+    final byWork = left.work.compareTo(right.work);
+    if (byWork != 0) return byWork;
+    return (int.tryParse(left.juan) ?? 0).compareTo(
+      int.tryParse(right.juan) ?? 0,
+    );
+  });
+  final workJuans = <String, Set<int>>{};
+  for (final volume in volumes) {
+    final juan = int.tryParse(volume.juan);
+    if (juan != null) {
+      workJuans.putIfAbsent(volume.work, () => <int>{}).add(juan);
+    }
+  }
+  final results = <ScriptureSearchResult>[];
+  var totalTermHits = 0;
+  for (final volume in volumes) {
+    final List<ScriptureLine> lines;
+    try {
+      lines = parseScriptureHtml(volume.html);
+    } catch (_) {
+      continue;
+    }
+    final title = _localWorkTitle(lines);
+    final juans = (workJuans[volume.work]?.toList() ?? <int>[])..sort();
+    final passages = <ScripturePassage>[];
+    for (final line in lines) {
+      if (line.role != ScriptureLineRole.regular) continue;
+      final text = line.text.replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (text.isEmpty) continue;
+      final lower = text.toLowerCase();
+      if (!lower.contains(needle)) continue;
+      totalTermHits += _countOccurrences(lower, needle);
+      final linehead = line.linehead;
+      final lineLabel = linehead == null ? '' : linehead.split('_p').last;
+      passages.add(
+        ScripturePassage(
+          title: title.isEmpty ? volume.work : title,
+          reference: [
+            '卷${volume.juan}',
+            if (lineLabel.isNotEmpty) lineLabel,
+          ].join(' · '),
+          text: text,
+          linehead: linehead,
+          juan: volume.juan,
+          work: volume.work,
+          availableJuans: juans,
+        ),
+      );
+    }
+    if (passages.isEmpty) continue;
+    results.add(
+      ScriptureSearchResult(
+        title: '${volume.work} ${title.isEmpty ? '（離線經文）' : title}'.trim(),
+        description: '離線經文 · 命中 ${passages.length} 處',
+        passages: passages,
+      ),
+    );
+  }
+  final page = results.skip(start).take(pageSize).toList();
+  return _SearchBatch(
+    results: page,
+    nextStart: start + page.length,
+    totalFound: results.length,
+    totalTermHits: totalTermHits,
+  );
+}
+
+List<ScriptureLine>? _tryParseLocalVolume(CachedScriptureVolume volume) {
+  try {
+    return parseScriptureHtml(volume.html);
+  } catch (_) {
+    return null;
+  }
+}
+
+({String title, String byline}) _localVolumeInfo(List<ScriptureLine> lines) {
+  String pick(ScriptureLineRole role) => lines
+      .firstWhere(
+        (line) => line.role == role && line.text.trim().isNotEmpty,
+        orElse: () => const ScriptureLine(text: ''),
+      )
+      .text
+      .trim();
+  return (
+    title: pick(ScriptureLineRole.volumeTitle),
+    byline: pick(ScriptureLineRole.byline),
+  );
+}
+
+/// 去掉卷名尾端的「卷…」字樣，取得作品名稱。
+String _localWorkTitle(List<ScriptureLine> lines) {
+  final title = _localVolumeInfo(lines).title;
+  final stripped = title
+      .replaceFirst(RegExp(r'卷[第]?[〇零一二三四五六七八九十百千兩0-9]+$'), '')
+      .trim();
+  return stripped.isEmpty ? title : stripped;
+}
+
+List<int> _cachedJuansForWork(
+  List<CachedScriptureVolume> volumes,
+  String work,
+) =>
+    volumes
+        .where((volume) => volume.work == work)
+        .map((volume) => int.tryParse(volume.juan))
+        .whereType<int>()
+        .toSet()
+        .toList()
+      ..sort();
+
+String _lineheadWorkId(String linehead) {
+  final match = RegExp(r'^([A-Z]+)\d+n(\d+)_p').firstMatch(linehead);
+  return match == null ? '' : '${match.group(1)}${match.group(2)}';
+}
+
+ScripturePassage _localPassage({
+  required String work,
+  required CachedScriptureVolume volume,
+  required List<ScriptureLine> lines,
+  required List<int> juans,
+  String? linehead,
+}) {
+  final title = _localWorkTitle(lines);
+  return ScripturePassage(
+    title: title.isEmpty ? work : title,
+    reference: '卷 ${volume.juan}',
+    text: '',
+    linehead: linehead,
+    juan: volume.juan,
+    work: work,
+    availableJuans: juans,
+  );
+}
+
+/// 以本地已儲存的離線經卷建立可開啟的經卷位置，
+/// 供離線經目點擊與 Goto 使用。
+Future<ScripturePassage?> _localWorkPassage(
+  String work, {
+  String? targetLinehead,
+}) async {
+  if (work.isEmpty) return null;
+  final volumes = await scriptureVolumeStore.list();
+  final workVolumes = volumes.where((volume) => volume.work == work).toList()
+    ..sort(
+      (left, right) => (int.tryParse(left.juan) ?? 0).compareTo(
+        int.tryParse(right.juan) ?? 0,
+      ),
+    );
+  if (workVolumes.isEmpty) return null;
+  final juans = _cachedJuansForWork(volumes, work);
+  if (targetLinehead != null) {
+    for (final volume in workVolumes) {
+      final lines = _tryParseLocalVolume(volume);
+      if (lines != null &&
+          lines.any((line) => line.linehead == targetLinehead)) {
+        return _localPassage(
+          work: work,
+          volume: volume,
+          lines: lines,
+          juans: juans,
+          linehead: targetLinehead,
+        );
+      }
+    }
+  }
+  final target = workVolumes.first;
+  final lines = _tryParseLocalVolume(target) ?? const <ScriptureLine>[];
+  return _localPassage(work: work, volume: target, lines: lines, juans: juans);
+}
+
+/// 離線時依行號在本地已儲存的經卷中尋找對應位置。
+Future<ScripturePassage?> _resolveGotoPassageLocally(String linehead) async {
+  final work = _lineheadWorkId(linehead);
+  if (work.isEmpty) return null;
+  final volumes = await scriptureVolumeStore.list();
+  for (final volume in volumes.where((volume) => volume.work == work)) {
+    final lines = _tryParseLocalVolume(volume);
+    if (lines == null || !lines.any((line) => line.linehead == linehead)) {
+      continue;
+    }
+    return _localPassage(
+      work: work,
+      volume: volume,
+      lines: lines,
+      juans: _cachedJuansForWork(volumes, work),
+      linehead: linehead,
+    );
+  }
+  return null;
+}
+
+/// 離線時以本地已儲存經卷的經名／作譯者進行經目查詢。
+Future<List<Map<String, dynamic>>> _searchOfflineCatalog(String query) async {
+  final needle = query.trim().toLowerCase();
+  if (needle.isEmpty) return const [];
+  final volumes = await scriptureVolumeStore.list();
+  final byWork = <String, List<CachedScriptureVolume>>{};
+  for (final volume in volumes) {
+    byWork
+        .putIfAbsent(volume.work, () => <CachedScriptureVolume>[])
+        .add(volume);
+  }
+  final results = <Map<String, dynamic>>[];
+  for (final entry in byWork.entries) {
+    final volume = entry.value.reduce(
+      (left, right) =>
+          (int.tryParse(left.juan) ?? 0) <= (int.tryParse(right.juan) ?? 0)
+          ? left
+          : right,
+    );
+    final lines = _tryParseLocalVolume(volume);
+    if (lines == null) continue;
+    final info = _localVolumeInfo(lines);
+    final title = _localWorkTitle(lines).isNotEmpty
+        ? _localWorkTitle(lines)
+        : entry.key;
+    final haystack = '$title ${info.byline} ${entry.key}'.toLowerCase();
+    if (!haystack.contains(needle)) continue;
+    results.add({
+      'work': entry.key,
+      'title': title,
+      if (info.byline.isNotEmpty) 'byline': info.byline,
+      'offline': true,
+    });
+  }
+  results.sort(
+    (left, right) => '${left['title']}'.compareTo('${right['title']}'),
+  );
+  return results;
 }
 
 Future<_SearchBatch> _fetchSearchBatch(String query, {int start = 0}) async {
@@ -5295,6 +5674,8 @@ const _readerBookmarksKey = 'reader_bookmarks';
 const _readingHistoryKey = 'reading_history';
 const _searchHistoryKey = 'search_history';
 const _maximumSearchHistory = 20;
+const _initialRecentReadingsCount = 3;
+const _recentReadingsPageSize = 20;
 
 Future<List<String>> _loadSearchHistory() async {
   final preferences = await SharedPreferences.getInstance();
@@ -5362,7 +5743,6 @@ Future<void> _recordRecentReading(ScripturePassage passage) async {
   final current = _ReaderBookmark.fromPassage(passage);
   history.removeWhere((item) => item.work == current.work);
   history.insert(0, current);
-  if (history.length > 20) history.removeRange(20, history.length);
   final preferences = await SharedPreferences.getInstance();
   final saved = await preferences.setString(
     _readingHistoryKey,
@@ -5521,6 +5901,7 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
   String? error;
   bool loading = false;
   bool loadingMore = false;
+  bool offlineMode = false;
   int nextStart = 0;
   int totalFound = 0;
   int totalTermHits = 0;
@@ -5567,6 +5948,7 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
       loading = true;
       loadingMore = false;
       error = null;
+      offlineMode = false;
       submittedQuery = query;
       results = const [];
       nextStart = 0;
@@ -5577,7 +5959,9 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
 
   Future<void> _loadPage(String query, int start) async {
     try {
-      final batch = await _fetchSearchBatch(query, start: start);
+      final batch = offlineMode
+          ? await _searchOfflineVolumes(query, start: start)
+          : await _fetchSearchBatch(query, start: start);
       if (!mounted) return;
       setState(() {
         results = [...results, ...batch.results];
@@ -5596,6 +5980,27 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
       });
     } catch (exception) {
       if (!mounted) return;
+      if (!offlineMode && _isNetworkFailure(exception)) {
+        final batch = await _searchOfflineVolumes(query, start: start);
+        if (!mounted) return;
+        setState(() {
+          offlineMode = true;
+          results = [...results, ...batch.results];
+          nextStart = batch.nextStart;
+          totalFound = batch.totalFound;
+          totalTermHits = batch.totalTermHits;
+          loading = false;
+          loadingMore = false;
+          _FullTextSearchCache.remember(
+            query,
+            results: results,
+            nextStart: nextStart,
+            totalFound: totalFound,
+            totalTermHits: totalTermHits,
+          );
+        });
+        return;
+      }
       setState(() {
         error = '全文搜尋失敗：$exception';
         loading = false;
@@ -5663,7 +6068,11 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
             child: Align(
               alignment: Alignment.centerLeft,
-              child: Text('「$submittedQuery」找到 $totalFound 筆'),
+              child: Text(
+                offlineMode
+                    ? '「$submittedQuery」離線模式，本地找到 $totalFound 筆'
+                    : '「$submittedQuery」找到 $totalFound 筆',
+              ),
             ),
           ),
         Expanded(
