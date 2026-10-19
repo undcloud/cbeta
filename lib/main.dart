@@ -2633,6 +2633,8 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
   final localSearchController = TextEditingController();
   final Map<String, Future<List<ScriptureLine>>> juanCache = {};
   bool didScrollToMatch = false;
+  int? _pendingScrollAnchorOffset;
+  double? _pendingScrollAnchorDelta;
   bool showSearchNavigation = true;
   bool showLocalSearch = false;
   String localSearchQuery = '';
@@ -2892,7 +2894,33 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
   }
 
   void _onDisplaySettingsChanged() {
-    if (mounted) setState(() => didScrollToMatch = false);
+    if (!mounted) return;
+    // 記錄目前視窗頂端所在的文字位置，讓簡繁轉換或字體調整後維持閱讀座標。
+    _captureReaderScrollAnchor();
+    setState(() => didScrollToMatch = false);
+  }
+
+  void _captureReaderScrollAnchor() {
+    if (!readerScrollController.hasClients) return;
+    final editable = _findRenderEditable(
+      scriptureTextKey.currentContext?.findRenderObject(),
+    );
+    final viewport = readerScrollController.position.context.storageContext
+        .findRenderObject();
+    if (editable is! RenderEditable || viewport is! RenderBox) return;
+    final viewportTop = viewport.localToGlobal(Offset.zero).dy;
+    final editableTopLeft = editable.localToGlobal(Offset.zero);
+    final globalY = viewportTop.clamp(
+      editableTopLeft.dy,
+      editableTopLeft.dy + editable.size.height,
+    );
+    final position = editable.getPositionForPoint(
+      Offset(editableTopLeft.dx + editable.size.width / 2, globalY),
+    );
+    final caretRect = editable.getLocalRectForCaret(position);
+    _pendingScrollAnchorOffset = position.offset;
+    _pendingScrollAnchorDelta =
+        editable.localToGlobal(caretRect.topLeft).dy - viewportTop;
   }
 
   void _onCachedScripturesUpdated() {
@@ -3239,6 +3267,48 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                               );
                               final viewportRenderObject = context
                                   .findRenderObject();
+                              final anchorOffset = _pendingScrollAnchorOffset;
+                              final anchorDelta = _pendingScrollAnchorDelta;
+                              _pendingScrollAnchorOffset = null;
+                              _pendingScrollAnchorDelta = null;
+                              if (anchorOffset != null &&
+                                  anchorDelta != null &&
+                                  renderObject is RenderEditable &&
+                                  viewportRenderObject is RenderBox) {
+                                final editableLength =
+                                    renderObject.text?.toPlainText().length ??
+                                    0;
+                                final caretRect = renderObject
+                                    .getLocalRectForCaret(
+                                      TextPosition(
+                                        offset: anchorOffset.clamp(
+                                          0,
+                                          editableLength,
+                                        ),
+                                      ),
+                                    );
+                                final caretY = renderObject
+                                    .localToGlobal(caretRect.topLeft)
+                                    .dy;
+                                final viewportTop = viewportRenderObject
+                                    .localToGlobal(Offset.zero)
+                                    .dy;
+                                didScrollToMatch = true;
+                                readerScrollController.jumpTo(
+                                  (readerScrollController.offset +
+                                          caretY -
+                                          viewportTop -
+                                          anchorDelta)
+                                      .clamp(
+                                        0.0,
+                                        readerScrollController
+                                            .position
+                                            .maxScrollExtent,
+                                      )
+                                      .toDouble(),
+                                );
+                                return;
+                              }
                               if (localSearchRange != null &&
                                   renderObject is RenderEditable &&
                                   viewportRenderObject is RenderBox) {
