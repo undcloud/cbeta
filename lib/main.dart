@@ -13,6 +13,8 @@ import 'package:html/dom.dart' as html_dom;
 import 'package:html/parser.dart' show parseFragment;
 import 'package:http/http.dart' as http;
 import 'package:icu_kit/icu_kit.dart';
+import 'package:open_filex/open_filex.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -27,6 +29,258 @@ Future<void> main() async {
 final scriptureDisplaySettings = ScriptureDisplaySettings();
 
 final scriptureCacheUpdates = ValueNotifier<Set<String>>({});
+
+const _giteeOwner = 'undclouds';
+const _giteeRepo = 'cbeta';
+
+/// Gitee 的 `latest` 別名會永遠指向最新發行版中同名的附件，
+/// 因此可作為固定不變的下載連結。
+const _giteeLatestDownloadBase =
+    'https://gitee.com/$_giteeOwner/$_giteeRepo/releases/download/latest';
+const _latestApkDownloadUrl =
+    '$_giteeLatestDownloadBase/app-arm64-v8a-release.apk';
+const _appUpdaterChannel = MethodChannel('xuefo/app_updater');
+const _pendingUpdatePathKey = 'pending_update_apk_path';
+const _pendingUpdateVersionKey = 'pending_update_version';
+
+enum _InstallPermissionAction { cancel, proceed, settings }
+
+class AppUpdateInfo {
+  const AppUpdateInfo({
+    required this.version,
+    required this.downloadUrl,
+    required this.releaseName,
+    required this.releaseNotes,
+  });
+  final String version;
+  final String downloadUrl;
+  final String releaseName;
+  final String releaseNotes;
+}
+
+/// 從 Gitee Releases API 取得最新版本資訊。
+Future<AppUpdateInfo?> _fetchLatestGiteeRelease({
+  List<String> preferredAbis = const [],
+}) async {
+  if (kIsWeb) return null;
+  final response = await http
+      .get(
+        Uri.https(
+          'gitee.com',
+          '/api/v5/repos/$_giteeOwner/$_giteeRepo/releases/latest',
+        ),
+      )
+      .timeout(const Duration(seconds: 15));
+  if (response.statusCode != 200) return null;
+  final payload =
+      jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
+  final version = '${payload['tag_name'] ?? ''}'.trim();
+  if (version.isEmpty) return null;
+  final apkAssets = (payload['assets'] as List<dynamic>? ?? const [])
+      .whereType<Map<String, dynamic>>()
+      .where((asset) => '${asset['name'] ?? ''}'.toLowerCase().endsWith('.apk'))
+      .toList();
+  if (apkAssets.isEmpty) return null;
+
+  Map<String, dynamic>? preferred;
+  final abiOrder = <String>[
+    ...preferredAbis,
+    ...const ['arm64-v8a', 'armeabi-v7a', 'x86_64'],
+  ];
+  for (final abi in abiOrder) {
+    for (final asset in apkAssets) {
+      if ('${asset['name']}'.contains(abi)) {
+        preferred = asset;
+        break;
+      }
+    }
+    if (preferred != null) break;
+  }
+  preferred ??= apkAssets.first;
+  final assetName = '${preferred['name'] ?? ''}'.trim();
+  final downloadUrl = assetName.isEmpty
+      ? '${preferred['browser_download_url'] ?? ''}'
+      : '$_giteeLatestDownloadBase/${Uri.encodeComponent(assetName)}';
+  if (downloadUrl.isEmpty) return null;
+  return AppUpdateInfo(
+    version: version,
+    downloadUrl: downloadUrl,
+    releaseName: '${payload['name'] ?? version}',
+    releaseNotes: '${payload['body'] ?? ''}',
+  );
+}
+
+/// 版本號比較：支援 `v1.2.3`、`1.2`、`1.0.0+4` 等格式，缺少的區段視為 0。
+bool isNewerVersion(String latest, String current) {
+  List<int> parts(String version) {
+    final normalized = version.trim().replaceFirst(RegExp(r'^[vV]'), '');
+    final core =
+        RegExp(r'^\d+(?:\.\d+)*').firstMatch(normalized)?.group(0) ?? '0';
+    return core.split('.').map((part) => int.tryParse(part) ?? 0).toList();
+  }
+
+  final latestParts = parts(latest);
+  final currentParts = parts(current);
+  final length = latestParts.length > currentParts.length
+      ? latestParts.length
+      : currentParts.length;
+  for (var index = 0; index < length; index++) {
+    final left = index < latestParts.length ? latestParts[index] : 0;
+    final right = index < currentParts.length ? currentParts[index] : 0;
+    if (left != right) return left > right;
+  }
+  return false;
+}
+
+/// Android 是否已允許本 App 安裝 APK（Android 8.0 以上需使用者授權）。
+Future<bool> _canInstallApk() async {
+  if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return false;
+  try {
+    return await _appUpdaterChannel.invokeMethod<bool>('canInstallPackages') ??
+        false;
+  } on PlatformException {
+    return false;
+  } on MissingPluginException {
+    return false;
+  }
+}
+
+Future<List<String>> _deviceAbis() async {
+  try {
+    final abis = await _appUpdaterChannel.invokeMethod<List<Object?>>(
+      'supportedAbis',
+    );
+    return abis?.whereType<String>().toList() ?? const [];
+  } on PlatformException {
+    return const [];
+  } on MissingPluginException {
+    return const [];
+  }
+}
+
+Future<void> _openInstallPermissionSettings() async {
+  if (kIsWeb) return;
+  try {
+    await _appUpdaterChannel.invokeMethod<void>(
+      'openInstallPermissionSettings',
+    );
+  } on PlatformException {
+    // 忽略：無法開啟設定頁時，使用者仍可自行前往系統設定。
+  } on MissingPluginException {
+    // 忽略：非 Android 平台沒有此通道。
+  }
+}
+
+/// 下載更新 APK 到暫存目錄，並回報下載進度（0.0–1.0）。
+Future<String> _downloadUpdateApk(
+  AppUpdateInfo info,
+  ValueNotifier<double?> progress,
+) async {
+  final tempDirectory = await getTemporaryDirectory();
+  final directory = Directory(
+    '${tempDirectory.path}${Platform.pathSeparator}cbeta_update',
+  );
+  if (await directory.exists()) {
+    await for (final entity in directory.list()) {
+      if (entity is File) {
+        try {
+          await entity.delete();
+        } catch (_) {
+          // 舊檔無法刪除時忽略，後續仍可寫入新檔。
+        }
+      }
+    }
+  } else {
+    await directory.create(recursive: true);
+  }
+  final file = File(
+    '${directory.path}${Platform.pathSeparator}cbeta-${info.version}.apk',
+  );
+  final client = http.Client();
+  IOSink? sink;
+  try {
+    final request = http.Request('GET', Uri.parse(info.downloadUrl));
+    final response = await client
+        .send(request)
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode != 200) {
+      throw Exception('下載失敗（HTTP ${response.statusCode}）');
+    }
+    final total = response.contentLength ?? 0;
+    var received = 0;
+    sink = file.openWrite();
+    await for (final chunk in response.stream) {
+      sink.add(chunk);
+      received += chunk.length;
+      if (total > 0) {
+        progress.value = (received / total).clamp(0.0, 1.0);
+      }
+    }
+    await sink.close();
+    sink = null;
+    progress.value = 1;
+    return file.path;
+  } catch (error) {
+    try {
+      await sink?.close();
+    } catch (_) {
+      // 忽略關閉串流時的次要錯誤。
+    }
+    try {
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // 忽略暫存檔刪除失敗。
+    }
+    rethrow;
+  } finally {
+    client.close();
+  }
+}
+
+class InstallPermissionRequiredException implements Exception {
+  const InstallPermissionRequiredException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+Future<void> _launchApkInstaller(String apkPath) async {
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+    try {
+      // 使用 PackageInstaller 工作階段，來源明確為本 App。
+      await _appUpdaterChannel.invokeMethod<void>('installApk', {
+        'path': apkPath,
+      });
+      return;
+    } on PlatformException catch (error) {
+      if (error.code == 'permission_denied') {
+        throw InstallPermissionRequiredException(error.message ?? '缺少安裝應用程式權限');
+      }
+      // 原生安裝失敗時改用 open_filex 作為後備。
+      try {
+        await _openApkWithFilex(apkPath);
+        return;
+      } catch (_) {
+        throw Exception(error.message ?? '無法啟動安裝程式');
+      }
+    } on MissingPluginException {
+      // 舊版原生端沒有 installApk，改用 open_filex。
+    }
+  }
+  await _openApkWithFilex(apkPath);
+}
+
+Future<void> _openApkWithFilex(String apkPath) async {
+  final result = await OpenFilex.open(
+    apkPath,
+    type: 'application/vnd.android.package-archive',
+  );
+  if (result.type != ResultType.done) {
+    throw Exception(result.message.isEmpty ? '無法啟動安裝程式' : result.message);
+  }
+}
 
 class CachedScriptureVolume {
   const CachedScriptureVolume({
@@ -453,27 +707,6 @@ Future<void> _showAbout(BuildContext context) {
                 ],
               ),
               _AboutSection(
-                title: '資料來源',
-                children: [
-                  _AboutLabelText(
-                    label: '經文與檢索資料來源：',
-                    value: '中華電子佛典協會（CBETA）相關資料服務及 API',
-                  ),
-                  const SizedBox(height: 8),
-                  _AboutLink(
-                    label: '資料服務：https://cbdata.dila.edu.tw/',
-                    url: 'https://cbdata.dila.edu.tw/',
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _displayText(
-                      '本 App 使用上述資料服務提供的 API，經文內容及相關資料的權利與使用規範，依原資料提供方的相關規定辦理。',
-                      context,
-                    ),
-                  ),
-                ],
-              ),
-              _AboutSection(
                 title: '開發資訊',
                 children: [
                   _AboutLabelText(label: '開發者：', value: 'undcloud'),
@@ -497,10 +730,44 @@ Future<void> _showAbout(BuildContext context) {
                 ],
               ),
               _AboutSection(
+                title: '下載最新版本',
+                children: [
+                  Text(
+                    _displayText('以下固定連結永遠指向最新版本的 APK（arm64-v8a）：', context),
+                  ),
+                  const SizedBox(height: 8),
+                  _AboutLink(
+                    label: _latestApkDownloadUrl,
+                    url: _latestApkDownloadUrl,
+                  ),
+                ],
+              ),
+              _AboutSection(
                 title: '資料版本',
                 children: [
                   Text(
                     _displayText('CBETA 資料版本：請以實際使用的 API 所提供之資料版本為準。', context),
+                  ),
+                ],
+              ),
+              _AboutSection(
+                title: '資料來源',
+                children: [
+                  _AboutLabelText(
+                    label: '經文與檢索資料來源：',
+                    value: '中華電子佛典協會（CBETA）相關資料服務及 API',
+                  ),
+                  const SizedBox(height: 8),
+                  _AboutLink(
+                    label: '資料服務：https://cbdata.dila.edu.tw/',
+                    url: 'https://cbdata.dila.edu.tw/',
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _displayText(
+                      '本 App 使用上述資料服務提供的 API，經文內容及相關資料的權利與使用規範，依原資料提供方的相關規定辦理。',
+                      context,
+                    ),
                   ),
                 ],
               ),
@@ -509,6 +776,19 @@ Future<void> _showAbout(BuildContext context) {
         ),
       ),
       actions: [
+        TextButton.icon(
+          onPressed: () async {
+            await Clipboard.setData(
+              ClipboardData(text: _aboutIntroductionText()),
+            );
+            if (!context.mounted) return;
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(const SnackBar(content: Text('已複製介紹')));
+          },
+          icon: const Icon(Icons.copy_rounded, size: 18),
+          label: Text(_displayText('複製', context)),
+        ),
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
           child: Text(_displayText('關閉', context)),
@@ -517,6 +797,20 @@ Future<void> _showAbout(BuildContext context) {
     ),
   );
 }
+
+String _aboutIntroductionText() => [
+  'CBETA 經典全文搜尋 Flutter App',
+  '',
+  '本 App 是一款基於 CBETA 提供的 API 開發的佛典閱讀與檢索應用程式，旨在為使用者提供便利的佛教經典瀏覽與查詢體驗。',
+  '本專案為獨立開發的開源專案，非 CBETA Online 官方開發或維護之應用程式。',
+  '',
+  '開發者：undcloud',
+  '開源專案：https://github.com/undcloud/cbeta',
+  '微信聯絡：undcloud',
+  '',
+  '下載最新版本：',
+  _latestApkDownloadUrl,
+].join('\n');
 
 class _AboutSection extends StatelessWidget {
   const _AboutSection({required this.title, required this.children});
@@ -785,6 +1079,7 @@ class _DisplaySettingsPanel extends StatelessWidget {
                     trailing: const Icon(Icons.chevron_right_rounded),
                     onTap: onAbout,
                   ),
+                  const _AppVersionLabel(),
                 ],
               ),
             ),
@@ -793,6 +1088,51 @@ class _DisplaySettingsPanel extends StatelessWidget {
       ),
     );
   }
+}
+
+class _AppVersionLabel extends StatefulWidget {
+  const _AppVersionLabel();
+
+  @override
+  State<_AppVersionLabel> createState() => _AppVersionLabelState();
+}
+
+class _AppVersionLabelState extends State<_AppVersionLabel> {
+  String? _version;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadVersion());
+  }
+
+  Future<void> _loadVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      if (!mounted) return;
+      setState(() {
+        _version = info.buildNumber.isEmpty
+            ? info.version
+            : '${info.version}（${info.buildNumber}）';
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _version = '未知');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(top: 16, bottom: 8),
+    child: Center(
+      child: Text(
+        _displayText('目前版本：${_version ?? '載入中…'}', context),
+        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+          color: Theme.of(context).colorScheme.onSurfaceVariant,
+        ),
+      ),
+    ),
+  );
 }
 
 class _SettingLabel extends StatelessWidget {
@@ -1229,7 +1569,8 @@ class ScriptureSearchPage extends StatefulWidget {
   State<ScriptureSearchPage> createState() => _ScriptureSearchPageState();
 }
 
-class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
+class _ScriptureSearchPageState extends State<ScriptureSearchPage>
+    with WidgetsBindingObserver {
   final searchController = TextEditingController();
   final resultsScrollController = ScrollController();
   String submittedQuery = '';
@@ -1258,13 +1599,348 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
   bool showAllHomeBookmarks = false;
   bool aiMode = false;
   bool offlineSearchActive = false;
+  AppUpdateInfo? _availableUpdate;
+  String _currentVersion = '';
+  bool _isUpdating = false;
+  bool _awaitingInstallPermission = false;
+  bool _installLaunched = false;
+  String? _pendingInstallApkPath;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     scriptureDisplaySettings.addListener(_onDisplaySettingsChanged);
     resultsScrollController.addListener(_onResultsScroll);
     _loadHomeSections();
+    unawaited(_checkForAppUpdate());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) {
+      return;
+    }
+    final apkPath = _pendingInstallApkPath;
+    if (_awaitingInstallPermission) {
+      _awaitingInstallPermission = false;
+      if (apkPath == null) return;
+      // 給予系統一點時間處理設定頁返回，再自動繼續安裝。
+      unawaited(
+        Future<void>.delayed(const Duration(milliseconds: 400), () async {
+          if (!mounted) return;
+          if (!await File(apkPath).exists()) {
+            await _showUpdateError('安裝失敗', '更新檔案已不存在，請重新下載');
+            return;
+          }
+          if (await _canInstallApk()) {
+            await _launchInstallerSafely(apkPath);
+          } else {
+            // 設定尚未生效時再次顯示權限指引。
+            await _installDownloadedApk(apkPath);
+          }
+        }),
+      );
+      return;
+    }
+    if (_installLaunched) {
+      _installLaunched = false;
+      if (apkPath == null) return;
+      unawaited(_promptRetryInstall(apkPath));
+    }
+  }
+
+  Future<void> _promptRetryInstall(String apkPath) async {
+    if (!mounted || !await File(apkPath).exists()) return;
+    if (!mounted) return;
+    final retry = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('安裝尚未完成'),
+        content: const Text('是否再次開啟系統安裝程式？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('稍後'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('再次安裝'),
+          ),
+        ],
+      ),
+    );
+    if (retry == true) {
+      await _launchInstallerSafely(apkPath);
+    }
+  }
+
+  Future<void> _checkForAppUpdate() async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    try {
+      final packageInfo = await PackageInfo.fromPlatform();
+      final info = await _fetchLatestGiteeRelease(
+        preferredAbis: await _deviceAbis(),
+      );
+      final hasUpdate =
+          info != null && isNewerVersion(info.version, packageInfo.version);
+      final pendingPath = hasUpdate
+          ? await _restorePendingUpdateApk(info.version)
+          : null;
+      if (!hasUpdate) {
+        await _clearPendingUpdate();
+      }
+      if (!mounted) return;
+      setState(() {
+        _currentVersion = packageInfo.version;
+        _availableUpdate = hasUpdate ? info : null;
+        _pendingInstallApkPath = pendingPath;
+      });
+    } catch (_) {
+      // 檢查更新失敗時保持安靜，避免影響正常使用。
+    }
+  }
+
+  Future<String?> _restorePendingUpdateApk(String version) async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      if (preferences.getString(_pendingUpdateVersionKey) != version) {
+        return null;
+      }
+      final path = preferences.getString(_pendingUpdatePathKey);
+      if (path == null) return null;
+      return await File(path).exists() ? path : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _rememberPendingUpdate(String apkPath, String version) async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.setString(_pendingUpdatePathKey, apkPath);
+      await preferences.setString(_pendingUpdateVersionKey, version);
+    } catch (_) {
+      // 無法記住下載位置時，本次仍可直接安裝。
+    }
+  }
+
+  Future<void> _clearPendingUpdate() async {
+    _pendingInstallApkPath = null;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final path = preferences.getString(_pendingUpdatePathKey);
+      await preferences.remove(_pendingUpdatePathKey);
+      await preferences.remove(_pendingUpdateVersionKey);
+      if (path != null) {
+        final file = File(path);
+        if (await file.exists()) await file.delete();
+      }
+    } catch (_) {
+      // 忽略清理暫存檔失敗。
+    }
+  }
+
+  Future<void> _promptForAppUpdate() async {
+    final info = _availableUpdate;
+    if (info == null || _isUpdating) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('發現新版本 ${info.version}'),
+        content: Text(
+          '目前版本：${_currentVersion.isEmpty ? '未知' : _currentVersion}\n\n'
+          '將從 Gitee 下載最新 APK 並覆蓋安裝，'
+          '已下載的經文與偏好設定都會保留。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('稍後'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('立即更新'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await _performAppUpdate(info);
+  }
+
+  Future<void> _performAppUpdate(AppUpdateInfo info) async {
+    if (_isUpdating || !mounted) return;
+
+    // 若先前已下載同一版本，直接沿用，避免重複下載。
+    final cachedApk =
+        _pendingInstallApkPath ?? await _restorePendingUpdateApk(info.version);
+    if (cachedApk != null && await File(cachedApk).exists()) {
+      _pendingInstallApkPath = cachedApk;
+      await _installDownloadedApk(cachedApk);
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() => _isUpdating = true);
+    final progress = ValueNotifier<double?>(null);
+    final navigator = Navigator.of(context, rootNavigator: true);
+    var dialogOpen = true;
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) =>
+            _UpdateProgressDialog(progress: progress, version: info.version),
+      ),
+    );
+
+    final String apkPath;
+    try {
+      apkPath = await _downloadUpdateApk(info, progress);
+    } catch (error) {
+      if (dialogOpen && navigator.canPop()) {
+        navigator.pop();
+        dialogOpen = false;
+      }
+      if (mounted) {
+        setState(() => _isUpdating = false);
+        await _showUpdateError('下載失敗', error);
+      }
+      return;
+    }
+
+    if (dialogOpen && navigator.canPop()) {
+      navigator.pop();
+      dialogOpen = false;
+    }
+    _pendingInstallApkPath = apkPath;
+    await _rememberPendingUpdate(apkPath, info.version);
+    if (!mounted) return;
+    setState(() => _isUpdating = false);
+    await _installDownloadedApk(apkPath);
+  }
+
+  Future<void> _installDownloadedApk(String apkPath) async {
+    _pendingInstallApkPath = apkPath;
+    if (await _canInstallApk()) {
+      await _launchInstallerSafely(apkPath);
+      return;
+    }
+    if (!mounted) return;
+    final action = await showDialog<_InstallPermissionAction>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('需要安裝權限'),
+        content: const Text(
+          '系統目前未允許「CBETA」安裝應用程式。\n\n'
+          '請點「前往設定」，確認設定頁上方顯示的是「CBETA」，'
+          '並開啟「允許安裝未知應用程式」。\n\n'
+          '如果該頁顯示 CBETA 已經允許，可選「仍然嘗試安裝」。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, _InstallPermissionAction.cancel),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, _InstallPermissionAction.proceed),
+            child: const Text('仍然嘗試'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, _InstallPermissionAction.settings),
+            child: const Text('前往設定'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    switch (action) {
+      case _InstallPermissionAction.settings:
+        _awaitingInstallPermission = true;
+        await _openInstallPermissionSettings();
+      case _InstallPermissionAction.proceed:
+        await _launchInstallerSafely(apkPath);
+      case _InstallPermissionAction.cancel:
+      case null:
+        break;
+    }
+  }
+
+  Future<void> _launchInstallerSafely(String apkPath) async {
+    try {
+      await _launchApkInstaller(apkPath);
+      _installLaunched = true;
+    } on InstallPermissionRequiredException catch (error) {
+      if (!mounted) return;
+      final openSettings = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('需要安裝權限'),
+          content: Text(
+            '${error.message}\n\n請在系統設定中允許「CBETA」安裝未知來源的應用程式，'
+            '返回 App 後會自動繼續安裝。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('前往設定'),
+            ),
+          ],
+        ),
+      );
+      if (openSettings == true) {
+        _awaitingInstallPermission = true;
+        await _openInstallPermissionSettings();
+      }
+    } catch (error) {
+      if (!mounted) return;
+      final openSettings = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('無法啟動安裝'),
+          content: Text('$error\n\n若系統不允許安裝，請開啟「安裝未知應用程式」權限後再試一次。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('前往設定'),
+            ),
+          ],
+        ),
+      );
+      if (openSettings == true) {
+        _awaitingInstallPermission = true;
+        await _openInstallPermissionSettings();
+      }
+    }
+  }
+
+  Future<void> _showUpdateError(String title, Object error) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: Text('$error'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _onDisplaySettingsChanged() {
@@ -1667,6 +2343,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     scriptureDisplaySettings.removeListener(_onDisplaySettingsChanged);
     searchController.dispose();
     resultsScrollController
@@ -1699,6 +2376,8 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage> {
           ],
           title: _HomeBrand(
             onTap: submittedQuery.isEmpty ? () {} : clearSearch,
+            showUpdateButton: _availableUpdate != null,
+            onUpdate: _promptForAppUpdate,
           ),
         ),
         body: SafeArea(
@@ -2143,10 +2822,17 @@ class _HomeHistorySection extends StatelessWidget {
 }
 
 class _HomeBrand extends StatelessWidget {
-  const _HomeBrand({required this.onTap, this.color});
+  const _HomeBrand({
+    required this.onTap,
+    this.color,
+    this.showUpdateButton = false,
+    this.onUpdate,
+  });
 
   final VoidCallback onTap;
   final Color? color;
+  final bool showUpdateButton;
+  final VoidCallback? onUpdate;
 
   @override
   Widget build(BuildContext context) => GestureDetector(
@@ -2172,6 +2858,52 @@ class _HomeBrand extends StatelessWidget {
               ),
               overflow: TextOverflow.ellipsis,
             ),
+          ),
+          if (showUpdateButton && onUpdate != null) ...[
+            const SizedBox(width: 8),
+            TextButton(
+              onPressed: onUpdate,
+              style: TextButton.styleFrom(
+                minimumSize: const Size(0, 28),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                backgroundColor: const Color(0xFF176B67),
+                foregroundColor: Colors.white,
+                textStyle: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              child: const Text('更新'),
+            ),
+          ],
+        ],
+      ),
+    ),
+  );
+}
+
+class _UpdateProgressDialog extends StatelessWidget {
+  const _UpdateProgressDialog({required this.progress, required this.version});
+
+  final ValueNotifier<double?> progress;
+  final String version;
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text('正在下載 $version'),
+    content: ValueListenableBuilder<double?>(
+      valueListenable: progress,
+      builder: (context, value, _) => Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          LinearProgressIndicator(value: value),
+          const SizedBox(height: 12),
+          Text(
+            value == null
+                ? '正在連線…'
+                : '${(value * 100).clamp(0, 100).toStringAsFixed(0)}%',
           ),
         ],
       ),

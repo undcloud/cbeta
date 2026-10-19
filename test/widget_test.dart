@@ -46,6 +46,15 @@ void main() {
     scriptureVolumeStore = ScriptureVolumeStore();
   });
 
+  test('compares release version numbers', () {
+    expect(isNewerVersion('1.0.1', '1.0.0'), isTrue);
+    expect(isNewerVersion('1.1.0', '1.0.9'), isTrue);
+    expect(isNewerVersion('1.0.0', '1.0.0'), isFalse);
+    expect(isNewerVersion('v1.0.0', '1.0'), isFalse);
+    expect(isNewerVersion('1.0.0', '1.0.1'), isFalse);
+    expect(isNewerVersion('2.0', '1.9.9'), isTrue);
+  });
+
   test('scripture HTML preserves CBETA lines and decodes visible text', () {
     final lines = parseScriptureHtml(
       '<div id="body">'
@@ -961,10 +970,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.textContaining('離線模式'), findsWidgets);
-      expect(
-        find.text('般若波羅蜜多心經', findRichText: true),
-        findsOneWidget,
-      );
+      expect(find.text('般若波羅蜜多心經', findRichText: true), findsOneWidget);
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pumpAndSettle();
@@ -1008,9 +1014,7 @@ void main() {
     }, () => client);
   });
 
-  testWidgets('offline Goto search opens a locally saved line', (
-    tester,
-  ) async {
+  testWidgets('offline Goto search opens a locally saved line', (tester) async {
     SharedPreferences.setMockInitialValues({});
     await scriptureDisplaySettings.load();
     await scriptureVolumeStore.write(
@@ -1219,10 +1223,10 @@ void main() {
 
         expect(find.text('T0002 經目命中'), findsNWidgets(2));
         expect(find.text('B0003 經目作品3'), findsOneWidget);
-        expect(find.text('B0006 經目作品6'), findsOneWidget);
+        expect(find.text('B0006 經目作品6'), findsNothing);
         expect(find.text('B0007 經目作品7'), findsNothing);
         expect(find.text('B0012 經目作品12'), findsNothing);
-        expect(find.text('經目匹配 · 點擊開啟'), findsNWidgets(5));
+        expect(find.text('經目匹配 · 點擊開啟'), findsNWidgets(2));
         await tester.ensureVisible(find.text('顯示更多'));
         await tester.tap(find.text('顯示更多'));
         await tester.pumpAndSettle();

@@ -1,7 +1,7 @@
 name: xuefo
 description: "CBETA 經典全文搜尋 Flutter App"
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.0.1+1
 
 environment:
   sdk: ^3.11.4
@@ -14,6 +14,8 @@ dependencies:
   html: ^0.15.7
   http: ^1.6.0
   icu_kit: ^0.2.0
+  open_filex: ^5.0.0
+  package_info_plus: ^10.2.2
   path_provider: ^2.1.6
   shared_preferences: ^2.5.6
   url_launcher: ^6.3.3

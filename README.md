@@ -1,6 +1,18 @@
 # CBETA
 CBETA 經典全文搜尋 Flutter App。
 
+## 下載最新版本
+
+以下連結固定不變，永遠指向最新發行版的 APK：
+
+- **arm64-v8a（多數 Android 手機）**  
+  https://gitee.com/undclouds/cbeta/releases/download/latest/app-arm64-v8a-release.apk
+
+發行版本列表：  
+https://gitee.com/undclouds/cbeta/releases
+
+> 此固定連結會自動解析到最新版本中同名的附件。發布新版本時，只要沿用 `app-arm64-v8a-release.apk` 這個檔名即可，無需修改分享出去的網址。
+
 
 # 關於我們
 
