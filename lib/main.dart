@@ -19,6 +19,15 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'search/candidates.dart';
+import 'search/conversion.dart';
+import 'search/goto.dart';
+import 'search/history.dart';
+import 'search/search_input.dart';
+
+export 'search/conversion.dart';
+export 'search/goto.dart';
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SimplifiedTraditionalConverter.load();
@@ -1289,63 +1298,6 @@ class _ScriptDisplayButton extends StatelessWidget {
   }
 }
 
-class SimplifiedTraditionalConverter {
-  static Map<String, String> _mapping = const {};
-  static Map<String, String> _reverseMapping = const {};
-
-  static Future<void> load() async {
-    final dictionary =
-        jsonDecode(
-              await rootBundle.loadString(
-                'assets/hanzi_simplified_to_traditional.json',
-              ),
-            )
-            as Map<String, dynamic>;
-    _mapping = dictionary.map(
-      (simplified, traditional) => MapEntry(simplified, traditional as String),
-    );
-    final reverseMapping = <String, String>{};
-    for (final entry in _mapping.entries) {
-      for (final rune in entry.value.runes) {
-        reverseMapping.putIfAbsent(String.fromCharCode(rune), () => entry.key);
-      }
-    }
-    _reverseMapping = reverseMapping;
-  }
-
-  static String convert(String text) {
-    final result = StringBuffer();
-    for (final rune in text.runes) {
-      final character = String.fromCharCode(rune);
-      result.write(_mapping[character] ?? character);
-    }
-    return result.toString();
-  }
-
-  static String toTraditionalDisplay(String text) {
-    final result = StringBuffer();
-    for (final rune in text.runes) {
-      final character = String.fromCharCode(rune);
-      result.write(
-        character == '面' ? character : _mapping[character] ?? character,
-      );
-    }
-    return result.toString();
-  }
-
-  static String toSimplified(String text) {
-    final result = StringBuffer();
-    for (final rune in text.runes) {
-      final character = String.fromCharCode(rune);
-      result.write(switch (character) {
-        '籤' => '签',
-        _ => _reverseMapping[character] ?? character,
-      });
-    }
-    return result.toString();
-  }
-}
-
 String _displayText(String text, [BuildContext? context]) {
   if (context != null) _ScriptDisplayScope.dependOn(context);
   return scriptureDisplaySettings.showSimplifiedText
@@ -1572,6 +1524,7 @@ class ScriptureSearchPage extends StatefulWidget {
 class _ScriptureSearchPageState extends State<ScriptureSearchPage>
     with WidgetsBindingObserver {
   final searchController = TextEditingController();
+  final searchFieldAnchorKey = GlobalKey();
   final resultsScrollController = ScrollController();
   String submittedQuery = '';
   List<ScriptureSearchResult> results = const [];
@@ -1951,7 +1904,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
     try {
       final history = await _loadBookmarkRecords(_readingHistoryKey);
       final bookmarks = await _loadBookmarks();
-      final searches = await _loadSearchHistory();
+      final searches = await loadSearchHistory();
       if (!mounted) return;
       setState(() {
         recentReadings = history;
@@ -1974,13 +1927,21 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
   }
 
   Future<void> search([String? value]) async {
+    final raw = (value ?? searchController.text).trim();
+    if (value != null) searchController.text = raw;
+    await _executeSearch(raw, null);
+  }
+
+  Future<void> _onSearchSelection(SearchSelection selection) async {
+    await _executeSearch(selection.rawInput, selection.query);
+  }
+
+  Future<void> _executeSearch(String rawInput, String? selectedQuery) async {
     final token = ++requestToken;
-    final inputQuery = (value ?? searchController.text).trim();
-    final query = SimplifiedTraditionalConverter.convert(inputQuery);
     final navigator = Navigator.of(context);
     final messenger = ScaffoldMessenger.of(context);
     FocusScope.of(context).unfocus();
-    if (inputQuery.isEmpty) {
+    if (rawInput.isEmpty) {
       setState(() {
         submittedQuery = '';
         results = const [];
@@ -1998,43 +1959,77 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       return;
     }
 
-    if (value != null) searchController.text = inputQuery;
-    try {
-      await _recordSearchQuery(inputQuery);
-      if (mounted && token == requestToken) {
-        setState(() {
-          recentSearches = [
-            inputQuery,
-            ...recentSearches.where(
-              (savedQuery) =>
-                  SimplifiedTraditionalConverter.convert(
-                    savedQuery.trim(),
-                  ).toLowerCase() !=
-                  query.toLowerCase(),
-            ),
-          ].take(_maximumSearchHistory).toList();
-        });
+    // Goto 只作用于首页关键字搜索，且必须早于简繁转换。
+    if (isCbetaGotoExpression(rawInput)) {
+      try {
+        await _recordSearchEntry(rawInput, rawInput);
+      } catch (error) {
+        if (mounted) {
+          messenger.showSnackBar(SnackBar(content: Text('儲存搜尋記錄失敗：$error')));
+        }
       }
-    } catch (error) {
-      if (mounted) {
-        messenger.showSnackBar(SnackBar(content: Text('儲存搜尋記錄失敗：$error')));
-      }
-    }
-
-    if (!mounted || token != requestToken) return;
-    if (isCbetaGotoExpression(inputQuery)) {
-      await _openGotoSearch(inputQuery, token);
+      if (!mounted || token != requestToken) return;
+      await _openGotoSearch(rawInput, token);
       return;
     }
+
     if (aiMode) {
+      try {
+        await _recordSearchEntry(rawInput, rawInput);
+      } catch (error) {
+        if (mounted) {
+          messenger.showSnackBar(SnackBar(content: Text('儲存搜尋記錄失敗：$error')));
+        }
+      }
+      if (!mounted || token != requestToken) return;
       navigator.push(
         MaterialPageRoute<void>(
-          builder: (_) => _AiSearchPage(initialQuery: inputQuery),
+          builder: (_) => _AiSearchPage(initialQuery: rawInput),
         ),
       );
       return;
     }
 
+    var query = selectedQuery?.trim() ?? '';
+    if (query.isEmpty) {
+      Map<String, String> selections = const {};
+      try {
+        selections = await loadSearchSelections();
+      } catch (_) {
+        // 歷史記錄損壞時不影響搜尋。
+      }
+      query = preferredQueryFor(rawInput, selections);
+    }
+    if (query.isEmpty) return;
+    if (!mounted || token != requestToken) return;
+
+    try {
+      await _recordSearchEntry(rawInput, query);
+    } catch (error) {
+      if (mounted) {
+        messenger.showSnackBar(SnackBar(content: Text('儲存搜尋記錄失敗：$error')));
+      }
+    }
+    if (!mounted || token != requestToken) return;
+    await _runKeywordSearch(query, token);
+  }
+
+  Future<void> _recordSearchEntry(String rawInput, String selectedQuery) async {
+    await recordSearchQuery(rawInput);
+    await recordSearchSelection(rawInput, selectedQuery);
+    if (!mounted) return;
+    setState(() {
+      recentSearches = [
+        rawInput,
+        ...recentSearches.where(
+          (savedQuery) =>
+              savedQuery.trim().toLowerCase() != rawInput.toLowerCase(),
+        ),
+      ].take(maximumSearchHistory).toList();
+    });
+  }
+
+  Future<void> _runKeywordSearch(String query, int token) async {
     setState(() {
       submittedQuery = query;
       results = const [];
@@ -2392,11 +2387,11 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
                   child: _SearchField(
                     controller: searchController,
                     recentSearches: recentSearches,
-                    onSubmitted: search,
-                    onSearch: () => search(),
+                    onSearch: _onSearchSelection,
                     onClear: clearSearch,
                     aiMode: aiMode,
                     onToggleAiMode: () => setState(() => aiMode = !aiMode),
+                    anchorKey: searchFieldAnchorKey,
                   ),
                 ),
               ),
@@ -2911,275 +2906,138 @@ class _UpdateProgressDialog extends StatelessWidget {
   );
 }
 
-class _SearchField extends StatefulWidget {
+class _SearchField extends StatelessWidget {
   const _SearchField({
     required this.controller,
     required this.recentSearches,
-    required this.onSubmitted,
     required this.onSearch,
     required this.onClear,
     required this.aiMode,
     required this.onToggleAiMode,
+    this.anchorKey,
   });
 
   final List<String> recentSearches;
   final TextEditingController controller;
-  final ValueChanged<String> onSubmitted;
-  final VoidCallback onSearch;
+  final ValueChanged<SearchSelection> onSearch;
   final VoidCallback onClear;
   final bool aiMode;
   final VoidCallback onToggleAiMode;
+  final GlobalKey? anchorKey;
 
   @override
-  State<_SearchField> createState() => _SearchFieldState();
-}
-
-class _SearchFieldState extends State<_SearchField> {
-  final FocusNode focusNode = FocusNode();
-  final LayerLink layerLink = LayerLink();
-  final GlobalKey fieldKey = GlobalKey();
-  OverlayEntry? suggestionOverlay;
-
-  List<String> get suggestions {
-    final query = SimplifiedTraditionalConverter.convert(
-      widget.controller.text.trim(),
-    ).toLowerCase();
-    return widget.recentSearches.where((savedQuery) {
-      return query.isEmpty ||
-          SimplifiedTraditionalConverter.convert(
-            savedQuery,
-          ).toLowerCase().contains(query);
-    }).toList();
-  }
-
-  void _showSuggestions() {
-    if (suggestions.isEmpty ||
-        !focusNode.hasFocus ||
-        suggestionOverlay != null) {
-      return;
-    }
-    suggestionOverlay = OverlayEntry(builder: _buildSuggestionOverlay);
-    Overlay.of(context).insert(suggestionOverlay!);
-  }
-
-  Widget _buildSuggestionOverlay(BuildContext context) {
-    final renderBox = fieldKey.currentContext?.findRenderObject() as RenderBox?;
-    final size = renderBox?.size ?? Size.zero;
-    final items = suggestions;
-    if (items.isEmpty || size.width == 0) return const SizedBox.shrink();
-    return Positioned.fill(
-      child: CompositedTransformFollower(
-        link: layerLink,
-        showWhenUnlinked: false,
-        offset: Offset(0, size.height),
-        child: Align(
-          alignment: Alignment.topLeft,
-          child: TapRegion(
-            groupId: focusNode,
-            child: Material(
-              elevation: 8,
-              color: Theme.of(context).colorScheme.surface,
-              borderRadius: BorderRadius.circular(8),
-              clipBehavior: Clip.antiAlias,
-              child: SizedBox(
-                width: size.width,
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxHeight: 280),
-                  child: ListView.separated(
-                    padding: EdgeInsets.zero,
-                    shrinkWrap: true,
-                    itemCount: items.length,
-                    separatorBuilder: (_, _) => const Divider(height: 1),
-                    itemBuilder: (context, index) {
-                      final query = items[index];
-                      return ListTile(
-                        dense: true,
-                        title: Text(
-                          query,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+  Widget build(BuildContext context) {
+    return Container(
+      key: anchorKey,
+      decoration: BoxDecoration(
+        color: Theme.of(context).appBarTheme.backgroundColor,
+        border: Border.all(color: const Color(0xFFD8CDB8)),
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x0A2C1810),
+            blurRadius: 16,
+            offset: Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          const SizedBox(width: 16),
+          const Icon(Icons.search_rounded, color: Color(0xFF176B67)),
+          const SizedBox(width: 12),
+          Expanded(
+            child: AnimatedBuilder(
+              animation: scriptureDisplaySettings,
+              builder: (context, _) => SearchInput(
+                controller: controller,
+                recentSearches: recentSearches,
+                showCandidates: !aiMode,
+                onSearch: onSearch,
+                textBuilder: (text) => _displayText(text, context),
+                displayListenable: scriptureDisplaySettings,
+                widthAnchorKey: anchorKey,
+                decoration: InputDecoration(
+                  hintText: _displayText('請輸入關鍵字搜尋經典、經題或作譯者…', context),
+                  border: InputBorder.none,
+                  contentPadding: const EdgeInsets.symmetric(vertical: 18),
+                ),
+              ),
+            ),
+          ),
+          ValueListenableBuilder<TextEditingValue>(
+            valueListenable: controller,
+            builder: (context, value, child) => value.text.isEmpty
+                ? const SizedBox.shrink()
+                : IconButton(
+                    tooltip: _displayText('清除搜尋', context),
+                    onPressed: onClear,
+                    icon: const Icon(Icons.close_rounded),
+                  ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Tooltip(
+              message: _displayText(
+                aiMode ? 'AI 模式：開啟（語意搜尋）' : 'AI 模式：關閉',
+                context,
+              ),
+              child: InkWell(
+                onTap: onToggleAiMode,
+                borderRadius: BorderRadius.circular(20),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: aiMode
+                        ? const Color(0xFF176B67)
+                        : Colors.transparent,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: aiMode
+                          ? const Color(0xFF176B67)
+                          : const Color(0xFFC9BEAA),
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.auto_awesome_rounded,
+                        size: 16,
+                        color: aiMode ? Colors.white : const Color(0xFF176B67),
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        'AI',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: aiMode
+                              ? Colors.white
+                              : const Color(0xFF52615C),
                         ),
-                        onTap: () {
-                          _hideSuggestions();
-                          widget.controller.text = query;
-                          widget.onSubmitted(query);
-                        },
-                      );
-                    },
+                      ),
+                    ],
                   ),
                 ),
               ),
             ),
           ),
-        ),
-      ),
-    );
-  }
-
-  void _hideSuggestions() {
-    suggestionOverlay?.remove();
-    suggestionOverlay = null;
-  }
-
-  void _refreshSuggestions() {
-    if (!focusNode.hasFocus || suggestions.isEmpty) {
-      _hideSuggestions();
-      return;
-    }
-    if (suggestionOverlay == null) {
-      _showSuggestions();
-    } else {
-      suggestionOverlay!.markNeedsBuild();
-    }
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    focusNode.addListener(_refreshSuggestions);
-    widget.controller.addListener(_refreshSuggestions);
-  }
-
-  @override
-  void didUpdateWidget(covariant _SearchField oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.controller != widget.controller) {
-      oldWidget.controller.removeListener(_refreshSuggestions);
-      widget.controller.addListener(_refreshSuggestions);
-    }
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _refreshSuggestions();
-    });
-  }
-
-  @override
-  void dispose() {
-    _hideSuggestions();
-    focusNode
-      ..removeListener(_refreshSuggestions)
-      ..dispose();
-    widget.controller.removeListener(_refreshSuggestions);
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return CompositedTransformTarget(
-      link: layerLink,
-      child: Container(
-        key: fieldKey,
-        decoration: BoxDecoration(
-          color: Theme.of(context).appBarTheme.backgroundColor,
-          border: Border.all(color: const Color(0xFFD8CDB8)),
-          borderRadius: BorderRadius.circular(8),
-          boxShadow: const [
-            BoxShadow(
-              color: Color(0x0A2C1810),
-              blurRadius: 16,
-              offset: Offset(0, 4),
+          Padding(
+            padding: const EdgeInsets.all(5),
+            child: IconButton.filled(
+              tooltip: _displayText('搜尋經文', context),
+              onPressed: () {
+                final raw = controller.text.trim();
+                onSearch(SearchSelection(rawInput: raw, query: ''));
+              },
+              icon: const Icon(Icons.search_rounded),
             ),
-          ],
-        ),
-        child: Row(
-          children: [
-            const SizedBox(width: 16),
-            const Icon(Icons.search_rounded, color: Color(0xFF176B67)),
-            const SizedBox(width: 12),
-            Expanded(
-              child: AnimatedBuilder(
-                animation: scriptureDisplaySettings,
-                builder: (context, _) => TextField(
-                  controller: widget.controller,
-                  focusNode: focusNode,
-                  groupId: focusNode,
-                  onTapOutside: (_) => focusNode.unfocus(),
-                  onChanged: (_) => _refreshSuggestions(),
-                  textInputAction: TextInputAction.search,
-                  onSubmitted: (value) {
-                    _hideSuggestions();
-                    widget.onSubmitted(value);
-                  },
-                  decoration: InputDecoration(
-                    hintText: _displayText('請輸入關鍵字搜尋經典、經題或作譯者…', context),
-                    border: InputBorder.none,
-                    contentPadding: const EdgeInsets.symmetric(vertical: 18),
-                  ),
-                ),
-              ),
-            ),
-            ValueListenableBuilder<TextEditingValue>(
-              valueListenable: widget.controller,
-              builder: (context, value, child) => value.text.isEmpty
-                  ? const SizedBox.shrink()
-                  : IconButton(
-                      tooltip: _displayText('清除搜尋', context),
-                      onPressed: widget.onClear,
-                      icon: const Icon(Icons.close_rounded),
-                    ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 4),
-              child: Tooltip(
-                message: _displayText(
-                  widget.aiMode ? 'AI 模式：開啟（語意搜尋）' : 'AI 模式：關閉',
-                  context,
-                ),
-                child: InkWell(
-                  onTap: widget.onToggleAiMode,
-                  borderRadius: BorderRadius.circular(20),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 6,
-                    ),
-                    decoration: BoxDecoration(
-                      color: widget.aiMode
-                          ? const Color(0xFF176B67)
-                          : Colors.transparent,
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(
-                        color: widget.aiMode
-                            ? const Color(0xFF176B67)
-                            : const Color(0xFFC9BEAA),
-                      ),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          Icons.auto_awesome_rounded,
-                          size: 16,
-                          color: widget.aiMode
-                              ? Colors.white
-                              : const Color(0xFF176B67),
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          'AI',
-                          style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w700,
-                            color: widget.aiMode
-                                ? Colors.white
-                                : const Color(0xFF52615C),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.all(5),
-              child: IconButton.filled(
-                tooltip: _displayText('搜尋經文', context),
-                onPressed: widget.onSearch,
-                icon: const Icon(Icons.search_rounded),
-              ),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -3577,9 +3435,26 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
     );
   }
 
-  void _findLocalMatches(String query, List<ScriptureLine> lines) {
-    localSearchQuery = SimplifiedTraditionalConverter.convert(query.trim());
-    localSearchLines = lines;
+  Future<void> _runLocalSearch(SearchSelection selection) async {
+    final raw = selection.rawInput.trim();
+    final selected = selection.query.trim();
+    if (raw.isEmpty || selected.isEmpty) {
+      setState(() {
+        localSearchQuery = '';
+        localSearchOffsets = const [];
+        didScrollToMatch = true;
+      });
+      return;
+    }
+    try {
+      await recordSearchSelection(raw, selected);
+    } catch (_) {
+      // 記錄失敗不影響搜尋。
+    }
+    if (!mounted) return;
+
+    final lines = localSearchLines;
+    localSearchQuery = selected;
     localSearchIndex = 0;
     final needle = localSearchQuery.toLowerCase();
     final haystack = lines
@@ -4201,10 +4076,8 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                   count: localSearchOffsets.isEmpty
                       ? '0 / 0'
                       : '${localSearchIndex + 1} / ${localSearchOffsets.length}',
-                  onSearch: (query) => _findLocalMatches(
-                    query,
-                    localSearchLines.isEmpty ? const [] : localSearchLines,
-                  ),
+                  onSearch: (selection) =>
+                      unawaited(_runLocalSearch(selection)),
                   onPrevious: () => _moveLocalMatch(-1),
                   onNext: () => _moveLocalMatch(1),
                   onClose: () => setState(() {
@@ -5758,36 +5631,6 @@ String formatSelectedPassageForCopy(
   return '《${passage.title}》$volume$section：「\n$selectedText」$citation';
 }
 
-String extractCbetaGotoQuery(String input) {
-  final trimmed = input.trim();
-  final citation = RegExp(
-    r'[\(（]\s*(CBETA\b[^)）]*?)\s*[\)）]',
-    caseSensitive: false,
-  ).firstMatch(trimmed);
-  return citation?.group(1)?.trim() ?? trimmed;
-}
-
-String normalizeCbetaGotoLinehead(String input) {
-  final linehead = RegExp(
-    r'\b([A-Z]\d{1,3})\s*,?\s*no\.?\s*(\d+)\s*,?\s*p{1,2}\.?\s*([a-z]?)(\d{1,4})([a-z])(\d{1,2})',
-    caseSensitive: false,
-  ).firstMatch(input);
-  if (linehead == null) return input.trim();
-  return '${linehead.group(1)!.toUpperCase()}n'
-      '${linehead.group(2)!.padLeft(4, '0')}_p'
-      '${linehead.group(3)!.toLowerCase()}'
-      '${linehead.group(4)!.padLeft(linehead.group(3)!.isEmpty ? 4 : 3, '0')}'
-      '${linehead.group(5)!.toLowerCase()}'
-      '${linehead.group(6)!.padLeft(2, '0')}';
-}
-
-bool isCbetaGotoExpression(String input) {
-  final candidate = normalizeCbetaGotoLinehead(extractCbetaGotoQuery(input));
-  return RegExp(
-    r'^[A-Z]\d{1,3}n\d{4}_p[a-z]?\d{3,4}[a-z]\d{2}$',
-  ).hasMatch(candidate);
-}
-
 String _catalogResultWorkId(Map<String, dynamic> result) {
   final work = '${result['work'] ?? ''}'.trim();
   if (work.isNotEmpty) return work;
@@ -6509,44 +6352,8 @@ class _ReaderBookmark {
 
 const _readerBookmarksKey = 'reader_bookmarks';
 const _readingHistoryKey = 'reading_history';
-const _searchHistoryKey = 'search_history';
-const _maximumSearchHistory = 20;
 const _initialRecentReadingsCount = 3;
 const _recentReadingsPageSize = 20;
-
-Future<List<String>> _loadSearchHistory() async {
-  final preferences = await SharedPreferences.getInstance();
-  final stored = preferences.getString(_searchHistoryKey);
-  if (stored == null) return [];
-  final decoded = jsonDecode(stored);
-  if (decoded is! List<dynamic> || decoded.any((item) => item is! String)) {
-    throw const FormatException('搜尋記錄資料格式錯誤');
-  }
-  return decoded.whereType<String>().toList();
-}
-
-Future<void> _recordSearchQuery(String query) async {
-  final history = await _loadSearchHistory();
-  final normalizedQuery = SimplifiedTraditionalConverter.convert(
-    query.trim(),
-  ).toLowerCase();
-  history.removeWhere(
-    (savedQuery) =>
-        SimplifiedTraditionalConverter.convert(
-          savedQuery.trim(),
-        ).toLowerCase() ==
-        normalizedQuery,
-  );
-  history.insert(0, query.trim());
-  if (history.length > _maximumSearchHistory) {
-    history.removeRange(_maximumSearchHistory, history.length);
-  }
-  final saved = await (await SharedPreferences.getInstance()).setString(
-    _searchHistoryKey,
-    jsonEncode(history),
-  );
-  if (!saved) throw StateError('無法儲存搜尋記錄');
-}
 
 Future<List<_ReaderBookmark>> _loadBookmarkRecords(String key) async {
   final preferences = await SharedPreferences.getInstance();
@@ -6636,7 +6443,7 @@ class _LocalSearchBar extends StatelessWidget {
 
   final TextEditingController controller;
   final String count;
-  final ValueChanged<String> onSearch;
+  final ValueChanged<SearchSelection> onSearch;
   final VoidCallback onPrevious;
   final VoidCallback onNext;
   final VoidCallback onClose;
@@ -6649,16 +6456,17 @@ class _LocalSearchBar extends StatelessWidget {
     child: Row(
       children: [
         Expanded(
-          child: TextField(
+          child: SearchInput(
             controller: controller,
             autofocus: true,
+            onSearch: onSearch,
+            textBuilder: (text) => _displayText(text, context),
+            displayListenable: scriptureDisplaySettings,
             decoration: InputDecoration(
               hintText: _displayText('在此卷中搜尋…', context),
               border: InputBorder.none,
               contentPadding: const EdgeInsets.symmetric(horizontal: 14),
             ),
-            onChanged: onSearch,
-            onSubmitted: onSearch,
           ),
         ),
         Padding(
@@ -6766,9 +6574,26 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
   }
 
   Future<void> search() async {
-    final input = controller.text.trim();
-    if (input.isEmpty) return;
-    final query = SimplifiedTraditionalConverter.convert(input);
+    final raw = controller.text.trim();
+    if (raw.isEmpty) return;
+    final query = await preferredQueryForInput(raw);
+    await _runSearch(raw, query);
+  }
+
+  Future<void> _onSearchSelection(SearchSelection selection) async {
+    final raw = selection.rawInput.trim();
+    if (raw.isEmpty) return;
+    await _runSearch(raw, selection.query);
+  }
+
+  Future<void> _runSearch(String raw, String query) async {
+    if (raw.isEmpty || query.isEmpty) return;
+    try {
+      await recordSearchSelection(raw, query);
+    } catch (_) {
+      // 記錄失敗不影響搜尋。
+    }
+    if (!mounted) return;
     _FullTextSearchCache.lastQuery = query;
     FocusScope.of(context).unfocus();
     if (kIsWeb) {
@@ -6880,10 +6705,11 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
           child: Row(
             children: [
               Expanded(
-                child: TextField(
+                child: SearchInput(
                   controller: controller,
-                  textInputAction: TextInputAction.search,
-                  onSubmitted: (_) => search(),
+                  onSearch: _onSearchSelection,
+                  textBuilder: (text) => _displayText(text, context),
+                  displayListenable: scriptureDisplaySettings,
                   decoration: InputDecoration(
                     hintText: _displayText('輸入關鍵字搜尋經文…', context),
                     border: OutlineInputBorder(),
@@ -7549,6 +7375,13 @@ class _WorkPickerResponseCache {
   static final Map<String, Future<String>> text = {};
 }
 
+/// 清空選擇佛經頁的 API 回應快取（僅供測試使用）。
+@visibleForTesting
+void resetWorkPickerResponseCache() {
+  _WorkPickerResponseCache.json.clear();
+  _WorkPickerResponseCache.text.clear();
+}
+
 Future<Map<String, dynamic>> _cachedPickerJson(
   Uri uri,
   String serviceName,
@@ -7610,6 +7443,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   bool loadingCreators = false;
   bool loadingDynasties = false;
   bool showingWorks = false;
+  String creatorQuery = '';
   String? error;
   String? resultMessage;
 
@@ -7787,9 +7621,26 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   }
 
   Future<void> _searchToc() async {
-    final input = tocController.text.trim();
-    if (input.isEmpty) return;
-    final query = SimplifiedTraditionalConverter.convert(input);
+    final raw = tocController.text.trim();
+    if (raw.isEmpty) return;
+    final query = await preferredQueryForInput(raw);
+    await _runTocSearch(raw, query);
+  }
+
+  Future<void> _onTocSelection(SearchSelection selection) async {
+    final raw = selection.rawInput.trim();
+    if (raw.isEmpty) return;
+    await _runTocSearch(raw, selection.query);
+  }
+
+  Future<void> _runTocSearch(String raw, String query) async {
+    if (raw.isEmpty || query.isEmpty) return;
+    try {
+      await recordSearchSelection(raw, query);
+    } catch (_) {
+      // 記錄失敗不影響查詢。
+    }
+    if (!mounted) return;
     setState(() {
       loading = true;
       error = null;
@@ -7926,7 +7777,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   }
 
   List<Object> get visibleCreatorRows {
-    final query = creatorController.text.trim().toLowerCase();
+    final query = creatorQuery.trim().toLowerCase();
     final groups = <String, List<MapEntry<String, Map<String, dynamic>>>>{};
     for (final entry in creators) {
       final name = '${entry.value['regular_name'] ?? ''}';
@@ -8043,13 +7894,41 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     },
   );
 
+  Future<void> _onCreatorSelection(SearchSelection selection) async {
+    final raw = selection.rawInput.trim();
+    final selected = selection.query.trim();
+    if (raw.isEmpty) {
+      setState(() => creatorQuery = '');
+      return;
+    }
+    if (selected.isEmpty) return;
+    try {
+      await recordSearchSelection(raw, selected);
+    } catch (_) {
+      // 記錄失敗不影響搜尋。
+    }
+    if (!mounted) return;
+    setState(() {
+      showingWorks = false;
+      creatorQuery = selected;
+    });
+  }
+
   Widget _buildCreatorTab() => Column(
     children: [
       Padding(
         padding: const EdgeInsets.all(12),
-        child: TextField(
+        child: SearchInput(
           controller: creatorController,
-          onChanged: (_) => setState(() => showingWorks = false),
+          onSearch: _onCreatorSelection,
+          textBuilder: (text) => _displayText(text, context),
+          displayListenable: scriptureDisplaySettings,
+          onChanged: (value) => setState(() {
+            showingWorks = false;
+            creatorQuery = SimplifiedTraditionalConverter.convertPreferred(
+              value.trim(),
+            );
+          }),
           decoration: InputDecoration(
             prefixIcon: Icon(Icons.search_rounded),
             hintText: _displayText('搜尋作譯者…', context),
@@ -8146,6 +8025,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     required String hint,
     required String buttonText,
     required VoidCallback onSearch,
+    ValueChanged<SearchSelection>? onSelection,
     TextStyle? hintStyle,
   }) => Column(
     children: [
@@ -8154,17 +8034,30 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
         child: Row(
           children: [
             Expanded(
-              child: TextField(
-                controller: controller,
-                textInputAction: TextInputAction.search,
-                onSubmitted: (_) => onSearch(),
-                decoration: InputDecoration(
-                  hintText: _displayText(hint, context),
-                  hintStyle: hintStyle,
-                  border: const OutlineInputBorder(),
-                  isDense: true,
-                ),
-              ),
+              child: onSelection == null
+                  ? TextField(
+                      controller: controller,
+                      textInputAction: TextInputAction.search,
+                      onSubmitted: (_) => onSearch(),
+                      decoration: InputDecoration(
+                        hintText: _displayText(hint, context),
+                        hintStyle: hintStyle,
+                        border: const OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    )
+                  : SearchInput(
+                      controller: controller,
+                      onSearch: onSelection,
+                      textBuilder: (text) => _displayText(text, context),
+                      displayListenable: scriptureDisplaySettings,
+                      decoration: InputDecoration(
+                        hintText: _displayText(hint, context),
+                        hintStyle: hintStyle,
+                        border: const OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
             ),
             const SizedBox(width: 8),
             FilledButton(onPressed: onSearch, child: Text(buttonText)),
@@ -8253,6 +8146,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
                 hint: '輸入經典名稱…',
                 buttonText: '搜尋',
                 onSearch: _searchToc,
+                onSelection: _onTocSelection,
               ),
               _ => _buildSearchTab(
                 controller: gotoController,

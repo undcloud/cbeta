@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 及以下的自动备份规则：保留搜索记录、设置与离线经文。 -->
+<full-backup-content>
+    <include domain="sharedpref" path="." />
+    <include domain="file" path="." />
+    <include domain="database" path="." />
+    <include domain="external" path="." />
+</full-backup-content>

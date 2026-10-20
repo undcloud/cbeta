@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ 的云备份与设备迁移规则：保留搜索记录、设置与离线经文。 -->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="sharedpref" path="." />
+        <include domain="file" path="." />
+        <include domain="database" path="." />
+        <include domain="external" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="sharedpref" path="." />
+        <include domain="file" path="." />
+        <include domain="database" path="." />
+        <include domain="external" path="." />
+    </device-transfer>
+</data-extraction-rules>

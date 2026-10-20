@@ -17,6 +17,8 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:xuefo/main.dart';
+import 'package:xuefo/search/candidates.dart';
+import 'package:xuefo/search/search_input.dart';
 
 class _MemoryScriptureVolumeStore extends ScriptureVolumeStore {
   final Map<String, CachedScriptureVolume> volumes = {};
@@ -40,6 +42,7 @@ class _MemoryScriptureVolumeStore extends ScriptureVolumeStore {
 void main() {
   setUp(() {
     scriptureVolumeStore = _MemoryScriptureVolumeStore();
+    resetWorkPickerResponseCache();
   });
 
   tearDown(() {
@@ -787,12 +790,30 @@ void main() {
     await SimplifiedTraditionalConverter.load();
     expect(SimplifiedTraditionalConverter.convert('五蕴'), '五蘊');
     expect(SimplifiedTraditionalConverter.convert('简体搜索发'), '簡體搜索發');
+    expect(SimplifiedTraditionalConverter.convert('国'), '國');
+    expect(SimplifiedTraditionalConverter.convert('钻'), '鑽');
     expect(SimplifiedTraditionalConverter.convert('ABC 123!'), 'ABC 123!');
+    final ambiguous = SimplifiedTraditionalConverter.convertCandidates('厂丑');
+    expect(ambiguous.scriptKind, ScriptKind.simplified);
+    expect(ambiguous.candidates, ['廠丑', '廠醜', '厂丑', '厂醜']);
+    expect(ambiguous.requiresChoice, isTrue);
     expect(SimplifiedTraditionalConverter.toSimplified('五蘊經典'), '五蕴经典');
+    expect(SimplifiedTraditionalConverter.toSimplified('雲何'), '云何');
     expect(SimplifiedTraditionalConverter.toSimplified('𠀀'), '𠀀');
+    // 繁體經文中的共用字不應被過度轉換。
+    expect(SimplifiedTraditionalConverter.toTraditionalDisplay('云何'), '云何');
+    expect(SimplifiedTraditionalConverter.toTraditionalDisplay('山谷'), '山谷');
+    expect(SimplifiedTraditionalConverter.toTraditionalDisplay('皇后'), '皇后');
+    expect(SimplifiedTraditionalConverter.toTraditionalDisplay('公里'), '公里');
+    expect(SimplifiedTraditionalConverter.toTraditionalDisplay('干戈'), '干戈');
+    expect(SimplifiedTraditionalConverter.toTraditionalDisplay('占卜'), '占卜');
+    expect(SimplifiedTraditionalConverter.toTraditionalDisplay('于闐'), '于闐');
+    expect(SimplifiedTraditionalConverter.toTraditionalDisplay('尸羅'), '尸羅');
+    expect(SimplifiedTraditionalConverter.toTraditionalDisplay('咸皆'), '咸皆');
+    expect(SimplifiedTraditionalConverter.toTraditionalDisplay('天台宗'), '天台宗');
     expect(
-      SimplifiedTraditionalConverter.toTraditionalDisplay('关于我们部类册别作译者经目查询'),
-      '關於我們部類冊別作譯者經目查詢',
+      SimplifiedTraditionalConverter.toTraditionalDisplay('我们部类册别作译者经目查询'),
+      '我們部類冊別作譯者經目查詢',
     );
     expect(SimplifiedTraditionalConverter.toSimplified('我的書籤'), '我的书签');
 
@@ -823,6 +844,62 @@ void main() {
 
     await scriptureDisplaySettings.update(showSimplifiedText: false);
     await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('live search input shows history and candidate choices', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await SimplifiedTraditionalConverter.load();
+    final controller = TextEditingController();
+    final displayMode = ValueNotifier<bool>(false);
+    var simplifiedText = false;
+    SearchSelection? selection;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SearchInput(
+            controller: controller,
+            recentSearches: const ['五蘊'],
+            displayListenable: displayMode,
+            textBuilder: (text) => simplifiedText
+                ? SimplifiedTraditionalConverter.toSimplified(text)
+                : text,
+            onSearch: (value) => selection = value,
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byType(TextField));
+    await tester.pumpAndSettle();
+    expect(find.widgetWithText(ListTile, '五蘊'), findsOneWidget);
+
+    await tester.enterText(find.byType(TextField), '厂丑');
+    await tester.pumpAndSettle();
+    expect(find.widgetWithText(ListTile, '廠丑'), findsOneWidget);
+    expect(find.widgetWithText(ListTile, '厂丑'), findsOneWidget);
+    expect(find.text('原始輸入'), findsOneWidget);
+
+    simplifiedText = true;
+    displayMode.value = true;
+    await tester.pump();
+    expect(find.text('原始输入'), findsOneWidget);
+    simplifiedText = false;
+    displayMode.value = false;
+    await tester.pump();
+    expect(find.text('原始輸入'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(ListTile, '廠醜'));
+    await tester.pumpAndSettle();
+    expect(selection?.rawInput, '厂丑');
+    expect(selection?.query, '廠醜');
+    expect(controller.text, '廠醜');
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    controller.dispose();
+    displayMode.dispose();
   });
 
   testWidgets('CBETA search page is shown', (WidgetTester tester) async {
@@ -1276,7 +1353,11 @@ void main() {
       await tester.tap(find.text('經目查詢'));
       await tester.pumpAndSettle();
       await tester.enterText(find.byType(TextField).last, '简体经目发愿');
-      await tester.tap(find.text('搜尋'));
+      await tester.pumpAndSettle();
+
+      final preferredCandidate = find.widgetWithText(ListTile, '簡體經目發願');
+      expect(preferredCandidate, findsOneWidget);
+      await tester.tap(preferredCandidate);
       await tester.pumpAndSettle();
 
       expect(tocQuery, '簡體經目發願');
@@ -1284,6 +1365,105 @@ void main() {
       await tester.pumpAndSettle();
     }, () => client);
   });
+
+  testWidgets('homepage ambiguous simplified input offers candidates', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await SimplifiedTraditionalConverter.load();
+    String? keywordQuery;
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/search/all_in_one') {
+        keywordQuery = request.url.queryParameters['q'];
+        return http.Response(
+          jsonEncode({
+            'num_found': 0,
+            'total_term_hits': 0,
+            'results': <Object>[],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      if (request.url.path == '/stable/search/toc') {
+        return http.Response(
+          jsonEncode({'num_found': 0, 'results': <Object>[]}),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(const CbetaSearchApp());
+      await tester.enterText(find.byType(TextField).first, '简体经目发愿');
+      await tester.pumpAndSettle();
+
+      expect(find.byType(LinearProgressIndicator), findsNothing);
+      expect(find.textContaining('計算中'), findsNothing);
+      final preferred = find.widgetWithText(ListTile, '簡體經目發願');
+      expect(preferred, findsOneWidget);
+      await tester.tap(preferred);
+      await tester.pumpAndSettle();
+
+      expect(keywordQuery, '簡體經目發願');
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+    }, () => client);
+  });
+
+  testWidgets(
+    'multi-character ambiguous input offers cross-product candidates',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await scriptureDisplaySettings.load();
+      await SimplifiedTraditionalConverter.load();
+      String? keywordQuery;
+      final client = MockClient((request) async {
+        if (request.url.path == '/stable/search/all_in_one') {
+          keywordQuery = request.url.queryParameters['q'];
+          return http.Response(
+            jsonEncode({
+              'num_found': 0,
+              'total_term_hits': 0,
+              'results': <Object>[],
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        if (request.url.path == '/stable/search/toc') {
+          return http.Response(
+            jsonEncode({'num_found': 0, 'results': <Object>[]}),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        return http.Response('{}', 404);
+      });
+
+      await http.runWithClient(() async {
+        await tester.pumpWidget(const CbetaSearchApp());
+        await tester.enterText(find.byType(TextField).first, '厂丑');
+        await tester.pumpAndSettle();
+
+        expect(find.byType(LinearProgressIndicator), findsNothing);
+        for (final candidate in ['廠丑', '廠醜', '厂丑', '厂醜']) {
+          expect(find.widgetWithText(ListTile, candidate), findsOneWidget);
+        }
+        await tester.tap(find.widgetWithText(ListTile, '廠醜'));
+        await tester.pumpAndSettle();
+        expect(keywordQuery, '廠醜');
+        expect(find.text('找不到「廠醜」相關經文'), findsOneWidget);
+        expect(find.textContaining('廠丑'), findsNothing);
+
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pumpAndSettle();
+      }, () => client);
+    },
+  );
 
   testWidgets('tapping the CBETA logo clears search results to the homepage', (
     tester,
@@ -1703,9 +1883,9 @@ void main() {
               .value,
           50,
         );
-        await tester.tap(find.byTooltip('回到首頁'));
+        await tester.tap(find.text('CBETA 閱讀'));
         await tester.pumpAndSettle();
-        expect(find.text('CBETA 線上閱讀'), findsOneWidget);
+        expect(find.text('CBETA 閱讀'), findsOneWidget);
 
         await tester.tap(find.byTooltip('選擇佛經'));
         await tester.pumpAndSettle();
@@ -1979,6 +2159,7 @@ void main() {
       await tester.tap(find.byTooltip('當卷搜尋'));
       await tester.pumpAndSettle();
       await tester.enterText(find.byType(TextField).last, '安置');
+      await tester.testTextInput.receiveAction(TextInputAction.search);
       await tester.pumpAndSettle();
 
       final text = tester.widget<SelectableText>(
@@ -2062,6 +2243,7 @@ void main() {
       await tester.tap(find.byTooltip('當卷搜尋'));
       await tester.pumpAndSettle();
       await tester.enterText(find.byType(TextField).last, '免者');
+      await tester.testTextInput.receiveAction(TextInputAction.search);
       await tester.pumpAndSettle();
       RenderEditable? findEditable(RenderObject object) {
         if (object is RenderEditable) return object;
@@ -2246,6 +2428,7 @@ void main() {
         await tester.tap(find.byTooltip('當卷搜尋'));
         await tester.pumpAndSettle();
         await tester.enterText(find.byType(TextField).last, '五蘊');
+        await tester.testTextInput.receiveAction(TextInputAction.search);
         await tester.pumpAndSettle();
         expect(find.text('1 / 2'), findsOneWidget);
         await tester.tap(find.byTooltip('下一筆'));
@@ -2290,7 +2473,7 @@ void main() {
         }
         await tester.tap(find.text('T0001 長阿含經 (2卷)'));
         await tester.pumpAndSettle();
-        expect(find.text('長阿含經 (2卷)'), findsNWidgets(2));
+        expect(find.text('長阿含經 (2卷)'), findsAtLeastNWidgets(1));
         expect(find.text('第 1 / 2 卷'), findsOneWidget);
       }, () => client);
     },

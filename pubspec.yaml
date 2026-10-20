@@ -34,3 +34,6 @@ flutter:
   assets:
     - assets/cbetaonline.png
     - assets/hanzi_simplified_to_traditional.json
+    - assets/hanzi_traditional_to_simplified.json
+    - assets/phrases_simplified_to_traditional.json
+    - assets/phrases_traditional_to_simplified.json
