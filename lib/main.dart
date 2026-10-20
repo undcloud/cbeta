@@ -9,8 +9,6 @@ import 'package:flutter/material.dart' as flutter_material;
 import 'package:flutter/rendering.dart' show RenderEditable;
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:html/dom.dart' as html_dom;
-import 'package:html/parser.dart' show parseFragment;
 import 'package:http/http.dart' as http;
 import 'package:icu_kit/icu_kit.dart';
 import 'package:open_filex/open_filex.dart';
@@ -19,14 +17,24 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'ai/ai_chunk.dart';
+import 'ai/ai_search_service.dart';
+import 'scripture/cache.dart';
+import 'scripture/models.dart';
+import 'scripture/parser.dart';
 import 'search/candidates.dart';
 import 'search/conversion.dart';
 import 'search/goto.dart';
 import 'search/history.dart';
 import 'search/search_input.dart';
+import 'settings/display_settings.dart';
 
+export 'scripture/cache.dart';
+export 'scripture/models.dart';
+export 'scripture/parser.dart';
 export 'search/conversion.dart';
 export 'search/goto.dart';
+export 'settings/display_settings.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,10 +42,6 @@ Future<void> main() async {
   await scriptureDisplaySettings.load();
   runApp(const CbetaSearchApp());
 }
-
-final scriptureDisplaySettings = ScriptureDisplaySettings();
-
-final scriptureCacheUpdates = ValueNotifier<Set<String>>({});
 
 const _giteeOwner = 'undclouds';
 const _giteeRepo = 'cbeta';
@@ -288,384 +292,6 @@ Future<void> _openApkWithFilex(String apkPath) async {
   );
   if (result.type != ResultType.done) {
     throw Exception(result.message.isEmpty ? '無法啟動安裝程式' : result.message);
-  }
-}
-
-class CachedScriptureVolume {
-  const CachedScriptureVolume({
-    required this.work,
-    required this.juan,
-    required this.html,
-    this.contentVersion,
-  });
-
-  final String work;
-  final String juan;
-  final String html;
-  final String? contentVersion;
-
-  String get key => '$work:$juan';
-
-  factory CachedScriptureVolume.fromJson(Map<String, dynamic> json) {
-    final work = json['work'];
-    final juan = json['juan'];
-    final html = json['html'];
-    final contentVersion = json['contentVersion'];
-    if (work is! String ||
-        juan is! String ||
-        html is! String ||
-        (contentVersion != null && contentVersion is! String)) {
-      throw const FormatException('離線經文資料格式無效');
-    }
-    return CachedScriptureVolume(
-      work: work,
-      juan: juan,
-      html: html,
-      contentVersion: contentVersion as String?,
-    );
-  }
-
-  Map<String, Object?> toJson() => {
-    'work': work,
-    'juan': juan,
-    'html': html,
-    'contentVersion': contentVersion,
-  };
-}
-
-class ScriptureVolumeStore {
-  ScriptureVolumeStore({Future<Directory> Function()? directoryProvider})
-    : _directoryProvider = directoryProvider ?? getApplicationSupportDirectory;
-
-  static const _webKeyPrefix = 'cbeta_scripture_volume:';
-  final Future<Directory> Function() _directoryProvider;
-
-  String _validateKey(String work, String juan) {
-    if (!RegExp(r'^[A-Za-z0-9]+$').hasMatch(work) ||
-        !RegExp(r'^\d+$').hasMatch(juan)) {
-      throw FormatException('無效的經卷識別碼：$work 卷 $juan');
-    }
-    return '$work-$juan';
-  }
-
-  Future<Directory> _cacheDirectory() async {
-    final supportDirectory = await _directoryProvider();
-    final directory = Directory(
-      '${supportDirectory.path}${Platform.pathSeparator}cbeta_scripture',
-    );
-    await directory.create(recursive: true);
-    return directory;
-  }
-
-  Future<CachedScriptureVolume?> read(String work, String juan) async {
-    final fileKey = _validateKey(work, juan);
-    final String? stored;
-    if (kIsWeb) {
-      stored = (await SharedPreferences.getInstance()).getString(
-        '$_webKeyPrefix$fileKey',
-      );
-    } else {
-      final directory = await _cacheDirectory();
-      final file = File(
-        '${directory.path}${Platform.pathSeparator}$fileKey.json',
-      );
-      stored = await file.exists() ? await file.readAsString() : null;
-    }
-    if (stored == null) return null;
-    final volume = CachedScriptureVolume.fromJson(
-      jsonDecode(stored) as Map<String, dynamic>,
-    );
-    if (volume.work != work || volume.juan != juan) {
-      throw FormatException('離線經卷識別碼不符：$work 卷 $juan');
-    }
-    return volume;
-  }
-
-  Future<void> write(CachedScriptureVolume volume) async {
-    final fileKey = _validateKey(volume.work, volume.juan);
-    final stored = jsonEncode(volume.toJson());
-    if (kIsWeb) {
-      final saved = await (await SharedPreferences.getInstance()).setString(
-        '$_webKeyPrefix$fileKey',
-        stored,
-      );
-      if (!saved) throw StateError('無法儲存離線經文：${volume.key}');
-      return;
-    }
-    final directory = await _cacheDirectory();
-    final file = File(
-      '${directory.path}${Platform.pathSeparator}$fileKey.json',
-    );
-    await file.writeAsString(stored, flush: true);
-  }
-
-  Future<List<CachedScriptureVolume>> list() async {
-    if (kIsWeb) {
-      final preferences = await SharedPreferences.getInstance();
-      final volumes = <CachedScriptureVolume>[];
-      for (final key in preferences.getKeys().where(
-        (key) => key.startsWith(_webKeyPrefix),
-      )) {
-        final stored = preferences.getString(key);
-        if (stored != null) {
-          volumes.add(
-            CachedScriptureVolume.fromJson(
-              jsonDecode(stored) as Map<String, dynamic>,
-            ),
-          );
-        }
-      }
-      return volumes;
-    }
-    final directory = await _cacheDirectory();
-    if (!await directory.exists()) return const [];
-    final files = await directory
-        .list()
-        .where((entity) => entity is File && entity.path.endsWith('.json'))
-        .cast<File>()
-        .toList();
-    final volumes = <CachedScriptureVolume>[];
-    for (final file in files) {
-      volumes.add(
-        CachedScriptureVolume.fromJson(
-          jsonDecode(await file.readAsString()) as Map<String, dynamic>,
-        ),
-      );
-    }
-    return volumes;
-  }
-
-  Future<void> clearAll() async {
-    if (kIsWeb) {
-      final preferences = await SharedPreferences.getInstance();
-      for (final key in preferences.getKeys().where(
-        (key) => key.startsWith(_webKeyPrefix),
-      )) {
-        final removed = await preferences.remove(key);
-        if (!removed) throw StateError('無法清除離線經文快取：$key');
-      }
-      return;
-    }
-    final directory = await _cacheDirectory();
-    if (!await directory.exists()) return;
-    await for (final entity in directory.list()) {
-      if (entity is File && entity.path.endsWith('.json')) {
-        await entity.delete();
-      }
-    }
-  }
-}
-
-var scriptureVolumeStore = ScriptureVolumeStore();
-
-class ScriptureCacheUpdateResult {
-  const ScriptureCacheUpdateResult({
-    required this.updated,
-    required this.unchanged,
-    required this.errors,
-  });
-
-  final int updated;
-  final int unchanged;
-  final List<String> errors;
-}
-
-Future<CachedScriptureVolume> _fetchScriptureVolume(
-  String work,
-  String juan,
-) async {
-  final response = await http
-      .get(
-        Uri.https('cbdata.dila.edu.tw', '/stable/juans', {
-          'work': work,
-          'juan': juan,
-        }),
-      )
-      .timeout(const Duration(seconds: 20));
-  if (response.statusCode != 200) {
-    throw Exception('經卷 API 回傳 ${response.statusCode}');
-  }
-  final payload =
-      jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
-  if (payload['success'] == false) {
-    throw Exception('CBETA 經卷下載失敗：${payload['error'] ?? '未知錯誤'}');
-  }
-  final html = (payload['results'] as List<dynamic>? ?? const [])
-      .whereType<String>()
-      .firstOrNull;
-  if (html == null || html.isEmpty) {
-    throw FormatException('CBETA 未回傳經卷內容：$work 卷 $juan');
-  }
-  return CachedScriptureVolume(
-    work: work,
-    juan: juan,
-    html: html,
-    contentVersion: payload['content'] as String?,
-  );
-}
-
-Future<ScriptureCacheUpdateResult> checkAndUpdateCachedScriptures() async {
-  final cachedVolumes = await scriptureVolumeStore.list();
-  var updated = 0;
-  var unchanged = 0;
-  final updatedKeys = <String>{};
-  final errors = <String>[];
-  for (final cached in cachedVolumes) {
-    try {
-      final latest = await _fetchScriptureVolume(cached.work, cached.juan);
-      final isUpdated =
-          cached.contentVersion != null && latest.contentVersion != null
-          ? cached.contentVersion != latest.contentVersion
-          : cached.html != latest.html;
-      if (isUpdated) {
-        await scriptureVolumeStore.write(latest);
-        updated++;
-        updatedKeys.add(cached.key);
-      } else {
-        unchanged++;
-      }
-    } catch (error) {
-      errors.add('${cached.work} 卷 ${cached.juan}：$error');
-    }
-  }
-  if (updatedKeys.isNotEmpty) {
-    scriptureCacheUpdates.value = Set.unmodifiable(updatedKeys);
-  }
-  return ScriptureCacheUpdateResult(
-    updated: updated,
-    unchanged: unchanged,
-    errors: List.unmodifiable(errors),
-  );
-}
-
-class ScriptureDisplaySettings extends ChangeNotifier {
-  static const _storageKey = 'scripture_display_settings';
-  static const paperSurface = Color(0xFFFAF6EC);
-
-  int fontSize = 19;
-  double lineHeight = 1.9;
-  String fontFamily = 'serif';
-  String backgroundTheme = 'default';
-  bool showCollation = true;
-  bool showLineBeginnings = false;
-  bool showSimplifiedText = false;
-  SharedPreferences? _preferences;
-
-  Color get backgroundColor => switch (backgroundTheme) {
-    'warm' => const Color(0xFFF5E6C8),
-    'green' => const Color(0xFFE3EDCD),
-    'white' => const Color(0xFFFFFFFF),
-    'grey' => const Color(0xFFEAEAEA),
-    'night' => const Color(0xFF1A1714),
-    _ => const Color(0xFFF5EFE0),
-  };
-
-  Color get textColor => backgroundTheme == 'night'
-      ? const Color(0xFFDCD0BA)
-      : const Color(0xFF2C1810);
-
-  Color get surfaceColor =>
-      backgroundTheme == 'default' ? paperSurface : backgroundColor;
-
-  String get fontFamilyName => switch (fontFamily) {
-    'sans' => 'Noto Sans TC',
-    'kai' => 'KaiTi',
-    'system' => 'system-ui',
-    _ => 'Noto Serif TC',
-  };
-
-  Future<void> load() async {
-    _preferences = await SharedPreferences.getInstance();
-    fontSize = 19;
-    lineHeight = 1.9;
-    fontFamily = 'serif';
-    backgroundTheme = 'default';
-    showCollation = true;
-    showLineBeginnings = false;
-    showSimplifiedText = false;
-    final stored = _preferences!.getString(_storageKey);
-    if (stored == null) return;
-    final values = jsonDecode(stored) as Map<String, dynamic>;
-    final savedFontSize = values['fontSize'];
-    final savedLineHeight = values['lineHeight'];
-    final savedFontFamily = values['fontFamily'];
-    final savedBackground = values['backgroundTheme'];
-    final savedCollation = values['showCollation'];
-    final savedLineBeginnings = values['showLineBeginnings'];
-    final savedSimplifiedText = values['showSimplifiedText'];
-    if (savedFontSize is int && savedFontSize >= 14 && savedFontSize <= 32) {
-      fontSize = savedFontSize;
-    }
-    if (savedLineHeight is num &&
-        savedLineHeight >= 1.2 &&
-        savedLineHeight <= 3.0) {
-      lineHeight = savedLineHeight.toDouble();
-    }
-    if (savedFontFamily is String &&
-        const {'serif', 'sans', 'kai', 'system'}.contains(savedFontFamily)) {
-      fontFamily = savedFontFamily;
-    }
-    if (savedBackground is String &&
-        const {
-          'default',
-          'warm',
-          'green',
-          'white',
-          'grey',
-          'night',
-        }.contains(savedBackground)) {
-      backgroundTheme = savedBackground;
-    }
-    if (savedCollation is bool) showCollation = savedCollation;
-    if (savedLineBeginnings is bool) {
-      showLineBeginnings = savedLineBeginnings;
-    }
-    if (savedSimplifiedText is bool) {
-      showSimplifiedText = savedSimplifiedText;
-    }
-  }
-
-  Future<void> update({
-    int? fontSize,
-    double? lineHeight,
-    String? fontFamily,
-    String? backgroundTheme,
-    bool? showCollation,
-    bool? showLineBeginnings,
-    bool? showSimplifiedText,
-  }) async {
-    if (fontSize != null) this.fontSize = fontSize.clamp(14, 32);
-    if (lineHeight != null) {
-      this.lineHeight = (lineHeight.clamp(1.2, 3.0) * 10).round() / 10;
-    }
-    if (fontFamily != null) this.fontFamily = fontFamily;
-    if (backgroundTheme != null) this.backgroundTheme = backgroundTheme;
-    if (showCollation != null) this.showCollation = showCollation;
-    if (showLineBeginnings != null) {
-      this.showLineBeginnings = showLineBeginnings;
-    }
-    if (showSimplifiedText != null) {
-      this.showSimplifiedText = showSimplifiedText;
-    }
-    notifyListeners();
-
-    final preferences = _preferences;
-    if (preferences == null) {
-      throw StateError('經文設定尚未初始化');
-    }
-    final saved = await preferences.setString(
-      _storageKey,
-      jsonEncode({
-        'fontSize': this.fontSize,
-        'lineHeight': this.lineHeight,
-        'fontFamily': this.fontFamily,
-        'backgroundTheme': this.backgroundTheme,
-        'showCollation': this.showCollation,
-        'showLineBeginnings': this.showLineBeginnings,
-        'showSimplifiedText': this.showSimplifiedText,
-      }),
-    );
-    if (!saved) throw StateError('無法儲存經文顯示設定');
   }
 }
 
@@ -3562,7 +3188,7 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
     return juanCache.putIfAbsent(key, () async {
       final cached = await scriptureVolumeStore.read(work, juan);
       if (cached != null) return parseScriptureHtml(cached.html);
-      final latest = await _fetchScriptureVolume(work, juan);
+      final latest = await fetchScriptureVolume(work, juan);
       await scriptureVolumeStore.write(latest);
       return parseScriptureHtml(latest.html);
     });
@@ -3585,7 +3211,7 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
     if (juan == null) {
       throw FormatException('搜尋結果缺少卷數，無法載入完整經卷：$linehead');
     }
-    final latest = await _fetchScriptureVolume(work, juan);
+    final latest = await fetchScriptureVolume(work, juan);
     await scriptureVolumeStore.write(latest);
     return parseScriptureHtml(latest.html);
   }
@@ -4116,357 +3742,6 @@ TextStyle _scriptureTextStyle(ScriptureDisplaySettings settings) {
     letterSpacing: 0.02 * settings.fontSize,
     color: settings.textColor,
   );
-}
-
-class ScriptureLine {
-  const ScriptureLine({
-    required this.text,
-    this.linehead,
-    this.footnotes = const [],
-    this.inlineNotes = const [],
-    this.verseCells = const [],
-    this.images = const [],
-    this.tableRows = const [],
-    this.headingLevel = 0,
-    this.role = ScriptureLineRole.regular,
-  });
-
-  final String text;
-  final String? linehead;
-  final List<ScriptureFootnote> footnotes;
-  final List<ScriptureInlineNote> inlineNotes;
-  final List<String> verseCells;
-  final List<ScriptureImage> images;
-  final List<List<ScriptureTableCell>> tableRows;
-  final int headingLevel;
-  final ScriptureLineRole role;
-}
-
-enum ScriptureLineRole { regular, volumeTitle, byline, navigationAnchor }
-
-class ScriptureImage {
-  const ScriptureImage({required this.source, this.alt = ''});
-
-  final String source;
-  final String alt;
-}
-
-class ScriptureTableCell {
-  const ScriptureTableCell({required this.text, this.columnSpan = 1});
-
-  final String text;
-  final int columnSpan;
-}
-
-class ScriptureInlineNote {
-  const ScriptureInlineNote({required this.offset, required this.length});
-
-  final int offset;
-  final int length;
-}
-
-class ScriptureFootnote {
-  const ScriptureFootnote({
-    required this.offset,
-    required this.label,
-    required this.clue,
-    required this.content,
-  });
-
-  final int offset;
-  final String label;
-  final String clue;
-  final String content;
-}
-
-String visibleScriptureLine(
-  ScriptureLine line, {
-  required bool showLineBeginnings,
-  required bool showCollation,
-}) {
-  final result = StringBuffer();
-  if (showLineBeginnings &&
-      line.linehead != null &&
-      line.role != ScriptureLineRole.navigationAnchor) {
-    result
-      ..write('[')
-      ..write(line.linehead!.split('_p').last)
-      ..write('] ');
-  }
-  var offset = 0;
-  if (showCollation) {
-    for (final footnote in line.footnotes) {
-      final noteOffset = footnote.offset.clamp(offset, line.text.length);
-      result
-        ..write(line.text.substring(offset, noteOffset))
-        ..write('[${footnote.label}]');
-      offset = noteOffset;
-    }
-  }
-  result.write(line.text.substring(offset));
-  if (line.verseCells.isNotEmpty) result.write('\n');
-  return result.toString();
-}
-
-List<ScriptureLine> parseScriptureHtml(String source) {
-  final fragment = parseFragment(source);
-  final root = fragment.querySelector('#body') ?? fragment;
-  final footnoteContent = {
-    for (final note in fragment.querySelectorAll('#back .footnote'))
-      if (note.id.isNotEmpty)
-        note.id: note.text.trim().replaceAll(RegExp(r'\s+'), ' '),
-  };
-  final lines = <ScriptureLine>[];
-  String? linehead;
-  var headingLevel = 0;
-  var lineRole = ScriptureLineRole.regular;
-  final text = StringBuffer();
-  StringBuffer? activeCell;
-  List<String> verseCells = [];
-  final images = <ScriptureImage>[];
-  List<List<ScriptureTableCell>> tableRows = [];
-  var footnotes = <ScriptureFootnote>[];
-  var inlineNotes = <ScriptureInlineNote>[];
-
-  void flushLine() {
-    if (linehead != null ||
-        text.isNotEmpty ||
-        images.isNotEmpty ||
-        tableRows.isNotEmpty) {
-      final rawText = text.toString();
-      final trimmedText = rawText
-          .replaceFirst(RegExp(r'^[ \t]+'), '')
-          .replaceFirst(RegExp(r'[ \t]+$'), '');
-      final leadingWhitespace =
-          rawText.length - rawText.replaceFirst(RegExp(r'^[ \t]+'), '').length;
-      lines.add(
-        ScriptureLine(
-          text: trimmedText,
-          linehead: linehead,
-          footnotes: footnotes
-              .map(
-                (note) => ScriptureFootnote(
-                  offset: (note.offset - leadingWhitespace).clamp(
-                    0,
-                    trimmedText.length,
-                  ),
-                  label: note.label,
-                  clue: note.clue,
-                  content: note.content,
-                ),
-              )
-              .toList(),
-          inlineNotes: inlineNotes
-              .map(
-                (note) => ScriptureInlineNote(
-                  offset: (note.offset - leadingWhitespace).clamp(
-                    0,
-                    trimmedText.length,
-                  ),
-                  length: note.length,
-                ),
-              )
-              .toList(),
-          verseCells: verseCells,
-          images: List.unmodifiable(images),
-          tableRows: List.unmodifiable(
-            tableRows.map((row) => List<ScriptureTableCell>.unmodifiable(row)),
-          ),
-          headingLevel: headingLevel,
-          role: lineRole,
-        ),
-      );
-    }
-    linehead = null;
-    text.clear();
-    verseCells = [];
-    images.clear();
-    tableRows = [];
-    footnotes = [];
-    inlineNotes = [];
-    headingLevel = 0;
-    lineRole = ScriptureLineRole.regular;
-  }
-
-  void appendText(String value) {
-    text.write(value);
-    activeCell?.write(value);
-  }
-
-  String tableCellText(html_dom.Node node) {
-    if (node is html_dom.Text) return node.data;
-    if (node is! html_dom.Element) return '';
-    if (node.classes.contains('lb') || node.classes.contains('lineInfo')) {
-      return '';
-    }
-    if (node.localName == 'br') return '\n';
-    final children = node.nodes.map(tableCellText).join();
-    return const {'p', 'div'}.contains(node.localName)
-        ? '$children\n'
-        : children;
-  }
-
-  void visit(html_dom.Node node) {
-    if (node is html_dom.Element && node.classes.contains('lb')) {
-      flushLine();
-      linehead = node.attributes['id'];
-      return;
-    }
-    if (node is html_dom.Element && node.localName == 'img') {
-      final source = node.attributes['src']?.trim() ?? '';
-      if (source.isNotEmpty) {
-        final uri = Uri.tryParse(source);
-        if (uri != null) {
-          images.add(
-            ScriptureImage(
-              source: uri.hasScheme
-                  ? source
-                  : Uri.parse(
-                      'https://cbetaonline.dila.edu.tw/',
-                    ).resolveUri(uri).toString(),
-              alt: node.attributes['alt']?.trim() ?? '',
-            ),
-          );
-        }
-      }
-      return;
-    }
-    if (node is html_dom.Element &&
-        (node.classes.contains('bip-table-row') || node.localName == 'tr')) {
-      final cells = node.children
-          .where(
-            (child) =>
-                child.classes.contains('bip-table-cell') ||
-                child.localName == 'td' ||
-                child.localName == 'th',
-          )
-          .map((cell) {
-            final cellText = cell.nodes.map(tableCellText).join().trim();
-            final columnSpan =
-                int.tryParse(cell.attributes['colspan'] ?? '') ?? 1;
-            return ScriptureTableCell(
-              text: cellText.replaceAll(RegExp(r'\s+'), ' '),
-              columnSpan: columnSpan.clamp(1, 12),
-            );
-          })
-          .toList();
-      if (cells.length > 1) {
-        if (text.isNotEmpty || images.isNotEmpty || tableRows.isNotEmpty) {
-          flushLine();
-        }
-        tableRows = [cells];
-        text.write(cells.map((cell) => cell.text).join('\t'));
-        flushLine();
-        return;
-      }
-    }
-    if (node is html_dom.Element &&
-        node.localName == 'a' &&
-        node.classes.contains('noteAnchor')) {
-      final href = node.attributes['href'] ?? '';
-      final clue = href.replaceFirst(RegExp(r'^#'), '');
-      final addNote = node.classes.contains('add');
-      final noteNumber = RegExp(r'n\d+(\d{3})$').firstMatch(href)?.group(1);
-      final label = addNote
-          ? 'A${RegExp(r'(\d+)$').firstMatch(clue)?.group(1) ?? ''}'
-          : noteNumber == null
-          ? null
-          : int.tryParse(noteNumber)?.toString();
-      if (label != null && clue.isNotEmpty) {
-        footnotes.add(
-          ScriptureFootnote(
-            offset: text.length,
-            label: label,
-            clue: clue,
-            content: footnoteContent[clue] ?? '',
-          ),
-        );
-      }
-      return;
-    }
-    if (node is html_dom.Text) {
-      appendText(node.data);
-      return;
-    }
-    if (node is html_dom.Element && node.localName == 'br') {
-      appendText('\n');
-      return;
-    }
-    if (node is html_dom.Element &&
-        (node.classes.contains('inline-note') ||
-            node.classes.contains('doube-line-note'))) {
-      final start = text.length;
-      appendText('（');
-      for (final child in node.nodes) {
-        visit(child);
-      }
-      appendText('）');
-      inlineNotes.add(
-        ScriptureInlineNote(offset: start, length: text.length - start),
-      );
-      return;
-    }
-    if (node is html_dom.Element && node.classes.contains('lg-row')) {
-      verseCells = [];
-      for (final cell in node.children.where(
-        (child) => child.classes.contains('lg-cell'),
-      )) {
-        final cellText = StringBuffer();
-        activeCell = cellText;
-        for (final child in cell.nodes) {
-          visit(child);
-        }
-        verseCells.add(cellText.toString().trim());
-      }
-      activeCell = null;
-      flushLine();
-      return;
-    }
-    final isBlock = node is html_dom.Element && node.localName == 'p';
-    final isVolumeTitle = isBlock && node.classes.contains('juan');
-    final isByline = isBlock && node.classes.contains('byline');
-    final isStyledLine = isVolumeTitle || isByline;
-    final isHeading =
-        isBlock &&
-        (node.classes.contains('head') ||
-            node.attributes.containsKey('data-head-level'));
-    if ((isHeading || isStyledLine) && text.isNotEmpty) flushLine();
-    if (isVolumeTitle) lineRole = ScriptureLineRole.volumeTitle;
-    if (isByline) lineRole = ScriptureLineRole.byline;
-    if (isHeading) {
-      headingLevel =
-          int.tryParse(node.attributes['data-head-level'] ?? '') ?? 1;
-      headingLevel = headingLevel.clamp(1, 6);
-    }
-    if (isBlock && text.isNotEmpty && !text.toString().endsWith('\n')) {
-      appendText('\n');
-    }
-    for (final child in node.nodes) {
-      visit(child);
-    }
-    if (isBlock && text.isNotEmpty && !text.toString().endsWith('\n')) {
-      appendText('\n');
-    }
-    if (isHeading || isStyledLine) flushLine();
-  }
-
-  for (final child in root.nodes) {
-    visit(child);
-  }
-  flushLine();
-  final seenVolumeTitles = <String>{};
-  return lines.map((line) {
-    if (line.role != ScriptureLineRole.volumeTitle) return line;
-    final normalizedTitle = line.text
-        .replaceAll(RegExp(r'\s+'), '')
-        .replaceAll(RegExp(r'\[\d+\]'), '');
-    if (seenVolumeTitles.add(normalizedTitle)) return line;
-    return ScriptureLine(
-      text: '',
-      linehead: line.linehead,
-      role: ScriptureLineRole.navigationAnchor,
-    );
-  }).toList();
 }
 
 class _SelectablePassageText extends StatefulWidget {
@@ -5231,51 +4506,6 @@ TextSpan _interactivePassageText(
   return TextSpan(children: children);
 }
 
-class ScripturePassage {
-  const ScripturePassage({
-    required this.title,
-    required this.reference,
-    required this.text,
-    this.linehead,
-    this.juan,
-    this.work,
-    this.availableJuans = const [],
-    this.lines = const [],
-    this.showCollation = true,
-    this.showLineBeginnings = false,
-  });
-
-  final String title;
-  final String reference;
-  final String text;
-  final String? linehead;
-  final String? juan;
-  final String? work;
-  final List<int> availableJuans;
-  final List<ScriptureLine> lines;
-  final bool showCollation;
-  final bool showLineBeginnings;
-
-  ScripturePassage copyWith({
-    required String? linehead,
-    String? juan,
-    String? reference,
-  }) {
-    return ScripturePassage(
-      title: title,
-      reference: reference ?? this.reference,
-      text: text,
-      linehead: linehead,
-      juan: juan ?? this.juan,
-      work: work,
-      availableJuans: availableJuans,
-      lines: lines,
-      showCollation: showCollation,
-      showLineBeginnings: showLineBeginnings,
-    );
-  }
-}
-
 class _SearchResultNavigation extends StatelessWidget {
   const _SearchResultNavigation({
     required this.current,
@@ -5426,18 +4656,6 @@ String? _lineheadAtOffset(
     currentOffset = lineEnd;
   }
   return currentLinehead;
-}
-
-class ScriptureSearchResult {
-  const ScriptureSearchResult({
-    required this.title,
-    required this.description,
-    required this.passages,
-  });
-
-  final String title;
-  final String description;
-  final List<ScripturePassage> passages;
 }
 
 TextSpan _highlightedPassageText(String text, String query, {int? startAt}) {
@@ -6773,69 +5991,6 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
   );
 }
 
-const _cbssRetrieveBase = 'https://cbss.dila.edu.tw/rag/retrieve/';
-const _cbssLlmUrl = 'https://cbetaonline.dila.edu.tw/cbss/llmStream.php';
-
-class _AiChunk {
-  const _AiChunk({
-    required this.chunkId,
-    required this.work,
-    required this.linehead,
-    required this.text,
-    required this.title,
-    required this.byline,
-    required this.category,
-    required this.juan,
-    required this.score,
-  });
-
-  final String chunkId;
-  final String work;
-  final String linehead;
-  final String text;
-  final String title;
-  final String byline;
-  final String category;
-  final int? juan;
-  final double score;
-
-  factory _AiChunk.fromJson(Map<String, dynamic> json) => _AiChunk(
-    chunkId: '${json['chunk_id'] ?? ''}',
-    work: '${json['work'] ?? ''}',
-    linehead: '${json['linehead'] ?? ''}',
-    text: '${json['text'] ?? ''}',
-    title: '${json['title'] ?? ''}',
-    byline: '${json['byline'] ?? ''}',
-    category: '${json['category'] ?? ''}',
-    juan: json['juan'] is num
-        ? (json['juan'] as num).toInt()
-        : int.tryParse('${json['juan']}'),
-    score:
-        (json['score'] as num?)?.toDouble() ??
-        (json['vector_similarity'] as num?)?.toDouble() ??
-        0,
-  );
-
-  Map<String, Object?> toLlmJson() => {
-    'chunk_id': chunkId,
-    'work': work,
-    'linehead': linehead,
-    'text': text,
-    'title': title,
-    'juan': juan,
-    'score': score,
-  };
-
-  ScripturePassage toPassage() => ScripturePassage(
-    title: title.isEmpty ? work : title,
-    reference: juan == null ? '' : '卷 $juan',
-    text: '',
-    linehead: linehead.isEmpty ? null : linehead,
-    juan: juan?.toString(),
-    work: work,
-  );
-}
-
 class _AiSearchPage extends StatefulWidget {
   const _AiSearchPage({required this.initialQuery});
 
@@ -6848,8 +6003,8 @@ class _AiSearchPage extends StatefulWidget {
 class _AiSearchPageState extends State<_AiSearchPage> {
   late final TextEditingController controller;
   final ScrollController scrollController = ScrollController();
-  final StringBuffer _jsonBuffer = StringBuffer();
-  final List<_AiChunk> chunks = [];
+  final AiSearchService aiService = AiSearchService();
+  final List<AiChunk> chunks = [];
   final List<String> relatedQuestions = [];
   String submittedQuery = '';
   String answer = '';
@@ -6857,7 +6012,6 @@ class _AiSearchPageState extends State<_AiSearchPage> {
   bool retrieving = false;
   bool generating = false;
   int _requestToken = 0;
-  http.Client? _client;
 
   @override
   void initState() {
@@ -6871,7 +6025,7 @@ class _AiSearchPageState extends State<_AiSearchPage> {
   @override
   void dispose() {
     _requestToken++;
-    _client?.close();
+    aiService.cancel();
     controller.dispose();
     scrollController.dispose();
     super.dispose();
@@ -6882,8 +6036,8 @@ class _AiSearchPageState extends State<_AiSearchPage> {
     if (input.isEmpty) return;
     controller.text = input;
     FocusScope.of(context).unfocus();
+    aiService.cancel();
     final token = ++_requestToken;
-    _jsonBuffer.clear();
     setState(() {
       submittedQuery = SimplifiedTraditionalConverter.convert(input);
       chunks.clear();
@@ -6901,10 +6055,41 @@ class _AiSearchPageState extends State<_AiSearchPage> {
       return;
     }
     try {
-      await _retrieve(token);
+      await aiService.retrieve(
+        submittedQuery,
+        onBatch: (arrived) {
+          if (!mounted || token != _requestToken) return;
+          setState(() => chunks.addAll(arrived));
+        },
+        isCancelled: () => !mounted || token != _requestToken,
+      );
       if (!mounted || token != _requestToken) return;
+      if (chunks.isEmpty) {
+        setState(() => retrieving = false);
+        return;
+      }
       chunks.sort((a, b) => b.score.compareTo(a.score));
-      await _generate(token);
+      setState(() {
+        retrieving = false;
+        generating = true;
+      });
+      final result = await aiService.generate(
+        submittedQuery,
+        chunks,
+        onAnswer: (value) {
+          if (!mounted || token != _requestToken) return;
+          setState(() => answer = value);
+        },
+        isCancelled: () => !mounted || token != _requestToken,
+      );
+      if (!mounted || token != _requestToken) return;
+      setState(() {
+        answer = result.answer;
+        relatedQuestions
+          ..clear()
+          ..addAll(result.relatedQuestions);
+        generating = false;
+      });
     } catch (exception) {
       if (!mounted || token != _requestToken) return;
       setState(() {
@@ -6915,182 +6100,19 @@ class _AiSearchPageState extends State<_AiSearchPage> {
     }
   }
 
-  Future<void> _retrieve(int token) async {
-    final uri = Uri.parse(_cbssRetrieveBase).replace(
-      queryParameters: {
-        'q': submittedQuery,
-        'stream': '1',
-        'cache': '0',
-        'rows': '30',
-        'start': '0',
-        'log_query': '0',
-      },
-    );
-    final client = http.Client();
-    _client = client;
-    try {
-      final response = await client
-          .send(http.Request('GET', uri))
-          .timeout(const Duration(seconds: 30));
-      if (response.statusCode != 200) {
-        throw Exception('語意檢索 API 回傳 ${response.statusCode}');
-      }
-      await for (final part in response.stream.transform(utf8.decoder)) {
-        if (token != _requestToken) return;
-        final arrived = <_AiChunk>[];
-        _consumeJson(part, (obj) {
-          final chunk = _AiChunk.fromJson(obj);
-          if (chunk.text.isNotEmpty && chunk.linehead.isNotEmpty) {
-            arrived.add(chunk);
-          }
-        });
-        if (arrived.isEmpty) continue;
-        if (!mounted || token != _requestToken) return;
-        setState(() => chunks.addAll(arrived));
-        if (chunks.length >= 30) break;
-      }
-    } finally {
-      client.close();
-      if (identical(_client, client)) _client = null;
-      if (mounted && token == _requestToken) {
-        setState(() => retrieving = false);
-      }
-    }
-  }
-
-  Future<void> _generate(int token) async {
-    if (chunks.isEmpty) return;
-    setState(() => generating = true);
-    final client = http.Client();
-    _client = client;
-    final answerBuffer = StringBuffer();
-    final relatedBuffer = StringBuffer();
-    final tagStack = <String>[];
-    var inRelated = false;
-    try {
-      final request = http.Request('POST', Uri.parse(_cbssLlmUrl))
-        ..headers['Content-Type'] = 'application/json'
-        ..body = jsonEncode({
-          'query': submittedQuery,
-          'chunks': [for (final chunk in chunks.take(20)) chunk.toLlmJson()],
-          'lang': 'zh-hant-tw',
-        });
-      final response = await client.send(request);
-      if (response.statusCode != 200) {
-        throw Exception('AI 生成 API 回傳 ${response.statusCode}');
-      }
-      await for (final part in response.stream.transform(utf8.decoder)) {
-        if (token != _requestToken) return;
-        _consumeJson(part, (obj) {
-          switch (obj['t']) {
-            case 'start':
-              final tag = '${obj['tag']}';
-              tagStack.add(tag);
-              if (tag == 'blockquote') {
-                inRelated = true;
-              } else if (tag == 'p') {
-                (inRelated ? relatedBuffer : answerBuffer).write('\n');
-              }
-            case 'end':
-              if (tagStack.isNotEmpty) tagStack.removeLast();
-            case 'text':
-              // 引用錨點 (<a rel="noopener noreferrer">) 會挾帶一個多餘的
-              // 佔位文字 ("r")，官方網頁會把整個錨點刪除或改寫成引用編號，
-              // 因此這裡直接略過錨點內的文字，避免露出雜訊。
-              if (tagStack.contains('a')) break;
-              final data = obj['data'];
-              if (data is String && data.isNotEmpty) {
-                (inRelated ? relatedBuffer : answerBuffer).write(data);
-              }
-          }
-        });
-        if (!mounted || token != _requestToken) return;
-        setState(() => answer = answerBuffer.toString().trim());
-      }
-      if (!mounted || token != _requestToken) return;
-      setState(() {
-        answer = answerBuffer.toString().trim();
-        relatedQuestions
-          ..clear()
-          ..addAll(
-            relatedBuffer
-                .toString()
-                .split('\n')
-                .map((line) => line.trim())
-                .where((line) => line.isNotEmpty),
-          );
-        generating = false;
-      });
-    } finally {
-      client.close();
-      if (identical(_client, client)) _client = null;
-      if (mounted && token == _requestToken && generating) {
-        setState(() => generating = false);
-      }
-    }
-  }
-
-  void _consumeJson(
-    String chunk,
-    void Function(Map<String, dynamic> object) handler,
-  ) {
-    _jsonBuffer.write(chunk);
-    final text = _jsonBuffer.toString();
-    var searchFrom = 0;
-    var consumed = 0;
-    while (true) {
-      final start = text.indexOf('{', searchFrom);
-      if (start < 0) break;
-      var depth = 0;
-      var inString = false;
-      var escaped = false;
-      var end = -1;
-      for (var i = start; i < text.length; i++) {
-        final code = text.codeUnitAt(i);
-        if (inString) {
-          if (escaped) {
-            escaped = false;
-          } else if (code == 0x5C) {
-            escaped = true;
-          } else if (code == 0x22) {
-            inString = false;
-          }
-        } else if (code == 0x22) {
-          inString = true;
-        } else if (code == 0x7B) {
-          depth++;
-        } else if (code == 0x7D) {
-          depth--;
-          if (depth == 0) {
-            end = i;
-            break;
-          }
-        }
-      }
-      if (end < 0) {
-        consumed = start;
-        break;
-      }
-      try {
-        final decoded = jsonDecode(text.substring(start, end + 1));
-        if (decoded is Map<String, dynamic>) handler(decoded);
-      } catch (_) {
-        // Ignore incomplete or malformed fragments and keep reading.
-      }
-      searchFrom = end + 1;
-      consumed = end + 1;
-    }
-    _jsonBuffer
-      ..clear()
-      ..write(text.substring(consumed));
-  }
-
-  Future<void> _openChunk(_AiChunk chunk) async {
+  Future<void> _openChunk(AiChunk chunk) async {
     if (chunk.linehead.isEmpty) return;
     await Navigator.of(context).push<void>(
       MaterialPageRoute(
         builder: (_) => ScriptureReaderPage(
-          passage: chunk.toPassage(),
+          passage: ScripturePassage(
+            title: chunk.title.isEmpty ? chunk.work : chunk.title,
+            reference: chunk.juan == null ? '' : '卷 ${chunk.juan}',
+            text: '',
+            linehead: chunk.linehead.isEmpty ? null : chunk.linehead,
+            juan: chunk.juan?.toString(),
+            work: chunk.work,
+          ),
           query: '',
           searchHits: const [],
           initialHitIndex: 0,
@@ -7292,7 +6314,7 @@ class _AiSearchPageState extends State<_AiSearchPage> {
     ),
   );
 
-  Widget _buildChunkCard(BuildContext context, _AiChunk chunk) {
+  Widget _buildChunkCard(BuildContext context, AiChunk chunk) {
     final details = [
       if (chunk.title.isNotEmpty) chunk.title,
       if (chunk.byline.isNotEmpty) chunk.byline,

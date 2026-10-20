@@ -1,0 +1,23 @@
+# AI Agent 上下文排除：生成物、依赖缓存、体积大的数据文件
+build/
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+android/.gradle/
+android/app/build/
+android/local.properties
+linux/flutter/ephemeral/
+windows/flutter/ephemeral/
+macos/Flutter/ephemeral/
+web/main.dart.js
+web/main.dart.js_*.part.js
+web/canvaskit/
+assets/fonts/
+assets/hanzi_simplified_to_traditional.json
+assets/hanzi_traditional_to_simplified.json
+assets/phrases_simplified_to_traditional.json
+assets/phrases_traditional_to_simplified.json
+*.log
+*.tmp
+tmp/
