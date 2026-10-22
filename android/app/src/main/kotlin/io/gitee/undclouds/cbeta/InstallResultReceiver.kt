@@ -1,4 +1,4 @@
-package com.example.xuefo
+package io.gitee.undclouds.cbeta
 
 import android.content.BroadcastReceiver
 import android.content.Context

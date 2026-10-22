@@ -19,6 +19,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import 'ai/ai_chunk.dart';
 import 'ai/ai_search_service.dart';
+import 'dictionary/dictionary_page.dart';
 import 'scripture/cache.dart';
 import 'scripture/models.dart';
 import 'scripture/parser.dart';
@@ -6446,7 +6447,7 @@ Future<String> _cachedPickerText(Uri uri, String serviceName) async {
 }
 
 class _WorkPickerPageState extends State<_WorkPickerPage> {
-  static const _tabs = ['部類', '冊別', '作譯者', '年代', '經目查詢', 'Goto 查詢'];
+  static const _tabs = ['部類', '冊別', '作譯者', '年代', '經目查詢', 'Goto 查詢', '詞典查詢'];
 
   final Map<int, List<({String q, String label})>> catalogLevels = {
     0: [],
@@ -7170,18 +7171,81 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
                 onSearch: _searchToc,
                 onSelection: _onTocSelection,
               ),
-              _ => _buildSearchTab(
+              5 => _buildSearchTab(
                 controller: gotoController,
                 hint: '輸入行號或完整引文，如 CBETA 2026.R2, B22, no. 117, p. 5a1',
                 buttonText: '到該行',
                 onSearch: _gotoLine,
               ),
+              _ => _buildDictionaryTab(),
             },
           ),
         ],
       ),
     ),
   );
+
+  Future<String> _getFodictBaseDir() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return '${dir.path}/fodict';
+  }
+
+  Widget _buildDictionaryTab() {
+    return FutureBuilder<String>(
+      future: _getFodictBaseDir(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (snapshot.hasError) {
+          return Center(
+            child: Text('無法載入詞典路徑：${snapshot.error}'),
+          );
+        }
+        final baseDir = snapshot.data!;
+        return Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  Icons.menu_book_outlined,
+                  size: 64,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  _displayText('佛學詞典查詢', context),
+                  style: Theme.of(context).textTheme.headlineSmall,
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  _displayText('收錄 28 部佛學詞典，支援關鍵詞搜尋', context),
+                  style: Theme.of(context).textTheme.bodyMedium,
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 24),
+                FilledButton.icon(
+                  onPressed: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (context) => DictionarySearchPage(
+                          fodictBaseDir: baseDir,
+                        ),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.search_rounded),
+                  label: Text(_displayText('開啟詞典查詢', context)),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
 
   @override
   void dispose() {

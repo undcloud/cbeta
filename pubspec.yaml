@@ -37,3 +37,9 @@ flutter:
     - assets/hanzi_traditional_to_simplified.json
     - assets/phrases_simplified_to_traditional.json
     - assets/phrases_traditional_to_simplified.json
+    - assets/fodict/012.weishi-j/fodict.dat
+    - assets/fodict/013.fajie-j/fodict.dat
+    - assets/fodict/013.fajie-j/fodict.idx
+    - assets/fodict/014.famen-j/fodict.dat
+    - assets/fodict/014.famen-j/fodict.idx
+    - assets/fodict/014.famen-j/fodict.ini
