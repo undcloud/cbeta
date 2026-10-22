@@ -3881,20 +3881,31 @@ class _SelectablePassageTextState extends State<_SelectablePassageText> {
               );
             },
             contextMenuBuilder: (context, editableTextState) {
-              final buttonItems = editableTextState.contextMenuButtonItems.map((
-                item,
-              ) {
-                if (item.type == ContextMenuButtonType.copy) {
-                  return item.copyWith(
-                    label: '複製引文',
-                    onPressed: () {
-                      _copyCitation();
-                      editableTextState.hideToolbar();
-                    },
-                  );
-                }
-                return item;
-              }).toList();
+              final textEditingValue = editableTextState.textEditingValue;
+              final selectedText = textEditingValue.selection.textInside(textEditingValue.text);
+              
+              final buttonItems = <ContextMenuButtonItem>[
+                ContextMenuButtonItem(
+                  label: '複製',
+                  onPressed: () async {
+                    await Clipboard.setData(ClipboardData(text: selectedText));
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('已複製')),
+                      );
+                    }
+                    editableTextState.hideToolbar();
+                  },
+                ),
+                ContextMenuButtonItem(
+                  label: '複製引文',
+                  onPressed: () {
+                    _copyCitation();
+                    editableTextState.hideToolbar();
+                  },
+                ),
+              ];
+              
               return AdaptiveTextSelectionToolbar.buttonItems(
                 anchors: editableTextState.contextMenuAnchors,
                 buttonItems: buttonItems,
