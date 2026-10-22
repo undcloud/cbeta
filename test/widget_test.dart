@@ -116,7 +116,7 @@ void main() {
     expect(lines.last.inlineNotes.single.length, '（夾注）'.length);
   });
 
-  test('scripture HTML retains hidden anchors for duplicate volume titles', () {
+  test('scripture HTML keeps duplicate volume titles searchable', () {
     final lines = parseScriptureHtml(
       '<div id="body">'
       '<span class="lb" id="T01n0003_p0154b05"></span>'
@@ -132,13 +132,14 @@ void main() {
     expect(lines.first.text, '毘婆尸佛經卷上\n');
     expect(lines.last.role, ScriptureLineRole.navigationAnchor);
     expect(lines.last.linehead, 'T01n0003_p0156c08');
+    expect(lines.last.text, '毘婆尸佛經卷上\n');
     expect(
       visibleScriptureLine(
         lines.last,
         showLineBeginnings: true,
         showCollation: true,
       ),
-      '',
+      '[1]毘婆尸佛經卷上\n',
     );
   });
 
@@ -456,6 +457,275 @@ void main() {
       final parsed = await scriptureVolumeStore.read('T0102', '1');
       expect(parsed?.html, scriptureHtml);
     }, () => client);
+  });
+
+  testWidgets('reader distinguishes opening and closing title hits', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: true,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    final buffer = StringBuffer(
+      '<html><body><div id="body">'
+      '<span class="lb" id="T02n0102_p0499c05"></span>'
+      '<p class="juan">佛說五蘊皆空經</p>'
+      '<span class="lb" id="T02n0102_p0499c08"></span>'
+      '<p>如是我聞。</p>',
+    );
+    for (var i = 10; i < 50; i++) {
+      buffer.write(
+        '<span class="lb" id="T02n0102_p0499c${i.toString().padLeft(2, '0')}">'
+        '</span><p>第 $i 行內容，觀此五取蘊等法。</p>',
+      );
+    }
+    buffer.write(
+      '<span class="lb" id="T02n0102_p0499c28"></span>'
+      '<p class="juan">佛說五蘊皆空經</p>'
+      '</div></body></html>',
+    );
+    final scriptureHtml = buffer.toString();
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [scriptureHtml],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    const closingTitleHit = ScripturePassage(
+      title: '佛說五蘊皆空經',
+      reference: '卷1 · 0499c28',
+      text: '佛說五蘊皆空經',
+      linehead: 'T02n0102_p0499c28',
+      juan: '1',
+      work: 'T0102',
+    );
+    const openingTitleHit = ScripturePassage(
+      title: '佛說五蘊皆空經',
+      reference: '卷1 · 0499c05',
+      text: '佛說五蘊皆空經',
+      linehead: 'T02n0102_p0499c05',
+      juan: '1',
+      work: 'T0102',
+    );
+
+    Future<({double pixels, List<String> bodyHighlights})> openHit(
+      ScripturePassage passage,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ScriptureReaderPage(
+            key: ValueKey<String>(passage.linehead!),
+            passage: passage,
+            query: '五蘊',
+            searchHits: const [openingTitleHit, closingTitleHit],
+            initialHitIndex: passage.linehead == openingTitleHit.linehead
+                ? 0
+                : 1,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final scrollable = tester.state<ScrollableState>(
+        find
+            .descendant(
+              of: find.byType(SingleChildScrollView).first,
+              matching: find.byType(Scrollable),
+            )
+            .first,
+      );
+      final highlights = <String>[];
+      void collect(InlineSpan? span) {
+        if (span == null || span is! TextSpan) return;
+        if (span.style?.backgroundColor == const Color(0xFFDDEDE8)) {
+          highlights.add(span.text ?? '');
+        }
+        for (final child in span.children ?? const <InlineSpan>[]) {
+          collect(child);
+        }
+      }
+
+      collect(
+        tester
+            .widget<SelectableText>(find.byType(SelectableText).first)
+            .textSpan,
+      );
+      return (pixels: scrollable.position.pixels, bodyHighlights: highlights);
+    }
+
+    await http.runWithClient(() async {
+      // 開頭經題（標題列）：回到卷首，只在標題列高亮。
+      final opening = await openHit(openingTitleHit);
+      expect(opening.pixels, 0);
+      expect(opening.bodyHighlights, isEmpty);
+
+      // 卷末重複經題：滑到它在正文中的實際位置並在正文高亮，
+      // 不會和標題列重複高亮。
+      final closing = await openHit(closingTitleHit);
+      expect(closing.bodyHighlights, contains('五蘊'));
+      expect(closing.pixels, greaterThan(0));
+    }, () => client);
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+  });
+
+  testWidgets('reader distinguishes repeated hits sharing a linehead', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    const scriptureHtml =
+        '<html><body><div id="body">'
+        '<span class="lb" id="T01n0001_p0001a01"></span>'
+        '<p>五蘊五蘊</p>'
+        '</div></body></html>';
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [scriptureHtml],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    const hit = ScripturePassage(
+      title: '測試經',
+      reference: '卷1 · 0001a01',
+      text: '五蘊五蘊',
+      linehead: 'T01n0001_p0001a01',
+      juan: '1',
+      work: 'T0001',
+    );
+
+    Future<int> openAndCountHighlights(int hitIndex) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ScriptureReaderPage(
+            key: ValueKey<int>(hitIndex),
+            passage: hit,
+            query: '五蘊',
+            searchHits: const [hit, hit],
+            initialHitIndex: hitIndex,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final selectable = tester.widget<SelectableText>(
+        find.byType(SelectableText).first,
+      );
+      var count = 0;
+      void collect(InlineSpan span) {
+        if (span is! TextSpan) return;
+        if (span.style?.backgroundColor == const Color(0xFFDDEDE8)) count += 1;
+        for (final child in span.children ?? const <InlineSpan>[]) {
+          collect(child);
+        }
+      }
+
+      collect(selectable.textSpan!);
+      return count;
+    }
+
+    await http.runWithClient(() async {
+      expect(await openAndCountHighlights(0), 2);
+      expect(await openAndCountHighlights(1), 1);
+    }, () => client);
+  });
+
+  testWidgets('reader keeps the title visible when the hit is the title', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: true,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    final buffer = StringBuffer('<div id="body">');
+    buffer.write(
+      '<span class="lb" id="T02n0102_p0499c05"></span>'
+      '<p class="juan">佛說五蘊皆空經</p>',
+    );
+    buffer.write(
+      '<span class="lb" id="T02n0102_p0499c07"></span>'
+      '<p class="byline">大唐三藏法師義淨奉制譯</p>',
+    );
+    for (var i = 8; i < 60; i++) {
+      final linehead = 'T02n0102_p0499c${i.toString().padLeft(2, '0')}';
+      buffer.write(
+        '<span class="lb" id="$linehead"></span>'
+        '<p>第 $i 行內容，五取蘊等法。</p>',
+      );
+    }
+    buffer.write(
+      '<span class="lb" id="T02n0102_p0499c28"></span>'
+      '<p class="juan">佛說五蘊皆空經</p>',
+    );
+    buffer.write('</div>');
+    final html = buffer.toString();
+
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [html],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    const titleHit = ScripturePassage(
+      title: '佛說五蘊皆空經',
+      reference: '卷1 · 0499c05',
+      text: '佛說五蘊皆空經',
+      linehead: 'T02n0102_p0499c05',
+      juan: '1',
+      work: 'T0102',
+    );
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: titleHit,
+            query: '五蘊',
+            searchHits: [titleHit],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final scrollable = tester.state<ScrollableState>(
+        find.byType(Scrollable).last,
+      );
+      expect(scrollable.position.pixels, 0);
+    }, () => client);
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
   });
 
   testWidgets('reader styles volume titles, bylines, and inline notes', (
@@ -2270,7 +2540,8 @@ void main() {
         find.byType(SingleChildScrollView).first,
       );
       final viewportRect = viewport.localToGlobal(Offset.zero) & viewport.size;
-      expect((caret.dy - viewportRect.center.dy).abs(), lessThan(40));
+      // 命中行預設置中顯示。
+      expect((caret.dy - viewportRect.center.dy).abs(), lessThan(60));
 
       final text = tester.widget<SelectableText>(
         find.byType(SelectableText).first,
@@ -2296,6 +2567,411 @@ void main() {
       showLineBeginnings: false,
       backgroundTheme: 'default',
     );
+  });
+
+  testWidgets('reader centers a keyword search hit', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: true,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        final scriptureLines = List.generate(80, (index) {
+          final lineNumber = index + 1;
+          final linehead =
+              'T01n0003_p0155a${lineNumber.toString().padLeft(2, '0')}';
+          final text = lineNumber == 40
+              ? '${List.filled(8, '聞已不樂而歸，').join()}實無免者，所以不'
+              : '王聞是事，憶念往昔相師之言，若得在家必作輪王。';
+          return '<span class="lb" id="$linehead"></span><p>$text</p>';
+        }).join();
+        return http.Response(
+          jsonEncode({
+            'results': ['<div id="body">$scriptureLines</div>'],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    const hit = ScripturePassage(
+      title: '毘婆尸佛經',
+      reference: '卷 1',
+      text: '聞已不樂而歸，入定思惟實無免者',
+      linehead: 'T01n0003_p0155a40',
+      juan: '1',
+      work: 'T0003',
+    );
+    const firstHit = ScripturePassage(
+      title: '毘婆尸佛經',
+      reference: '卷 1',
+      text: '王聞是事',
+      linehead: 'T01n0003_p0155a01',
+      juan: '1',
+      work: 'T0003',
+    );
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: hit,
+            query: '免者',
+            searchHits: [firstHit, hit],
+            initialHitIndex: 1,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      RenderEditable? findEditable(RenderObject object) {
+        if (object is RenderEditable) return object;
+        RenderEditable? editable;
+        object.visitChildren((child) {
+          editable ??= findEditable(child);
+        });
+        return editable;
+      }
+
+      final renderEditable = findEditable(
+        tester.renderObject(find.byType(SelectableText).first),
+      )!;
+      final plainText = renderEditable.text!.toPlainText();
+      final queryOffset = plainText.indexOf('免者');
+      expect(queryOffset, greaterThanOrEqualTo(0));
+      final lineStartOffset = plainText.indexOf('聞已不樂');
+      expect(lineStartOffset, greaterThanOrEqualTo(0));
+      final viewport = tester.renderObject<RenderBox>(
+        find.byType(SingleChildScrollView).first,
+      );
+      final viewportRect = viewport.localToGlobal(Offset.zero) & viewport.size;
+      // 長行換行時，置中的是命中所在行的行首。
+      final lineCaret = renderEditable.localToGlobal(
+        renderEditable
+            .getLocalRectForCaret(TextPosition(offset: lineStartOffset))
+            .center,
+      );
+      expect((lineCaret.dy - viewportRect.center.dy).abs(), lessThan(60));
+      final matchCaret = renderEditable.localToGlobal(
+        renderEditable
+            .getLocalRectForCaret(TextPosition(offset: queryOffset))
+            .center,
+      );
+      expect(matchCaret.dy, greaterThan(lineCaret.dy));
+    }, () => client);
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+  });
+
+  testWidgets('reader clamps hit scrolling at the start and end of a juan', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        final scriptureLines = List.generate(80, (index) {
+          final lineNumber = index + 1;
+          final linehead =
+              'T01n0003_p0155a${lineNumber.toString().padLeft(2, '0')}';
+          final text = switch (lineNumber) {
+            1 => '免者為首，王聞是事，憶念往昔相師之言。',
+            80 => '王聞是事，憶念往昔相師之言，實無免者。',
+            _ => '王聞是事，憶念往昔相師之言，若得在家必作輪王。',
+          };
+          return '<span class="lb" id="$linehead"></span><p>$text</p>';
+        }).join();
+        return http.Response(
+          jsonEncode({
+            'results': ['<div id="body">$scriptureLines</div>'],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    ScripturePassage hitAt(int lineNumber) => ScripturePassage(
+      title: '毘婆尸佛經',
+      reference: '卷 1',
+      text: '免者',
+      linehead: 'T01n0003_p0155a${lineNumber.toString().padLeft(2, '0')}',
+      juan: '1',
+      work: 'T0003',
+    );
+
+    Future<double> openAndMeasure(ScripturePassage passage) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ScriptureReaderPage(
+            key: ValueKey<String>(passage.linehead!),
+            passage: passage,
+            query: '免者',
+            searchHits: [passage],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final scrollable = tester.state<ScrollableState>(
+        find.byType(Scrollable).last,
+      );
+      return scrollable.position.pixels;
+    }
+
+    await http.runWithClient(() async {
+      // 命中在卷首：滑到最開頭。
+      expect(await openAndMeasure(hitAt(1)), 0);
+      // 命中在卷末：滑到最後面。
+      final endPixels = await openAndMeasure(hitAt(80));
+      final scrollable = tester.state<ScrollableState>(
+        find.byType(Scrollable).last,
+      );
+      expect(
+        (endPixels - scrollable.position.maxScrollExtent).abs(),
+        lessThan(1),
+      );
+    }, () => client);
+  });
+
+  testWidgets('reader aligns hits that follow verse blocks', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    final buffer = StringBuffer('<div id="body">');
+    for (var i = 0; i < 24; i++) {
+      buffer.write(
+        '<span class="lb" id="T01n0001_p0001a${i.toString().padLeft(2, '0')}">'
+        '</span><div class="lg-row">'
+        '<div class="lg-cell">自他俱入甘露城，</div>'
+        '<div class="lg-cell">同證一如真法界。</div></div>',
+      );
+    }
+    buffer.write(
+      '<span class="lb" id="T01n0001_p0001b01"></span>'
+      '<p>爾時樂遠離行菩薩，為諸大眾說是法已。</p>',
+    );
+    for (var i = 2; i < 20; i++) {
+      buffer.write(
+        '<span class="lb" id="T01n0001_p0001b${i.toString().padLeft(2, '0')}">'
+        '</span><p>復次大眾聞是法已，歡喜奉行。</p>',
+      );
+    }
+    buffer.write('</div>');
+    final html = buffer.toString();
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [html],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    const hit = ScripturePassage(
+      title: '測試經',
+      reference: '卷 1',
+      text: '爾時樂遠離行菩薩，為諸大眾說是法已。',
+      linehead: 'T01n0001_p0001b01',
+      juan: '1',
+      work: 'T0001',
+    );
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: hit,
+            query: '樂遠離行',
+            searchHits: [hit],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      RenderEditable? findEditable(RenderObject object) {
+        if (object is RenderEditable) return object;
+        RenderEditable? editable;
+        object.visitChildren((child) {
+          editable ??= findEditable(child);
+        });
+        return editable;
+      }
+
+      final renderEditable = findEditable(
+        tester.renderObject(find.byType(SelectableText).first),
+      )!;
+      final queryOffset = renderEditable.text!.toPlainText().indexOf('樂遠離行');
+      expect(queryOffset, greaterThanOrEqualTo(0));
+      final caret = renderEditable.localToGlobal(
+        renderEditable
+            .getLocalRectForCaret(TextPosition(offset: queryOffset))
+            .center,
+      );
+      final viewport = tester.renderObject<RenderBox>(
+        find.byType(SingleChildScrollView).first,
+      );
+      final viewportRect = viewport.localToGlobal(Offset.zero) & viewport.size;
+      // 偈頌 WidgetSpan 只佔 1 個純文字字元，位移不能被 cell 文字長度污染。
+      expect((caret.dy - viewportRect.center.dy).abs(), lessThan(60));
+    }, () => client);
+  });
+
+  testWidgets('in-volume search highlights text inside verse cells', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    const html =
+        '<div id="body">'
+        '<span class="lb" id="T01n0001_p0001a01"></span>'
+        '<div class="lg-row">'
+        '<div class="lg-cell">自他俱入甘露城，</div>'
+        '<div class="lg-cell">同證一如真法界。</div></div>'
+        '</div>';
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [html],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    const passage = ScripturePassage(
+      title: '測試經',
+      reference: '卷 1',
+      text: '甘露城',
+      linehead: 'T01n0001_p0001a01',
+      juan: '1',
+      work: 'T0001',
+    );
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: passage,
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('當卷搜尋'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).last, '甘露城');
+      await tester.testTextInput.receiveAction(TextInputAction.search);
+      await tester.pumpAndSettle();
+
+      final highlights = <String>[];
+      void collect(InlineSpan? span) {
+        if (span == null) return;
+        if (span is! TextSpan) return;
+        if (span.style?.backgroundColor == const Color(0xFFFFE08A)) {
+          highlights.add(span.text ?? '');
+        }
+        for (final child in span.children ?? const <InlineSpan>[]) {
+          collect(child);
+        }
+      }
+
+      for (final rich in tester.widgetList<RichText>(find.byType(RichText))) {
+        collect(rich.text);
+      }
+      expect(highlights, contains('甘露城'));
+      expect(find.text('1 / 1'), findsOneWidget);
+    }, () => client);
+  });
+
+  testWidgets('reader highlights a keyword hit spanning two lines', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    const html =
+        '<div id="body">'
+        '<span class="lb" id="T01n0001_p0001a01"></span>'
+        '<p>如是災禍其數有三，四大五'
+        '<span class="lb" id="T01n0001_p0001a02"></span>'
+        '蘊遷變。寂靜安樂。'
+        '</p></div>';
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [html],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    const hit = ScripturePassage(
+      title: '測試經',
+      reference: '卷 1',
+      text: '四大五蘊遷變',
+      linehead: 'T01n0001_p0001a01',
+      juan: '1',
+      work: 'T0001',
+    );
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: hit,
+            query: '五蘊',
+            searchHits: [hit],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final highlights = <String>[];
+      void collect(InlineSpan? span) {
+        if (span == null || span is! TextSpan) return;
+        if (span.style?.backgroundColor == const Color(0xFFDDEDE8)) {
+          highlights.add(span.text ?? '');
+        }
+        for (final child in span.children ?? const <InlineSpan>[]) {
+          collect(child);
+        }
+      }
+
+      collect(
+        tester
+            .widget<SelectableText>(find.byType(SelectableText).first)
+            .textSpan,
+      );
+      // 「五」與「蘊」分別落在兩個經文行，仍要各自高亮。
+      expect(highlights, containsAll(['五', '蘊']));
+    }, () => client);
   });
 
   testWidgets(

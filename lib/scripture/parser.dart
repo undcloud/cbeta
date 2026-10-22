@@ -285,9 +285,14 @@ List<ScriptureLine> parseScriptureHtml(String source) {
         .replaceAll(RegExp(r'\s+'), '')
         .replaceAll(RegExp(r'\[\d+\]'), '');
     if (seenVolumeTitles.add(normalizedTitle)) return line;
+    // 重複出現的卷名（通常是卷末的經題）仍保留文字，
+    // 讓搜尋命中可以定位與高亮，只是不再顯示行首標記。
     return ScriptureLine(
-      text: '',
+      text: line.text,
       linehead: line.linehead,
+      footnotes: line.footnotes,
+      inlineNotes: line.inlineNotes,
+      headingLevel: line.headingLevel,
       role: ScriptureLineRole.navigationAnchor,
     );
   }).toList();
