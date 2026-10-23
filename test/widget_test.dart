@@ -554,11 +554,12 @@ void main() {
         }
       }
 
-      collect(
-        tester
-            .widget<SelectableText>(find.byType(SelectableText).first)
-            .textSpan,
-      );
+      // Only collect highlights from the body portion (last child of root),
+      // skipping the header prefix (title, reference, header lines).
+      final rootSpan = tester
+          .widget<SelectableText>(find.byType(SelectableText).first)
+          .textSpan;
+      collect(rootSpan?.children?.lastOrNull);
       return (pixels: scrollable.position.pixels, bodyHighlights: highlights);
     }
 
@@ -773,36 +774,41 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      final styledTextWidgets = tester
-          .widgetList(
-            find.byWidgetPredicate(
-              (widget) => widget.runtimeType.toString() == 'Text',
-            ),
-          )
-          .cast<dynamic>();
+      final selectable = tester.widget<SelectableText>(
+        find.byType(SelectableText).first,
+      );
+      bool containsStyledSpan(
+        InlineSpan span, {
+        required String text,
+        required Color color,
+      }) {
+        if (span is! TextSpan) return false;
+        if (span.style?.color == color && span.toPlainText().contains(text)) {
+          return true;
+        }
+        return span.children?.any(
+              (child) => containsStyledSpan(child, text: text, color: color),
+            ) ??
+            false;
+      }
+
       expect(
-        styledTextWidgets.any(
-          (widget) =>
-              widget.textAlign == TextAlign.center &&
-              (widget.textSpan?.toPlainText() ?? widget.data) == '中阿含經卷第五' &&
-              widget.style?.color == const Color(0xFF007564),
+        containsStyledSpan(
+          selectable.textSpan!,
+          text: '中阿含經卷第五',
+          color: const Color(0xFF007564),
         ),
         isTrue,
       );
       expect(
-        styledTextWidgets.any(
-          (widget) =>
-              widget.textAlign == TextAlign.right &&
-              (widget.textSpan?.toPlainText() ?? widget.data) ==
-                  '東晉罽賓三藏瞿曇僧伽提婆譯' &&
-              widget.style?.color == const Color(0xFF6B5744),
+        containsStyledSpan(
+          selectable.textSpan!,
+          text: '東晉罽賓三藏瞿曇僧伽提婆譯',
+          color: const Color(0xFF8C7B66),
         ),
         isTrue,
       );
 
-      final selectable = tester.widget<SelectableText>(
-        find.byType(SelectableText).first,
-      );
       bool containsMutedInlineNote(InlineSpan span) {
         if (span is! TextSpan) return false;
         return span.style?.color == const Color(0xFF9C8B78) ||
@@ -810,6 +816,137 @@ void main() {
       }
 
       expect(containsMutedInlineNote(selectable.textSpan!), isTrue);
+    }, () => client);
+  });
+
+  testWidgets('reader keeps collation markers on byline lines', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: true,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    const scriptureHtml =
+        '<html><body><div id="body">'
+        '<p class="juan">毘婆尸佛經卷上</p>'
+        '<p class="byline">西天譯經三藏'
+        '<a class="noteAnchor" href="#n0002001"></a>臣法天奉詔譯</p>'
+        '<span class="lb" id="T01n0003_p0154b09"></span>'
+        '<p>爾時，佛告諸苾芻。</p>'
+        '</div><div id="back" style="display:none">'
+        '<div class="footnote" id="n0002001">宋【明】</div>'
+        '</div></body></html>';
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [scriptureHtml],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '毘婆尸佛經',
+              reference: '卷 1',
+              text: '',
+              linehead: 'T01n0003_p0154b09',
+              juan: '1',
+              work: 'T0003',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final selectable = tester.widget<SelectableText>(
+        find.byType(SelectableText).first,
+      );
+      expect(selectable.textSpan!.toPlainText(), contains('西天譯經三藏[1]'));
+      expect(selectable.textSpan!.toPlainText(), contains('臣法天奉詔譯'));
+    }, () => client);
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+  });
+
+  testWidgets('verse blocks keep one break before and a blank line after', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    const scriptureHtml =
+        '<div id="body">'
+        '<span class="lb" id="T01n0003_p0154b22"></span>'
+        '<p>爾時，世尊而說頌曰：</p>'
+        '<span class="lb" id="T01n0003_p0154b23"></span>'
+        '<div class="lg-row"><div class="lg-cell">自他俱入甘露城，</div>'
+        '<div class="lg-cell">同證一如真法界。</div></div>'
+        '<span class="lb" id="T01n0003_p0154b26"></span>'
+        '<p>爾時，世尊說此偈已。</p>'
+        '</div>';
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [scriptureHtml],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '毘婆尸佛經',
+              reference: '卷 1',
+              text: '',
+              linehead: 'T01n0003_p0154b22',
+              juan: '1',
+              work: 'T0003',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final plain = tester
+          .widget<SelectableText>(find.byType(SelectableText).first)
+          .textSpan!
+          .toPlainText();
+      // 前一段已自帶換行，不再補第二個換行。
+      expect(plain, contains('頌曰：\n'));
+      expect(plain, isNot(contains('頌曰：\n\n')));
+      // 偈頌段後保留一個空行，與後段分開。
+      expect(plain, contains('真法界。\n\n'));
     }, () => client);
   });
 
@@ -898,6 +1035,22 @@ void main() {
       '「如實觀法身故。\n「是為菩薩住八地中具足四法。」\n'
       '「云何菩薩知上下諸根？」」'
       '(CBETA 2026.R1, T25, no. 1509, p. 416c18-20)',
+    );
+  });
+
+  test('citation falls back to the first body linehead', () {
+    const passage = ScripturePassage(
+      title: '毘婆尸佛經',
+      reference: '',
+      text: '爾時，佛告諸苾芻。',
+      juan: '1',
+      lines: [ScriptureLine(text: '爾時，佛告諸苾芻。', linehead: 'T01n0003_p0154b09')],
+    );
+
+    expect(
+      formatSelectedPassageForCopy(passage, '宋 法天譯'),
+      '《毘婆尸佛經》卷1：「\n宋 法天譯」'
+      '(CBETA 2026.R1, T01, no. 0003, p. 154b9)',
     );
   });
 
@@ -1037,7 +1190,11 @@ void main() {
 
       expect(requestedGotoLineheads, ['B36n0198_ph017a02']);
       expect(requestedJuans, ['1']);
-      expect(find.text('博伽梵歌目標段落', findRichText: true), findsOneWidget);
+      final readerText = tester
+          .widget<SelectableText>(find.byType(SelectableText).first)
+          .textSpan!
+          .toPlainText();
+      expect(readerText, contains('博伽梵歌目標段落'));
       expect(find.text('第 1 / 3 卷'), findsOneWidget);
     }, () => client);
   });
@@ -1387,7 +1544,13 @@ void main() {
       await tester.testTextInput.receiveAction(TextInputAction.search);
       await tester.pumpAndSettle();
 
-      expect(find.text('離線行號經文', findRichText: true), findsOneWidget);
+      expect(
+        tester
+            .widget<SelectableText>(find.byType(SelectableText).first)
+            .textSpan!
+            .toPlainText(),
+        contains('離線行號經文'),
+      );
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pumpAndSettle();
@@ -1458,7 +1621,13 @@ void main() {
       await tester.testTextInput.receiveAction(TextInputAction.search);
       await tester.pumpAndSettle();
 
-      expect(find.text('Goto 目標經文', findRichText: true), findsOneWidget);
+      expect(
+        tester
+            .widget<SelectableText>(find.byType(SelectableText).first)
+            .textSpan!
+            .toPlainText(),
+        contains('Goto 目標經文'),
+      );
       expect(requestedPaths, contains('/stable/juans/goto'));
       expect(requestedPaths, contains('/stable/works/toc'));
       expect(requestedPaths, contains('/stable/juans'));
@@ -2135,7 +2304,13 @@ void main() {
         await tester.tap(find.text('B0117 三藏法數'));
         await tester.pumpAndSettle();
         expect(requestedWorkTocs, ['B0117']);
-        expect(find.text('三藏法數'), findsAtLeastNWidgets(1));
+        expect(
+          tester
+              .widget<SelectableText>(find.byType(SelectableText).first)
+              .textSpan!
+              .toPlainText(),
+          contains('三藏法數'),
+        );
         expect(
           tester
               .widget<DropdownButton<int>>(find.byType(DropdownButton<int>))
@@ -2186,83 +2361,13 @@ void main() {
         await tester.pumpAndSettle();
         expect(requestedGotoQueries, ['B22n0117_p0005a01']);
         expect(requestedWorkTocs, ['B0117']);
-        expect(find.text('三藏法數'), findsAtLeastNWidgets(1));
-        await tester.pumpWidget(const SizedBox.shrink());
-        await tester.pumpAndSettle();
-      }, () => client);
-    },
-  );
-
-  testWidgets(
-    'homepage search results are cached before opening full-text search in reader',
-    (WidgetTester tester) async {
-      await SimplifiedTraditionalConverter.load();
-      SharedPreferences.setMockInitialValues({});
-      await scriptureDisplaySettings.load();
-      var searchRequests = 0;
-      final client = MockClient((request) async {
-        if (request.url.path == '/stable/search/all_in_one') {
-          searchRequests++;
-          expect(request.url.queryParameters['q'], '五蘊');
-          return http.Response(
-            jsonEncode({
-              'num_found': 1,
-              'total_term_hits': 1,
-              'results': [
-                {
-                  'work': 'T0003',
-                  'file': 'T01n0003',
-                  'juan': 1,
-                  'juan_list': '1',
-                  'title': '毘婆尸佛經',
-                  'kwics': {
-                    'results': [
-                      {
-                        'kwic': '<span>五蘊幻身四相遷變</span>',
-                        'vol': 'T01',
-                        'lb': '0155a06',
-                      },
-                    ],
-                  },
-                },
-              ],
-            }),
-            200,
-            headers: {'content-type': 'application/json'},
-          );
-        }
-        if (request.url.path == '/stable/juans') {
-          return http.Response(
-            jsonEncode({
-              'results': [
-                '<div id="body"><span class="lb" '
-                    'id="T01n0003_p0155a06"></span>'
-                    '<span class="t">五蘊幻身四相遷變</span></div>',
-              ],
-            }),
-            200,
-            headers: {'content-type': 'application/json'},
-          );
-        }
-        return http.Response('{}', 404);
-      });
-
-      await http.runWithClient(() async {
-        await tester.pumpWidget(const CbetaSearchApp());
-        await tester.enterText(find.byType(TextField).first, '五蕴');
-        await tester.testTextInput.receiveAction(TextInputAction.search);
-        await tester.pumpAndSettle();
-        expect(find.text('T0003 毘婆尸佛經'), findsOneWidget);
-        expect(searchRequests, 1);
-
-        await tester.tap(find.text('五蘊幻身四相遷變', findRichText: true));
-        await tester.pumpAndSettle();
-        expect(find.byTooltip('全文搜尋'), findsOneWidget);
-
-        await tester.tap(find.byTooltip('全文搜尋'));
-        await tester.pumpAndSettle();
-        expect(find.text('T0003 毘婆尸佛經'), findsOneWidget);
-        expect(searchRequests, 1);
+        expect(
+          tester
+              .widget<SelectableText>(find.byType(SelectableText).first)
+              .textSpan!
+              .toPlainText(),
+          contains('三藏法數'),
+        );
         await tester.pumpWidget(const SizedBox.shrink());
         await tester.pumpAndSettle();
       }, () => client);
@@ -2325,19 +2430,14 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(
-        find.byWidgetPredicate(
-          (widget) =>
-              widget is Row &&
-              widget.mainAxisAlignment == MainAxisAlignment.center,
-        ),
-        findsOneWidget,
-      );
       expect(find.byTooltip('切換簡體／繁體'), findsOneWidget);
       final scriptureText = tester.widget<SelectableText>(
         find.byType(SelectableText).first,
       );
       expect(scriptureText.textSpan!.toPlainText(), contains('甲[2]乙五蘊經典'));
+      // 偈頌以文字呈現，才能逐字選取。
+      expect(scriptureText.textSpan!.toPlainText(), contains('毘婆尸太子，'));
+      expect(scriptureText.textSpan!.toPlainText(), contains('遊觀於園林，'));
       await tester.tap(find.byTooltip('切換簡體／繁體'));
       await tester.pumpAndSettle();
       expect(scriptureDisplaySettings.showSimplifiedText, isTrue);
@@ -2355,10 +2455,27 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(scriptureDisplaySettings.showSimplifiedText, isFalse);
-      await tester.tapAt(
-        tester.getTopLeft(find.byType(SelectableText).first) +
-            const Offset(26, 18),
+      RenderEditable? findEditable(RenderObject object) {
+        if (object is RenderEditable) return object;
+        RenderEditable? editable;
+        object.visitChildren((child) {
+          editable ??= findEditable(child);
+        });
+        return editable;
+      }
+
+      final collationEditable = findEditable(
+        tester.renderObject(find.byType(SelectableText).first),
+      )!;
+      final collationText = collationEditable.text!.toPlainText();
+      final collationIndex = collationText.indexOf('[2]');
+      expect(collationIndex, greaterThanOrEqualTo(0));
+      final collationTapPos = collationEditable.localToGlobal(
+        collationEditable
+            .getLocalRectForCaret(TextPosition(offset: collationIndex))
+            .center,
       );
+      await tester.tapAt(collationTapPos);
       await tester.pumpAndSettle();
       expect(find.text('宋【明】'), findsOneWidget);
       await tester.tap(find.text('關閉'));
@@ -2898,11 +3015,100 @@ void main() {
         }
       }
 
-      for (final rich in tester.widgetList<RichText>(find.byType(RichText))) {
-        collect(rich.text);
-      }
+      final selectable = tester.widget<SelectableText>(
+        find.byType(SelectableText).first,
+      );
+      collect(selectable.textSpan);
       expect(highlights, contains('甘露城'));
       expect(find.text('1 / 1'), findsOneWidget);
+    }, () => client);
+  });
+
+  testWidgets('reader offers copy, citation, share and select-all for header '
+      'and verse text', (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    const html =
+        '<div id="body">'
+        '<p class="juan">佛說五蘊皆空經</p>'
+        '<p class="byline">大唐三藏法師義淨奉制譯</p>'
+        '<span class="lb" id="T01n0102_p0499c08"></span>'
+        '<div class="lg-row">'
+        '<div class="lg-cell">自他俱入甘露城，</div>'
+        '<div class="lg-cell">同證一如真法界。</div></div>'
+        '</div>';
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [html],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    RenderEditable findEditable(RenderObject object) {
+      if (object is RenderEditable) return object;
+      late RenderEditable editable;
+      object.visitChildren((child) {
+        editable = findEditable(child);
+      });
+      return editable;
+    }
+
+    Future<void> expectSelectionMenuAt(int offset) async {
+      final editable = findEditable(
+        tester.renderObject(find.byType(SelectableText).first),
+      );
+      final caret = editable.localToGlobal(
+        editable.getLocalRectForCaret(TextPosition(offset: offset)).center,
+      );
+      await tester.longPressAt(caret);
+      await tester.pumpAndSettle();
+      expect(find.text('全選'), findsWidgets);
+      expect(find.text('複製'), findsWidgets);
+      expect(find.text('複製引文'), findsWidgets);
+      expect(find.text('分享到其他軟件'), findsWidgets);
+    }
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '佛說五蘊皆空經',
+              reference: '卷 1',
+              text: '',
+              linehead: 'T01n0102_p0499c08',
+              juan: '1',
+              work: 'T0102',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final selectable = tester.widget<SelectableText>(
+        find.byType(SelectableText).first,
+      );
+      final plain = selectable.textSpan!.toPlainText();
+      // 卷題（固定經名下方）。
+      await expectSelectionMenuAt(plain.indexOf('佛說五蘊皆空經') + 1);
+      // 译者／年代。
+      await expectSelectionMenuAt(plain.indexOf('大唐三藏法師') + 1);
+      // 偈頌正文。
+      await expectSelectionMenuAt(plain.indexOf('甘露城') + 1);
     }, () => client);
   });
 
@@ -2974,186 +3180,131 @@ void main() {
     }, () => client);
   });
 
-  testWidgets(
-    'reader offers in-volume search, full-text search, bookmarks, and work selection',
-    (WidgetTester tester) async {
-      SharedPreferences.setMockInitialValues({});
-      await scriptureDisplaySettings.load();
-      var fullTextSearchRequests = 0;
-      final client = MockClient((request) async {
-        if (request.url.path == '/stable/juans') {
-          return http.Response(
-            jsonEncode({
-              'results': [
-                '<div id="body">'
-                    '<span class="lb" id="T01n0001_p0001a01"></span>'
-                    '<span class="t">五蘊第一</span>'
-                    '<span class="lb" id="T01n0001_p0001a02"></span>'
-                    '<span class="t">五蘊第二</span>'
-                    '</div>',
-              ],
-            }),
-            200,
-            headers: {'content-type': 'application/json'},
-          );
-        }
-        if (request.url.path == '/stable/search/all_in_one') {
-          fullTextSearchRequests++;
-          expect(request.url.queryParameters['q'], '五蘊');
-          return http.Response(
-            jsonEncode({
-              'num_found': 1,
-              'total_term_hits': 2,
-              'results': [
-                {
-                  'work': 'T0001',
-                  'file': 'T01n0001',
-                  'juan': 1,
-                  'juan_list': '1,2',
-                  'title': '長阿含經',
-                  'kwics': {
-                    'results': [
-                      {
-                        'kwic': '<span>五蘊第一</span>',
-                        'vol': 'T01',
-                        'lb': '0001a01',
-                      },
-                      {
-                        'kwic': '<span>五蘊第二</span>',
-                        'vol': 'T01',
-                        'lb': '0001a02',
-                      },
-                    ],
-                  },
-                },
-              ],
-            }),
-            200,
-            headers: {'content-type': 'application/json'},
-          );
-        }
-        if (request.url.path == '/stable/catalog_entry') {
-          return http.Response(
-            jsonEncode({
-              'label': '部類目錄',
-              'results': [
-                {
-                  'work': 'T0001',
-                  'file': 'T01n0001',
-                  'label': 'T0001 長阿含經 (2卷)',
-                  'node_type': 'work',
-                },
-              ],
-            }),
-            200,
-            headers: {'content-type': 'application/json'},
-          );
-        }
-        if (request.url.path == '/stable/works/toc') {
-          return http.Response(
-            jsonEncode({
-              'results': [
-                {
-                  'juan': [
-                    {
-                      'file': 'T01n0001',
-                      'juan': 1,
-                      'lb': '0001a01',
-                      'title': '第一',
-                    },
-                    {
-                      'file': 'T01n0001',
-                      'juan': 2,
-                      'lb': '0002a01',
-                      'title': '第二',
-                    },
-                  ],
-                  'mulu': [],
-                },
-              ],
-            }),
-            200,
-            headers: {'content-type': 'application/json'},
-          );
-        }
-        return http.Response('{}', 404);
-      });
-      const passage = ScripturePassage(
-        title: '長阿含經',
-        reference: '卷 1',
-        text: '五蘊第一',
-        linehead: 'T01n0001_p0001a01',
-        juan: '1',
-        work: 'T0001',
-        availableJuans: [1, 2],
-      );
-
-      await http.runWithClient(() async {
-        await tester.pumpWidget(
-          MaterialApp(
-            home: ScriptureReaderPage(
-              passage: passage,
-              query: '',
-              searchHits: const [],
-              initialHitIndex: 0,
-            ),
-          ),
+  testWidgets('reader offers in-volume search, bookmarks, and work selection', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [
+              '<div id="body">'
+                  '<span class="lb" id="T01n0001_p0001a01"></span>'
+                  '<span class="t">五蘊第一</span>'
+                  '<span class="lb" id="T01n0001_p0001a02"></span>'
+                  '<span class="t">五蘊第二</span>'
+                  '</div>',
+            ],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
         );
-        await tester.pumpAndSettle();
+      }
+      if (request.url.path == '/stable/catalog_entry') {
+        return http.Response(
+          jsonEncode({
+            'label': '部類目錄',
+            'results': [
+              {
+                'work': 'T0001',
+                'file': 'T01n0001',
+                'label': 'T0001 長阿含經 (2卷)',
+                'node_type': 'work',
+              },
+            ],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      if (request.url.path == '/stable/works/toc') {
+        return http.Response(
+          jsonEncode({
+            'results': [
+              {
+                'juan': [
+                  {
+                    'file': 'T01n0001',
+                    'juan': 1,
+                    'lb': '0001a01',
+                    'title': '第一',
+                  },
+                  {
+                    'file': 'T01n0001',
+                    'juan': 2,
+                    'lb': '0002a01',
+                    'title': '第二',
+                  },
+                ],
+                'mulu': [],
+              },
+            ],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+    const passage = ScripturePassage(
+      title: '長阿含經',
+      reference: '卷 1',
+      text: '五蘊第一',
+      linehead: 'T01n0001_p0001a01',
+      juan: '1',
+      work: 'T0001',
+      availableJuans: [1, 2],
+    );
 
-        await tester.tap(find.byTooltip('當卷搜尋'));
-        await tester.pumpAndSettle();
-        await tester.enterText(find.byType(TextField).last, '五蘊');
-        await tester.testTextInput.receiveAction(TextInputAction.search);
-        await tester.pumpAndSettle();
-        expect(find.text('1 / 2'), findsOneWidget);
-        await tester.tap(find.byTooltip('下一筆'));
-        await tester.pumpAndSettle();
-        expect(find.text('2 / 2'), findsOneWidget);
-        await tester.tap(find.byTooltip('關閉'));
-        await tester.pumpAndSettle();
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ScriptureReaderPage(
+            passage: passage,
+            query: '',
+            searchHits: const [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
 
-        await tester.tap(find.byTooltip('全文搜尋'));
-        await tester.pumpAndSettle();
-        await tester.enterText(find.byType(TextField).first, '五蘊');
-        await tester.testTextInput.receiveAction(TextInputAction.search);
-        await tester.pumpAndSettle();
-        expect(find.text('T0001 長阿含經'), findsOneWidget);
-        await tester.tap(find.text('五蘊第一', findRichText: true));
-        await tester.pumpAndSettle();
-        expect(find.text('1 / 2 筆'), findsOneWidget);
-        await tester.tap(find.text('搜尋結果'));
-        await tester.pumpAndSettle();
-        await tester.pageBack();
-        await tester.pumpAndSettle();
-        await tester.tap(find.byTooltip('全文搜尋'));
-        await tester.pumpAndSettle();
-        expect(find.text('T0001 長阿含經'), findsOneWidget);
-        expect(fullTextSearchRequests, 1);
-        await tester.pageBack();
-        await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('當卷搜尋'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).last, '五蘊');
+      await tester.testTextInput.receiveAction(TextInputAction.search);
+      await tester.pumpAndSettle();
+      expect(find.text('1 / 2'), findsOneWidget);
+      await tester.tap(find.byTooltip('下一筆'));
+      await tester.pumpAndSettle();
+      expect(find.text('2 / 2'), findsOneWidget);
+      await tester.tap(find.byTooltip('關閉'));
+      await tester.pumpAndSettle();
 
-        await tester.tap(find.byTooltip('書籤'));
-        await tester.pumpAndSettle();
-        expect(find.byIcon(Icons.bookmark_added_rounded), findsOneWidget);
-        final preferences = await SharedPreferences.getInstance();
-        final savedBookmarks =
-            jsonDecode(preferences.getString('reader_bookmarks')!)
-                as List<dynamic>;
-        expect(savedBookmarks, hasLength(1));
+      await tester.tap(find.byTooltip('書籤'));
+      await tester.pumpAndSettle();
+      expect(find.byIcon(Icons.bookmark_added_rounded), findsOneWidget);
+      final preferences = await SharedPreferences.getInstance();
+      final savedBookmarks =
+          jsonDecode(preferences.getString('reader_bookmarks')!)
+              as List<dynamic>;
+      expect(savedBookmarks, hasLength(1));
 
-        await tester.tap(find.byTooltip('選擇佛經'));
-        await tester.pumpAndSettle();
-        for (final tab in ['部類', '冊別', '作譯者', '年代', '經目查詢', 'Goto 查詢']) {
-          expect(find.text(tab), findsOneWidget);
-        }
-        await tester.tap(find.text('T0001 長阿含經 (2卷)'));
-        await tester.pumpAndSettle();
-        expect(find.text('長阿含經 (2卷)'), findsAtLeastNWidgets(1));
-        expect(find.text('第 1 / 2 卷'), findsOneWidget);
-      }, () => client);
-    },
-  );
+      await tester.tap(find.byTooltip('選擇佛經'));
+      await tester.pumpAndSettle();
+      for (final tab in ['部類', '冊別', '作譯者', '年代', '經目查詢', 'Goto 查詢']) {
+        expect(find.text(tab), findsOneWidget);
+      }
+      await tester.tap(find.text('T0001 長阿含經 (2卷)'));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('reader-fixed-title')), findsOneWidget);
+      // 經名會跟隨簡繁設定顯示，只確認文字存在即可。
+      expect(find.textContaining('阿含'), findsWidgets);
+      expect(find.text('第 1 / 2 卷'), findsOneWidget);
+    }, () => client);
+  });
 
   testWidgets('display settings panel exposes typography and reading options', (
     WidgetTester tester,

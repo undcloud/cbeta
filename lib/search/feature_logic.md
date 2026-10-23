@@ -734,11 +734,22 @@ Android 端启用系统自动备份与卸载保留提示：
 - 找不到行號（跨卷或經文改版）時退回卷首，不再阻止整卷閱讀；
 - 跳轉後以「命中所在行」的行首為基準置中顯示；`clamp(0, maxScrollExtent)` 會讓
   卷首命中自動滑到最開頭、卷末命中滑到最後面，其餘情況維持居中。
-- 偈頌（`lg-row`）、表格與圖片以 `WidgetSpan` 呈現，在 `SelectableText` 純文字中
-  只佔 1 個 placeholder；`_buildScriptureTextLayout` 與渲染端必須用相同的 2 字元
-  （placeholder + 換行）前進量，否則大量偈頌之後的錨點與卷內搜尋會整段偏移。
-- `WidgetSpan` 內的文字不在純文字位移系統中，改用 `highlightedWidget` 直接字串
-  比對來高亮（卷內搜尋使用黃色、全局搜尋使用綠色）。
+- 表格與圖片仍以 `WidgetSpan` 呈現，在 `SelectableText` 純文字中各佔 1 個
+  placeholder；`_buildScriptureTextLayout` 與渲染端必須使用相同的前進量，否則
+  錨點與卷內搜尋會整段偏移。
+- 偈頌（`lg-row`）改以純文字呈現（每格之間以不可見的 `WidgetSpan` 補足等寬置中
+  間距），因此可以逐字選取；`_verseCellRenderedTexts` 同時供 layout 與渲染使用，
+  兩端的格內文字、校勘標記與 placeholder 數量必須一致。
+- 偈頌段落前只在上一行沒有自帶換行時補一個換行（不額外留空行）；段落後補一個
+  空行；偈字使用較大的行高。這些換行字元也必須同時寫進
+  `_buildScriptureTextLayout` 與渲染端，`lineStarts` 以偈頌列本身為起點，
+  搜尋錨點才不會偏移。
+- 標題固定在閱讀頁頂端顯示，捲動內容的卷題／作譯者靠右是用不可見的 `WidgetSpan`
+  留白達成（同一段文字才能選取）；該 placeholder 也算一個字元，reader 端的
+  `headerPrefixLength` 與 span 的 `toPlainText().length` 必須一致。卷題／作譯者
+  行的校勘標記也要一起渲染並計入長度。
+- `WidgetSpan` 內的文字（僅剩表格）不在純文字位移系統中，改用
+  `highlightedWidget` 直接字串比對來高亮（卷內搜尋使用黃色、全局搜尋使用綠色）。
 - 關鍵字高亮以 `_matchRangesIn(layout.text, query)` 先算出所有命中範圍再與每個文字
   片段求交集；因此跨經文行、跨校勘標記的命中（如「四大五｜蘊遷變」的「五蘊」）
   也能正確高亮。

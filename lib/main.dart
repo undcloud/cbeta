@@ -15,6 +15,7 @@ import 'package:open_filex/open_filex.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'ai/ai_chunk.dart';
@@ -1054,46 +1055,15 @@ class Text extends StatelessWidget {
 }
 
 class _DisplaySelectableText extends StatelessWidget {
-  const _DisplaySelectableText(this.data, {this.style})
-    : textSpan = null,
-      childKey = null,
-      onSelectionChanged = null,
-      contextMenuBuilder = null;
+  const _DisplaySelectableText(this.data, {this.style});
 
-  const _DisplaySelectableText.rich(
-    this.textSpan, {
-    required this.onSelectionChanged,
-    required this.contextMenuBuilder,
-    required this.style,
-    Key? key,
-  }) : data = null,
-       childKey = key;
-
-  final String? data;
-  final flutter_material.TextSpan? textSpan;
-  final Key? childKey;
+  final String data;
   final TextStyle? style;
-  final SelectionChangedCallback? onSelectionChanged;
-  final Widget Function(BuildContext, EditableTextState)? contextMenuBuilder;
 
   @override
   Widget build(BuildContext context) {
     _ScriptDisplayScope.dependOn(context);
-    final span = textSpan;
-    if (span != null) {
-      return flutter_material.SelectableText.rich(
-        _displayInlineSpan(span) as flutter_material.TextSpan,
-        key: childKey,
-        onSelectionChanged: onSelectionChanged,
-        contextMenuBuilder: contextMenuBuilder,
-        style: style,
-      );
-    }
-    return flutter_material.SelectableText(
-      _displayText(data!),
-      key: childKey,
-      style: style,
-    );
+    return flutter_material.SelectableText(_displayText(data), style: style);
   }
 }
 
@@ -3049,16 +3019,6 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
     _persistReadingHistory();
   }
 
-  Future<void> _openFullTextSearch() async {
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute(
-        builder: (_) => _FullTextSearchPage(
-          initialQuery: _FullTextSearchCache.lastQuery ?? widget.query,
-        ),
-      ),
-    );
-  }
-
   Future<void> _runLocalSearch(SearchSelection selection) async {
     final raw = selection.rawInput.trim();
     final selected = selection.query.trim();
@@ -3344,11 +3304,6 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
               icon: const Icon(Icons.find_in_page_outlined),
             ),
             IconButton(
-              tooltip: _displayText('全文搜尋', context),
-              onPressed: _openFullTextSearch,
-              icon: const Icon(Icons.search_rounded),
-            ),
-            IconButton(
               tooltip: _displayText('書籤', context),
               onPressed: _toggleBookmark,
               onLongPress: _showBookmarks,
@@ -3402,6 +3357,23 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                           line.role == ScriptureLineRole.byline,
                     )
                     .toList();
+                final headerPrefixLength = () {
+                  // 每個卷題／作譯者行都有一個對齊用的 WidgetSpan，
+                  // 且校勘標記必須跟實際渲染一致。
+                  final showCollation = scriptureDisplaySettings.showCollation;
+                  var len = 0;
+                  for (final line in headerLines) {
+                    final text = line.text.trim();
+                    final markerLength = showCollation
+                        ? line.footnotes.fold<int>(
+                            0,
+                            (length, note) => length + note.label.length + 2,
+                          )
+                        : 0;
+                    len += 1 + text.length + markerLength + 1;
+                  }
+                  return len;
+                }();
                 final scriptureLines = lines
                     .where(
                       (line) =>
@@ -3457,44 +3429,24 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
+                    // 固定顯示經名，不顯示卷號或行號等數字字母資訊。
                     Center(
                       child: ConstrainedBox(
                         constraints: const BoxConstraints(maxWidth: 680),
                         child: Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                currentPassage.title,
-                                style: TextStyle(
-                                  fontFamily: 'Noto Sans TC',
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w600,
-                                  color: settings.textColor,
-                                ),
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                currentPassage.reference,
-                                style: TextStyle(
-                                  fontFamily: 'Noto Sans TC',
-                                  fontSize: 13,
-                                  color: settings.backgroundTheme == 'night'
-                                      ? const Color(0xFFB2A48F)
-                                      : const Color(0xFF6B5744),
-                                ),
-                              ),
-                              if (currentPassage.availableJuans.isNotEmpty)
-                                _JuanSelector(
-                                  currentJuan: int.tryParse(
-                                    currentPassage.juan ?? '',
-                                  ),
-                                  availableJuans: currentPassage.availableJuans,
-                                  onChanged: _selectJuan,
-                                ),
-                              const Divider(height: 24),
-                            ],
+                          padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
+                          child: Text(
+                            _displayText(currentPassage.title, context),
+                            key: const ValueKey('reader-fixed-title'),
+                            textAlign: TextAlign.center,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontFamily: 'Noto Sans TC',
+                              fontSize: 18,
+                              fontWeight: FontWeight.w600,
+                              color: settings.textColor,
+                            ),
                           ),
                         ),
                       ),
@@ -3565,11 +3517,16 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                                       localSearchRange!.start,
                                     )
                                   : null;
-                              final scrollOffset =
+                              final rawScrollOffset =
                                   localStart ??
                                   (currentPassage.linehead == null
                                       ? null
                                       : targetScrollStart);
+                              final scrollOffset = rawScrollOffset != null
+                                  ? (hitTarget.inHeader && localStart == null
+                                        ? 0
+                                        : rawScrollOffset + headerPrefixLength)
+                                  : null;
                               if (scrollOffset != null &&
                                   renderObject is RenderEditable &&
                                   viewportRenderObject is RenderBox) {
@@ -3632,10 +3589,31 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                                     crossAxisAlignment:
                                         CrossAxisAlignment.stretch,
                                     children: [
+                                      // 卷數調整按鈕放在捲動內容頂端，需固定區域下方靠右。
+                                      if (currentPassage
+                                          .availableJuans
+                                          .isNotEmpty)
+                                        Align(
+                                          alignment: Alignment.centerRight,
+                                          child: Padding(
+                                            padding: const EdgeInsets.only(
+                                              bottom: 4,
+                                            ),
+                                            child: _JuanSelector(
+                                              currentJuan: int.tryParse(
+                                                currentPassage.juan ?? '',
+                                              ),
+                                              availableJuans:
+                                                  currentPassage.availableJuans,
+                                              onChanged: _selectJuan,
+                                            ),
+                                          ),
+                                        ),
                                       _SelectablePassageText(
                                         selectableTextKey: scriptureTextKey,
                                         passage: passage,
                                         headerLines: headerLines,
+                                        layoutLineStarts: layout.lineStarts,
                                         query: showLocalSearch
                                             ? localSearchQuery
                                             : widget.query,
@@ -3734,6 +3712,7 @@ class _SelectablePassageText extends StatefulWidget {
     required this.passage,
     required this.query,
     required this.sourceLines,
+    this.layoutLineStarts = const [],
     this.headerLines = const [],
     this.localSearchRange,
     this.queryRanges = const [],
@@ -3745,6 +3724,7 @@ class _SelectablePassageText extends StatefulWidget {
   final ScripturePassage passage;
   final String query;
   final List<ScriptureLine> sourceLines;
+  final List<int> layoutLineStarts;
   final List<ScriptureLine> headerLines;
   final ({int start, int end})? localSearchRange;
   final List<({int start, int end})> queryRanges;
@@ -3772,54 +3752,166 @@ class _SelectablePassageTextState extends State<_SelectablePassageText> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) => Focus(
-    onKeyEvent: (node, event) {
-      final isCopyShortcut =
-          event is KeyDownEvent &&
-          event.logicalKey == LogicalKeyboardKey.keyC &&
-          (HardwareKeyboard.instance.isControlPressed ||
-              HardwareKeyboard.instance.isMetaPressed);
-      if (isCopyShortcut && selectedText.isNotEmpty) {
-        _copyCitation();
-        return KeyEventResult.handled;
+  /// WidgetSpan（表格、圖片、偈頌間距）在純文字中會留下 U+FFFC，
+  /// 複製與引文輸出時要移除。
+  String _stripSelectionPlaceholders(String text) =>
+      text.replaceAll('\uFFFC', '');
+
+  /// 卷題／作譯者行的文字片段，校勘標記與正文一致。
+  List<InlineSpan> _headerLineSpans(ScriptureLine line) {
+    final query = widget.query.trim();
+    final showCollation = scriptureDisplaySettings.showCollation;
+    final text = line.text.trim();
+    if (!showCollation || line.footnotes.isEmpty) {
+      return [_highlightedPassageText(text, query)];
+    }
+    final spans = <InlineSpan>[];
+    var cursor = 0;
+    for (final note in line.footnotes) {
+      final noteOffset = note.offset.clamp(cursor, text.length);
+      if (noteOffset > cursor) {
+        spans.add(
+          _highlightedPassageText(text.substring(cursor, noteOffset), query),
+        );
+        cursor = noteOffset;
       }
-      return KeyEventResult.ignored;
-    },
-    child: LayoutBuilder(
-      builder: (context, constraints) => Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          for (final line in widget.headerLines)
-            Padding(
-              padding: EdgeInsets.only(
-                bottom: line.role == ScriptureLineRole.volumeTitle ? 6 : 0,
+      final marker = '[${note.label}]';
+      if (note.content.isNotEmpty) {
+        final recognizer = TapGestureRecognizer()
+          ..onTap = () => _showFootnote(note);
+        noteRecognizers.add(recognizer);
+        spans.add(
+          TextSpan(
+            text: marker,
+            style: _headerFootnoteStyle,
+            recognizer: recognizer,
+          ),
+        );
+      } else {
+        spans.add(TextSpan(text: marker, style: _headerFootnoteStyle));
+      }
+    }
+    if (cursor < text.length) {
+      spans.add(_highlightedPassageText(text.substring(cursor), query));
+    }
+    return spans;
+  }
+
+  void _showFootnote(ScriptureFootnote note) {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(note.label.startsWith('A') ? 'CBETA 修訂註解' : '校勘記'),
+        content: _DisplaySelectableText(note.content),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('關閉'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 依畫面純文字位移找出所屬行的行號。
+  ///
+  /// `layoutLineStarts` 與畫面文字來自同一份 layout，因此偈頌、表格等
+  /// 也能量到正確的行。
+  String? _lineheadAtLayoutOffset(int offset) {
+    final lines = widget.sourceLines;
+    final starts = widget.layoutLineStarts;
+    if (starts.isEmpty || starts.length != lines.length) {
+      return widget.passage.linehead ??
+          _firstScriptureLinehead(widget.sourceLines);
+    }
+    String? current = widget.passage.linehead;
+    for (var i = 0; i < lines.length; i++) {
+      final lineStart = starts[i];
+      if (lineStart > offset) break;
+      if (lines[i].linehead != null) current = lines[i].linehead;
+      final lineEnd = i + 1 < starts.length
+          ? starts[i + 1]
+          : widget.passage.text.length;
+      if (offset <= lineEnd) return current;
+    }
+    return current;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    _ScriptDisplayScope.dependOn(context);
+    final settings = scriptureDisplaySettings;
+    return Focus(
+      onKeyEvent: (node, event) {
+        final isCopyShortcut =
+            event is KeyDownEvent &&
+            event.logicalKey == LogicalKeyboardKey.keyC &&
+            (HardwareKeyboard.instance.isControlPressed ||
+                HardwareKeyboard.instance.isMetaPressed);
+        if (isCopyShortcut && selectedText.isNotEmpty) {
+          _copyCitation();
+          return KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
+      },
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          // 用不可見的 WidgetSpan 補齊左側空白，讓單一段落可以置中或靠右，
+          // 同時保留文字本身的選取能力。
+          WidgetSpan leadingSpacer(double pad) => WidgetSpan(
+            alignment: PlaceholderAlignment.middle,
+            child: SizedBox(width: pad < 0 ? 0 : pad, height: 0),
+          );
+
+          final headerChildren = <InlineSpan>[];
+
+          for (final line in widget.headerLines) {
+            final isNight = settings.backgroundTheme == 'night';
+            final isVolumeTitle = line.role == ScriptureLineRole.volumeTitle;
+            final lineStyle = _scriptureTextStyle(settings).copyWith(
+              color: isNight
+                  ? (isVolumeTitle
+                        ? const Color(0xFF72C5B2)
+                        : const Color(0xFFA99A85))
+                  : (isVolumeTitle
+                        ? const Color(0xFF007564)
+                        : const Color(0xFF8C7B66)),
+              fontSize: settings.fontSize * (isVolumeTitle ? 1.05 : 0.8),
+              fontWeight: isVolumeTitle ? FontWeight.w600 : null,
+            );
+            final contentSpans = _headerLineSpans(line);
+            final painter = TextPainter(
+              text: TextSpan(style: lineStyle, children: contentSpans),
+              textDirection: Directionality.of(context),
+              textScaler: MediaQuery.textScalerOf(context),
+              maxLines: 1,
+            )..layout();
+            final textWidth = painter.width;
+            painter.dispose();
+            headerChildren.add(
+              leadingSpacer(
+                isVolumeTitle
+                    ? (constraints.maxWidth - textWidth) / 2
+                    : constraints.maxWidth - textWidth,
               ),
-              child: Text.rich(
-                _highlightedPassageText(line.text.trim(), widget.query.trim()),
-                textAlign: line.role == ScriptureLineRole.volumeTitle
-                    ? TextAlign.center
-                    : TextAlign.right,
-                style: _scriptureTextStyle(scriptureDisplaySettings).copyWith(
-                  color: scriptureDisplaySettings.backgroundTheme == 'night'
-                      ? line.role == ScriptureLineRole.volumeTitle
-                            ? const Color(0xFF72C5B2)
-                            : const Color(0xFFB2A48F)
-                      : line.role == ScriptureLineRole.volumeTitle
-                      ? const Color(0xFF007564)
-                      : const Color(0xFF6B5744),
-                  fontSize:
-                      scriptureDisplaySettings.fontSize *
-                      (line.role == ScriptureLineRole.volumeTitle
-                          ? 1.05
-                          : 0.85),
-                  fontWeight: line.role == ScriptureLineRole.volumeTitle
-                      ? FontWeight.w600
-                      : null,
-                ),
+            );
+            headerChildren.add(
+              TextSpan(
+                style: lineStyle,
+                children: [
+                  ...contentSpans,
+                  const TextSpan(text: '\n'),
+                ],
               ),
-            ),
-          _DisplaySelectableText.rich(
+            );
+          }
+
+          var headerPrefixLength = 0;
+          for (final span in headerChildren) {
+            headerPrefixLength += span.toPlainText().length;
+          }
+
+          final bodySpan = _displayInlineSpan(
             _interactivePassageText(
               context,
               widget.passage,
@@ -3831,6 +3923,14 @@ class _SelectablePassageTextState extends State<_SelectablePassageText> {
               width: constraints.maxWidth,
               recognizers: noteRecognizers,
             ),
+          );
+
+          final combinedSpan = flutter_material.TextSpan(
+            children: [...headerChildren, bodySpan],
+          );
+
+          return SelectableText.rich(
+            combinedSpan,
             key: widget.selectableTextKey,
             onSelectionChanged: (selection, _) {
               final start = selection.start < selection.end
@@ -3839,46 +3939,61 @@ class _SelectablePassageTextState extends State<_SelectablePassageText> {
               final end = selection.start > selection.end
                   ? selection.start
                   : selection.end;
-              final sourceStart = _sourceOffsetForSelectableOffset(
-                widget.passage.lines,
-                start,
-                showLineBeginnings: widget.passage.showLineBeginnings,
-                showCollation: widget.passage.showCollation,
+
+              final plainText = combinedSpan.toPlainText();
+              if (end <= headerPrefixLength) {
+                selectedText = _stripSelectionPlaceholders(
+                  plainText.substring(start, end),
+                ).trimRight();
+                final fallbackLinehead =
+                    widget.passage.linehead ??
+                    _firstScriptureLinehead(widget.sourceLines);
+                selectedStartLinehead = fallbackLinehead;
+                selectedEndLinehead = fallbackLinehead;
+                return;
+              }
+
+              final bodyStart = (start - headerPrefixLength)
+                  .clamp(0, plainText.length - headerPrefixLength)
+                  .toInt();
+              final bodyEnd = (end - headerPrefixLength)
+                  .clamp(0, plainText.length - headerPrefixLength)
+                  .toInt();
+
+              final headerPart = start < headerPrefixLength
+                  ? '${plainText.substring(start, headerPrefixLength).trimRight()}\n'
+                  : '';
+              final bodyPart = plainText.substring(
+                headerPrefixLength + bodyStart,
+                headerPrefixLength + bodyEnd,
               );
-              final sourceEnd = _sourceOffsetForSelectableOffset(
-                widget.passage.lines,
-                end,
-                showLineBeginnings: widget.passage.showLineBeginnings,
-                showCollation: widget.passage.showCollation,
+              selectedText = _stripSelectionPlaceholders(
+                headerPart.isEmpty ? bodyPart : '$headerPart$bodyPart',
               );
-              selectedText = widget.passage.text.substring(
-                sourceStart,
-                sourceEnd.clamp(sourceStart, widget.passage.text.length),
-              );
-              selectedStartLinehead = _lineheadAtOffset(
-                widget.passage.lines,
-                sourceStart,
-                showLineBeginnings: widget.passage.showLineBeginnings,
-                showCollation: widget.passage.showCollation,
-              );
-              selectedEndLinehead = _lineheadAtOffset(
-                widget.passage.lines,
-                sourceEnd > sourceStart ? sourceEnd - 1 : sourceEnd,
-                showLineBeginnings: widget.passage.showLineBeginnings,
-                showCollation: widget.passage.showCollation,
+
+              selectedStartLinehead = _lineheadAtLayoutOffset(bodyStart);
+              selectedEndLinehead = _lineheadAtLayoutOffset(
+                bodyEnd > bodyStart ? bodyEnd - 1 : bodyEnd,
               );
             },
             contextMenuBuilder: (context, editableTextState) {
               final textEditingValue = editableTextState.textEditingValue;
-              final selectedText = textEditingValue.selection.textInside(
-                textEditingValue.text,
+              final selText = _stripSelectionPlaceholders(
+                textEditingValue.selection.textInside(textEditingValue.text),
               );
 
               final buttonItems = <ContextMenuButtonItem>[
                 ContextMenuButtonItem(
+                  label: '全選',
+                  onPressed: () {
+                    editableTextState.selectAll(SelectionChangedCause.toolbar);
+                    editableTextState.hideToolbar();
+                  },
+                ),
+                ContextMenuButtonItem(
                   label: '複製',
                   onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: selectedText));
+                    await Clipboard.setData(ClipboardData(text: selText));
                     if (context.mounted) {
                       ScaffoldMessenger.of(
                         context,
@@ -3894,6 +4009,13 @@ class _SelectablePassageTextState extends State<_SelectablePassageText> {
                     editableTextState.hideToolbar();
                   },
                 ),
+                ContextMenuButtonItem(
+                  label: '分享到其他軟件',
+                  onPressed: () {
+                    SharePlus.instance.share(ShareParams(text: selText));
+                    editableTextState.hideToolbar();
+                  },
+                ),
               ];
 
               return AdaptiveTextSelectionToolbar.buttonItems(
@@ -3901,12 +4023,12 @@ class _SelectablePassageTextState extends State<_SelectablePassageText> {
                 buttonItems: buttonItems,
               );
             },
-            style: _scriptureTextStyle(scriptureDisplaySettings),
-          ),
-        ],
+            style: _scriptureTextStyle(settings),
+          );
+        },
       ),
-    ),
-  );
+    );
+  }
 
   final List<TapGestureRecognizer> noteRecognizers = [];
 
@@ -3917,60 +4039,6 @@ class _SelectablePassageTextState extends State<_SelectablePassageText> {
     }
     super.dispose();
   }
-}
-
-int _sourceOffsetForSelectableOffset(
-  List<ScriptureLine> lines,
-  int selectableOffset, {
-  required bool showLineBeginnings,
-  required bool showCollation,
-}) {
-  var sourceOffset = 0;
-  var renderedOffset = 0;
-  for (final line in lines) {
-    final lineBeginning =
-        showLineBeginnings &&
-            line.linehead != null &&
-            line.role != ScriptureLineRole.navigationAnchor
-        ? '[${line.linehead!.split('_p').last}] '
-        : '';
-    sourceOffset += lineBeginning.length;
-    renderedOffset += lineBeginning.length;
-    final visibleLine = visibleScriptureLine(
-      line,
-      showLineBeginnings: false,
-      showCollation: showCollation,
-    );
-    if (line.verseCells.isNotEmpty) {
-      final widgetEnd = renderedOffset + 1;
-      final sourceEnd = sourceOffset + visibleLine.length;
-      if (selectableOffset <= widgetEnd) {
-        return selectableOffset <= renderedOffset ? sourceOffset : sourceEnd;
-      }
-      renderedOffset += 2;
-      sourceOffset = sourceEnd;
-    } else {
-      final lineEnd = renderedOffset + visibleLine.length;
-      if (selectableOffset <= lineEnd) {
-        return sourceOffset + (selectableOffset - renderedOffset);
-      }
-      renderedOffset = lineEnd;
-      sourceOffset += visibleLine.length;
-    }
-  }
-  return sourceOffset.clamp(
-    0,
-    lines.fold<int>(
-      0,
-      (length, line) =>
-          length +
-          visibleScriptureLine(
-            line,
-            showLineBeginnings: showLineBeginnings,
-            showCollation: showCollation,
-          ).length,
-    ),
-  );
 }
 
 RenderEditable? _findRenderEditable(RenderObject? renderObject) {
@@ -4018,12 +4086,69 @@ int _scriptureSourceAdvance(ScriptureLine line) =>
         ? 1
         : 0);
 
-/// 表格、偈頌與純圖片行在 `SelectableText` 中是以 `WidgetSpan` 呈現，
+/// 這些行在 layout 中會自帶換行，接在其後的偈頌段不需要再補換行。
+bool _lineEndsWithExplicitNewline(ScriptureLine line) =>
+    line.text.endsWith('\n') ||
+    line.verseCells.isNotEmpty ||
+    line.tableRows.isNotEmpty ||
+    (line.images.isNotEmpty && line.text.isEmpty);
+
+/// 判斷是否為 CBETA 的經號行，例如 `No. 102 [No. 99(33-34)]`。
+bool _isCanonNumberLine(String text) {
+  final trimmed = text.trim();
+  if (!trimmed.startsWith('No.')) return false;
+  return RegExp(r'^No\.[A-Za-z0-9\s\[\]\(\),.\-–—]*$').hasMatch(trimmed);
+}
+
+/// 取得此卷正文的第一個行號；標題／譯者沒有行號時用來產生引文。
+String? _firstScriptureLinehead(List<ScriptureLine> lines) {
+  for (final line in lines) {
+    final linehead = line.linehead;
+    if (linehead != null && linehead.isNotEmpty) return linehead;
+  }
+  return null;
+}
+
+const _headerFootnoteStyle = TextStyle(
+  color: Color(0xFF8B6B2F),
+  fontSize: 13,
+  decoration: TextDecoration.underline,
+);
+
+/// 表格與純圖片行在 `SelectableText` 中是以 `WidgetSpan` 呈現，
 /// 每個 WidgetSpan 在純文字中只佔用 1 個 placeholder 字元。
 bool _isWidgetOnlyScriptureLine(ScriptureLine line) =>
-    line.tableRows.isNotEmpty ||
-    line.verseCells.isNotEmpty ||
-    (line.images.isNotEmpty && line.text.isEmpty);
+    line.tableRows.isNotEmpty || (line.images.isNotEmpty && line.text.isEmpty);
+
+/// 偈頌每一格在畫面上的文字（含校勘標記）。
+///
+/// 這個結果同時供 layout 位移計算與實際渲染使用，兩者必須完全一致，
+/// 否則選取、捲動與搜尋高亮都會偏移。
+List<String> _verseCellRenderedTexts(
+  ScriptureLine line, {
+  required bool showCollation,
+}) {
+  final rendered = <String>[];
+  var cellStart = 0;
+  for (final cell in line.verseCells) {
+    final cellEnd = cellStart + cell.length;
+    final buffer = StringBuffer();
+    var cursor = 0;
+    for (final note in line.footnotes) {
+      if (note.offset < cellStart || note.offset > cellEnd) continue;
+      final local = (note.offset - cellStart).clamp(cursor, cell.length);
+      buffer.write(cell.substring(cursor, local));
+      if (showCollation) {
+        buffer.write('[${note.label}]');
+      }
+      cursor = local;
+    }
+    buffer.write(cell.substring(cursor));
+    rendered.add(buffer.toString());
+    cellStart = cellEnd;
+  }
+  return rendered;
+}
 
 _ScriptureTextLayout _buildScriptureTextLayout(
   List<ScriptureLine> lines, {
@@ -4035,7 +4160,22 @@ _ScriptureTextLayout _buildScriptureTextLayout(
   final lineSourceStarts = <int>[];
   var offset = 0;
   var sourceOffset = 0;
-  for (final line in lines) {
+  for (var lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    final line = lines[lineIndex];
+    final isVerseBlockStart =
+        line.verseCells.isNotEmpty &&
+        lineIndex > 0 &&
+        lines[lineIndex - 1].verseCells.isEmpty;
+    final isVerseBlockEnd =
+        line.verseCells.isNotEmpty &&
+        lineIndex + 1 < lines.length &&
+        lines[lineIndex + 1].verseCells.isEmpty;
+    if (isVerseBlockStart &&
+        !_lineEndsWithExplicitNewline(lines[lineIndex - 1])) {
+      // 偈頌段落前只需要一個換行；前一行若已自帶換行就不再重複。
+      buffer.write('\n');
+      offset += 1;
+    }
     if (showLineBeginnings &&
         line.linehead != null &&
         line.role != ScriptureLineRole.navigationAnchor) {
@@ -4045,12 +4185,36 @@ _ScriptureTextLayout _buildScriptureTextLayout(
     }
     lineStarts.add(offset);
     lineSourceStarts.add(sourceOffset);
-    if (line.tableRows.isNotEmpty || line.verseCells.isNotEmpty) {
+    if (line.tableRows.isNotEmpty) {
       // WidgetSpan placeholder + 換行。
       buffer
         ..write('\uFFFC')
         ..write('\n');
       offset += 2;
+    } else if (line.verseCells.isNotEmpty) {
+      // 偈頌改以文字呈現，才能逐字選取：
+      // 每格前面的間距仍是 WidgetSpan placeholder，格子內容則是真實文字。
+      final cellTexts = _verseCellRenderedTexts(
+        line,
+        showCollation: showCollation,
+      );
+      buffer.write('\uFFFC');
+      offset += 1;
+      for (var i = 0; i < cellTexts.length; i++) {
+        if (i > 0) {
+          buffer.write('\uFFFC');
+          offset += 1;
+        }
+        buffer.write(cellTexts[i]);
+        offset += cellTexts[i].length;
+      }
+      buffer.write('\n');
+      offset += 1;
+      if (isVerseBlockEnd) {
+        // 偈頌段後留一空行，與後段分開。
+        buffer.write('\n');
+        offset += 1;
+      }
     } else if (line.images.isNotEmpty) {
       for (var i = 0; i < line.images.length; i++) {
         buffer.write('\uFFFC');
@@ -4113,6 +4277,35 @@ int _layoutEditableOffsetForSource(
     final sourceEnd = sourceStart + line.text.length;
     if (sourceOffset <= sourceEnd || i == lines.length - 1) {
       final inLine = (sourceOffset - sourceStart).clamp(0, line.text.length);
+      if (line.verseCells.isNotEmpty) {
+        final renderedCells = _verseCellRenderedTexts(
+          line,
+          showCollation: showCollation,
+        );
+        var rendered = layout.lineStarts[i] + 1; // 行首間距 placeholder
+        var consumed = 0;
+        for (var c = 0; c < line.verseCells.length; c++) {
+          if (c > 0) rendered += 1; // 格與格之間的 placeholder
+          final cellLength = line.verseCells[c].length;
+          if (inLine <= consumed + cellLength) {
+            final markersInCell = showCollation
+                ? line.footnotes
+                      .where(
+                        (note) =>
+                            note.offset >= consumed && note.offset <= inLine,
+                      )
+                      .fold<int>(
+                        0,
+                        (length, note) => length + note.label.length + 2,
+                      )
+                : 0;
+            return rendered + (inLine - consumed) + markersInCell;
+          }
+          rendered += renderedCells[c].length;
+          consumed += cellLength;
+        }
+        return rendered;
+      }
       // WidgetSpan 內的文字無法用純文字位移定位，統一指向該行開頭。
       if (_isWidgetOnlyScriptureLine(line)) {
         return layout.lineStarts[i];
@@ -4495,7 +4688,22 @@ TextSpan _interactivePassageText(
     sourceOffset += _scriptureSourceAdvance(line);
   }
 
-  for (final line in sourceLines) {
+  for (var lineIndex = 0; lineIndex < sourceLines.length; lineIndex++) {
+    final line = sourceLines[lineIndex];
+    final isVerseBlockStart =
+        line.verseCells.isNotEmpty &&
+        lineIndex > 0 &&
+        sourceLines[lineIndex - 1].verseCells.isEmpty;
+    final isVerseBlockEnd =
+        line.verseCells.isNotEmpty &&
+        lineIndex + 1 < sourceLines.length &&
+        sourceLines[lineIndex + 1].verseCells.isEmpty;
+    if (isVerseBlockStart &&
+        !_lineEndsWithExplicitNewline(sourceLines[lineIndex - 1])) {
+      // 與 `_buildScriptureTextLayout` 一致：前一行沒有換行才補一個。
+      children.add(const TextSpan(text: '\n'));
+      offset += 1;
+    }
     if (settings.showLineBeginnings &&
         line.linehead != null &&
         line.role != ScriptureLineRole.navigationAnchor) {
@@ -4615,84 +4823,127 @@ TextSpan _interactivePassageText(
         sourceOffset += _scriptureSourceAdvance(line);
       }
     } else if (line.verseCells.isNotEmpty) {
-      final lineStartOffset = offset;
-      children.add(
-        WidgetSpan(
-          alignment: PlaceholderAlignment.middle,
-          child: SizedBox(
-            width: width,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                for (
-                  var cellIndex = 0;
-                  cellIndex < line.verseCells.length;
-                  cellIndex++
+      final verseStyle = _scriptureTextStyle(settings);
+      final renderedCells = _verseCellRenderedTexts(
+        line,
+        showCollation: settings.showCollation,
+      );
+      final spansPerCell = <List<InlineSpan>>[];
+      final cellWidths = <double>[];
+      var layoutCursor = offset + 1; // 行首間距 placeholder
+      var sourceCursor = 0;
+      for (var cellIndex = 0; cellIndex < line.verseCells.length; cellIndex++) {
+        final cellText = line.verseCells[cellIndex];
+        final cellEnd = sourceCursor + cellText.length;
+        final cellSpans = contentSpans(
+          ScriptureLine(
+            text: cellText,
+            footnotes: line.footnotes
+                .where(
+                  (note) =>
+                      note.offset >= sourceCursor && note.offset <= cellEnd,
                 )
-                  Flexible(
-                    child: Text.rich(
-                      TextSpan(
-                        children: contentSpans(
-                          ScriptureLine(
-                            text: line.verseCells[cellIndex],
-                            footnotes: line.footnotes
-                                .where(
-                                  (note) =>
-                                      note.offset >=
-                                          line.verseCells
-                                              .take(cellIndex)
-                                              .fold<int>(
-                                                0,
-                                                (length, cell) =>
-                                                    length + cell.length,
-                                              ) &&
-                                      note.offset <=
-                                          line.verseCells
-                                                  .take(cellIndex)
-                                                  .fold<int>(
-                                                    0,
-                                                    (length, cell) =>
-                                                        length + cell.length,
-                                                  ) +
-                                              line.verseCells[cellIndex].length,
-                                )
-                                .map(
-                                  (note) => ScriptureFootnote(
-                                    offset:
-                                        note.offset -
-                                        line.verseCells
-                                            .take(cellIndex)
-                                            .fold<int>(
-                                              0,
-                                              (length, cell) =>
-                                                  length + cell.length,
-                                            ),
-                                    label: note.label,
-                                    clue: note.clue,
-                                    content: note.content,
-                                  ),
-                                )
-                                .toList(),
-                          ),
-                          0,
-                          0,
-                          highlightSpan: (value) =>
-                              highlightedWidget(value, lineStartOffset, 2),
-                        ),
-                      ),
-                      textAlign: TextAlign.center,
-                      style: _scriptureTextStyle(settings),
+                .map(
+                  (note) => ScriptureFootnote(
+                    offset: (note.offset - sourceCursor).clamp(
+                      0,
+                      cellText.length,
                     ),
+                    label: note.label,
+                    clue: note.clue,
+                    content: note.content,
                   ),
-              ],
+                )
+                .toList(),
+          ),
+          layoutCursor,
+          0,
+        );
+        final painter = TextPainter(
+          text: TextSpan(style: verseStyle, children: cellSpans),
+          textDirection: Directionality.of(context),
+          textScaler: MediaQuery.textScalerOf(context),
+          maxLines: 1,
+        )..layout();
+        cellWidths.add(painter.width);
+        painter.dispose();
+        spansPerCell.add(cellSpans);
+        layoutCursor += renderedCells[cellIndex].length + 1;
+        sourceCursor = cellEnd;
+      }
+
+      // 以文字呈現每一格，才能逐字選取；格與格之間的間距用不可見的
+      // WidgetSpan 補足，維持原本每格等寬置中的外觀。
+      // 保留 0.5px 餘裕，避免量測誤差讓整行被擠到下一行。
+      var rowWidth = width > 1 ? width - 0.5 : width;
+      final hasLinePrefix =
+          settings.showLineBeginnings &&
+          line.linehead != null &&
+          line.role != ScriptureLineRole.navigationAnchor;
+      if (hasLinePrefix) {
+        final marker = '[${line.linehead!.split('_p').last}] ';
+        final markerPainter = TextPainter(
+          text: TextSpan(
+            text: marker,
+            style: verseStyle.copyWith(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
             ),
           ),
-        ),
-      );
-      // WidgetSpan 在純文字中只佔 1 個 placeholder，再加上換行。
+          textDirection: Directionality.of(context),
+          textScaler: MediaQuery.textScalerOf(context),
+          maxLines: 1,
+        )..layout();
+        rowWidth = (rowWidth - markerPainter.width).clamp(0.0, double.infinity);
+        markerPainter.dispose();
+      }
+      final cellCount = spansPerCell.length;
+      final slot = cellCount == 0 ? rowWidth : rowWidth / cellCount;
+      // 偈字行距加大；仍以同一個字元序列呈現，不影響搜尋錨點。
+      final verseLineStyle = TextStyle(height: settings.lineHeight + 0.5);
+      var cursorX = 0.0;
+      for (var i = 0; i < cellCount; i++) {
+        final targetLeft = i * slot + (slot - cellWidths[i]) / 2;
+        final pad = (targetLeft - cursorX).clamp(0.0, double.infinity);
+        children.add(
+          WidgetSpan(
+            alignment: PlaceholderAlignment.middle,
+            child: SizedBox(width: pad, height: 0),
+          ),
+        );
+        children.add(
+          TextSpan(style: verseLineStyle, children: spansPerCell[i]),
+        );
+        cursorX = targetLeft + cellWidths[i];
+      }
       offset += 1;
+      for (var i = 0; i < renderedCells.length; i++) {
+        if (i > 0) offset += 1;
+        offset += renderedCells[i].length;
+      }
       children.add(const TextSpan(text: '\n'));
       offset += 1;
+      if (isVerseBlockEnd) {
+        // 與 `_buildScriptureTextLayout` 一致：偈頌段後留一空行。
+        children.add(const TextSpan(text: '\n'));
+        offset += 1;
+      }
+      sourceOffset += _scriptureSourceAdvance(line);
+    } else if (_isCanonNumberLine(line.text)) {
+      // 經號行（No. ...）只是索引資訊，用較小、較淺的字級顯示。
+      final content = contentSpans(line, offset, sourceOffset);
+      children.add(
+        TextSpan(
+          style: TextStyle(
+            fontSize: settings.fontSize * 0.72,
+            color: settings.backgroundTheme == 'night'
+                ? const Color(0xFF8E8171)
+                : const Color(0xFF9A8B78),
+          ),
+          children: content,
+        ),
+      );
+      offset = offset + visibleLineLength(line);
       sourceOffset += _scriptureSourceAdvance(line);
     } else {
       addContent(line);
@@ -4829,30 +5080,6 @@ class _JuanSelector extends StatelessWidget {
   );
 }
 
-String? _lineheadAtOffset(
-  List<ScriptureLine> lines,
-  int offset, {
-  required bool showLineBeginnings,
-  required bool showCollation,
-}) {
-  var currentOffset = 0;
-  String? currentLinehead;
-  for (final line in lines) {
-    if (currentOffset > offset) break;
-    if (line.linehead != null) currentLinehead = line.linehead;
-    final lineEnd =
-        currentOffset +
-        visibleScriptureLine(
-          line,
-          showLineBeginnings: showLineBeginnings,
-          showCollation: showCollation,
-        ).length;
-    if (offset <= lineEnd) return currentLinehead;
-    currentOffset = lineEnd;
-  }
-  return currentLinehead;
-}
-
 TextSpan _highlightedPassageText(String text, String query, {int? startAt}) {
   if (query.isEmpty) return TextSpan(text: text);
   final lowerText = text.toLowerCase();
@@ -4944,14 +5171,16 @@ Future<void> _copySelectedPassage(
   String? selectedStartLinehead,
   String? selectedEndLinehead,
 }) async {
-  var endLinehead = selectedEndLinehead ?? passage.linehead;
-  var startLinehead = selectedStartLinehead ?? passage.linehead;
+  final fallbackLinehead =
+      passage.linehead ?? _firstScriptureLinehead(passage.lines);
+  var endLinehead = selectedEndLinehead ?? fallbackLinehead;
+  var startLinehead = selectedStartLinehead ?? fallbackLinehead;
   String? sectionTitle;
   try {
     if (selectedStartLinehead == null) {
       final lineheads = await _loadSelectionLineheads(passage, selectedText);
-      startLinehead = lineheads.firstOrNull ?? passage.linehead;
-      endLinehead = lineheads.length > 1 ? lineheads.last : passage.linehead;
+      startLinehead = lineheads.firstOrNull ?? startLinehead;
+      endLinehead = lineheads.length > 1 ? lineheads.last : endLinehead;
     }
     sectionTitle = await _loadSectionTitle(passage, startLinehead);
   } catch (_) {
@@ -5091,7 +5320,9 @@ String formatSelectedPassageForCopy(
   String? endLinehead,
   String? sectionTitle,
 }) {
-  final start = _citationLocation(startLinehead ?? passage.linehead);
+  final start = _citationLocation(
+    startLinehead ?? passage.linehead ?? _firstScriptureLinehead(passage.lines),
+  );
   final end = _citationLocation(endLinehead) ?? start;
   final citationLocation = start == null
       ? ''
@@ -5999,7 +6230,6 @@ class _FullTextSearchSnapshot {
 
 class _FullTextSearchCache {
   static final Map<String, _FullTextSearchSnapshot> _snapshots = {};
-  static String? lastQuery;
 
   static _FullTextSearchSnapshot? get(String query) => _snapshots[query];
 
@@ -6010,7 +6240,6 @@ class _FullTextSearchCache {
     required int totalFound,
     required int totalTermHits,
   }) {
-    lastQuery = query;
     _snapshots[query] = _FullTextSearchSnapshot(
       results: List.unmodifiable(results),
       nextStart: nextStart,
@@ -6047,7 +6276,6 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
         nextStart = cached.nextStart;
         totalFound = cached.totalFound;
         totalTermHits = cached.totalTermHits;
-        _FullTextSearchCache.lastQuery = query;
       } else {
         WidgetsBinding.instance.addPostFrameCallback((_) => search());
       }
@@ -6075,7 +6303,6 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
       // 記錄失敗不影響搜尋。
     }
     if (!mounted) return;
-    _FullTextSearchCache.lastQuery = query;
     FocusScope.of(context).unfocus();
     if (kIsWeb) {
       setState(() {
