@@ -1,0 +1,112 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:xuefo/download/catalog_cache.dart';
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  setUp(() {
+    CatalogCache.instance.debugReset();
+  });
+
+  test('loads the four scope selector catalogs', () async {
+    final cache = CatalogCache.instance;
+    await cache.load();
+
+    expect(cache.cbetaTree, isNotNull);
+    expect(cache.origTree, isNotNull);
+    expect(cache.cbetaTree!.children, isNotEmpty);
+    expect(cache.origTree!.children, isNotEmpty);
+    expect(cache.creators, isNotEmpty);
+    expect(cache.dynasties, isNotEmpty);
+
+    final allWorks = cache.allWorks;
+    expect(allWorks.length, greaterThan(5000));
+    final workIds = allWorks.map((work) => work.work).toSet();
+    expect(workIds.length, allWorks.length);
+
+    final categoryWorks = cache.workIdsInNode(cache.cbetaTree!);
+    expect(categoryWorks.length, greaterThan(4000));
+    expect(cache.cbetaTree!.workCount, categoryWorks.length);
+
+    final volumeWorks = cache.workIdsInNode(cache.origTree!);
+    expect(volumeWorks.length, categoryWorks.length);
+
+    for (final work in allWorks) {
+      expect(work.juans, isNotEmpty);
+      expect(work.title, isNotEmpty);
+    }
+  });
+
+  test('parses juan counts, bylines, creators, and dynasties', () async {
+    final cache = CatalogCache.instance;
+    await cache.load();
+
+    final longAgama = cache.lookupWork('T0001');
+    expect(longAgama, isNotNull);
+    expect(longAgama!.title, '長阿含經');
+    expect(longAgama.juans.length, 22);
+    expect(longAgama.creators, contains('佛陀耶舍'));
+
+    final department = cache.departmentForWork('T0001');
+    expect(department, contains('阿含部類'));
+
+    final firstCreator = cache.creators.values.first;
+    expect(firstCreator.strokeGroup, '1 劃');
+    expect(firstCreator.name, '一如');
+    expect(firstCreator.works, isNotEmpty);
+    expect(firstCreator.works.first.work, 'B0117');
+    expect(firstCreator.works.first.label, startsWith('B0117 三藏法數'));
+    expect(firstCreator.works.first.juan, 50);
+
+    final firstDynasty = cache.dynasties.first;
+    expect(firstDynasty.name, '東漢');
+    expect(firstDynasty.start, '25');
+    expect(firstDynasty.end, '220');
+    expect(firstDynasty.period, '25 CE–220 CE');
+    expect(firstDynasty.works, isNotEmpty);
+  });
+
+  test('searches the local catalog by work id, title and creator', () async {
+    final cache = CatalogCache.instance;
+    await cache.load();
+
+    final byId = cache.searchWorks('T0001');
+    expect(byId, isNotEmpty);
+    expect(byId.first['work'], 'T0001');
+    expect(byId.first['label'], contains('長阿含經'));
+
+    final byTitle = cache.searchWorks('長阿含');
+    expect(byTitle.any((item) => item['work'] == 'T0001'), isTrue);
+
+    final byCreator = cache.searchWorks('佛陀耶舍');
+    expect(byCreator.any((item) => item['work'] == 'T0001'), isTrue);
+
+    expect(cache.lookupWorkFile('T0001'), 'T01n0001');
+    expect(cache.lookupWorkFile('A1057'), 'A091n1057');
+    expect(byId.first['file'], 'T01n0001');
+
+    expect(cache.searchWorks('  '), isEmpty);
+    expect(cache.searchWorks('T0001', limit: 1), hasLength(1));
+  });
+
+  test('every catalog work resolves to metadata', () async {
+    final cache = CatalogCache.instance;
+    await cache.load();
+
+    for (final node in cache.cbetaTree!.children) {
+      for (final work in cache.workIdsInNode(node)) {
+        expect(cache.lookupWork(work), isNotNull, reason: work);
+      }
+    }
+    for (final creator in cache.creators.values) {
+      for (final work in creator.works) {
+        expect(cache.lookupWork(work.work), isNotNull, reason: work.work);
+      }
+    }
+    for (final dynasty in cache.dynasties) {
+      for (final work in dynasty.works) {
+        expect(cache.lookupWork(work.work), isNotNull, reason: work.work);
+      }
+    }
+  });
+}

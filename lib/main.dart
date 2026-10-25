@@ -29,6 +29,10 @@ import 'search/conversion.dart';
 import 'search/goto.dart';
 import 'search/history.dart';
 import 'search/search_input.dart';
+import 'download/catalog_cache.dart';
+import 'download/download_manager.dart';
+import 'download/download_models.dart';
+import 'download/download_notifications.dart';
 import 'settings/display_settings.dart';
 
 export 'scripture/cache.dart';
@@ -42,7 +46,34 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SimplifiedTraditionalConverter.load();
   await scriptureDisplaySettings.load();
+  await downloadManager.initialize();
+  downloadNotifications
+    ..initialize()
+    ..onOpenDownloadManager = _openDownloadManagerFromNotification;
   runApp(const CbetaSearchApp());
+  unawaited(_consumePendingDownloadManagerRequest());
+}
+
+final _navigatorKey = GlobalKey<NavigatorState>();
+
+Future<void> _consumePendingDownloadManagerRequest() async {
+  if (await downloadNotifications.consumePendingOpenRequest()) {
+    _openDownloadManagerFromNotification();
+  }
+}
+
+void _openDownloadManagerFromNotification() {
+  final context = _navigatorKey.currentContext;
+  if (context != null) {
+    unawaited(_showDownloadStatusPanel(context));
+    return;
+  }
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    final readyContext = _navigatorKey.currentContext;
+    if (readyContext != null) {
+      unawaited(_showDownloadStatusPanel(readyContext));
+    }
+  });
 }
 
 const _giteeOwner = 'undclouds';
@@ -301,7 +332,6 @@ Future<void> _showDisplaySettings(BuildContext context) {
   return showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
-    backgroundColor: scriptureDisplaySettings.backgroundColor,
     builder: (context) => SafeArea(
       child: FractionallySizedBox(
         heightFactor: 0.88,
@@ -310,6 +340,31 @@ Future<void> _showDisplaySettings(BuildContext context) {
     ),
   );
 }
+
+Future<void> _showOfflineDataManager(BuildContext context) {
+  Navigator.of(context).pop();
+  final rootContext = _navigatorKey.currentContext ?? context;
+  return _showDownloadStatusPanel(rootContext);
+}
+
+bool _downloadStatusPanelOpen = false;
+
+Future<void> _showDownloadStatusPanel(BuildContext context) async {
+  if (_downloadStatusPanelOpen) return;
+  _downloadStatusPanelOpen = true;
+  try {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) =>
+          _DownloadStatusPanel(onDisposed: _markDownloadStatusPanelClosed),
+    );
+  } finally {
+    _downloadStatusPanelOpen = false;
+  }
+}
+
+void _markDownloadStatusPanelClosed() => _downloadStatusPanelOpen = false;
 
 Future<void> _showAbout(BuildContext context) {
   return showDialog<void>(
@@ -708,7 +763,24 @@ class _DisplaySettingsPanel extends StatelessWidget {
                       () => settings.update(showLineBeginnings: value),
                     ),
                   ),
-                  const _CachedScriptureUpdateTile(),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(_displayText('離線資料管理', context)),
+                    subtitle: AnimatedBuilder(
+                      animation: downloadManager,
+                      builder: (context, _) {
+                        final count = downloadManager.versions.length;
+                        return Text(
+                          _displayText(
+                            count == 0 ? '尚未下載經文' : '已下載 $count 卷',
+                            context,
+                          ),
+                        );
+                      },
+                    ),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: () => _showOfflineDataManager(context),
+                  ),
                   const Divider(),
                   ListTile(
                     contentPadding: EdgeInsets.zero,
@@ -849,57 +921,279 @@ class _SettingsButton extends StatelessWidget {
   );
 }
 
-class _CachedScriptureUpdateTile extends StatefulWidget {
-  const _CachedScriptureUpdateTile();
+class _DownloadInfoButton extends StatefulWidget {
+  const _DownloadInfoButton({required this.onPressed});
+  final VoidCallback onPressed;
 
   @override
-  State<_CachedScriptureUpdateTile> createState() =>
-      _CachedScriptureUpdateTileState();
+  State<_DownloadInfoButton> createState() => _DownloadInfoButtonState();
 }
 
-class _CachedScriptureUpdateTileState
-    extends State<_CachedScriptureUpdateTile> {
-  bool isUpdating = false;
+class _DownloadInfoButtonState extends State<_DownloadInfoButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _flashController;
 
-  Future<void> _updateCachedScriptures() async {
-    setState(() => isUpdating = true);
-    try {
-      final result = await checkAndUpdateCachedScriptures();
-      if (!mounted) return;
-      final message = result.errors.isEmpty
-          ? result.updated + result.unchanged == 0
-                ? '沒有已儲存的離線經卷'
-                : '檢查完成：更新 ${result.updated} 卷，${result.unchanged} 卷已是最新'
-          : '檢查完成：更新 ${result.updated} 卷，${result.unchanged} 卷已是最新，'
-                '${result.errors.length} 卷更新失敗：'
-                '${result.errors.take(2).join('；')}';
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
-    } catch (error) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('檢查離線經文更新失敗：$error')));
-    } finally {
-      if (mounted) setState(() => isUpdating = false);
+  @override
+  void initState() {
+    super.initState();
+    _flashController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 800),
+    );
+    downloadManager.addListener(_onManagerChanged);
+  }
+
+  void _onManagerChanged() {
+    if (downloadManager.isDownloading) {
+      if (!_flashController.isAnimating) _flashController.repeat(reverse: true);
+    } else {
+      _flashController.stop();
+      _flashController.reset();
     }
+    if (mounted) setState(() {});
   }
 
   @override
-  Widget build(BuildContext context) => ListTile(
-    contentPadding: EdgeInsets.zero,
-    title: const Text('更新離線經文'),
-    subtitle: const Text('檢查並更新已儲存的經卷'),
-    trailing: isUpdating
-        ? const SizedBox(
-            width: 20,
-            height: 20,
-            child: CircularProgressIndicator(strokeWidth: 2),
+  void dispose() {
+    downloadManager.removeListener(_onManagerChanged);
+    _flashController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDownloading = downloadManager.isDownloading;
+    final iconColor = isDownloading
+        ? Color.lerp(
+            Colors.green.shade400,
+            Colors.green.shade800,
+            _flashController.value,
           )
-        : const Icon(Icons.system_update_alt_rounded),
-    onTap: isUpdating ? null : _updateCachedScriptures,
-  );
+        : null;
+    return AnimatedBuilder(
+      animation: _flashController,
+      builder: (context, _) => IconButton(
+        tooltip: _displayText('下載管理', context),
+        onPressed: widget.onPressed,
+        icon: Icon(Icons.info_outline_rounded, color: iconColor),
+      ),
+    );
+  }
+}
+
+class _DownloadStatusPanel extends StatefulWidget {
+  const _DownloadStatusPanel({this.onDisposed});
+
+  final VoidCallback? onDisposed;
+
+  @override
+  State<_DownloadStatusPanel> createState() => _DownloadStatusPanelState();
+}
+
+class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
+  @override
+  void dispose() {
+    widget.onDisposed?.call();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: downloadManager,
+      builder: (context, _) {
+        final manager = downloadManager;
+        final progress = manager.progress;
+        final queue = manager.queue;
+        final pendingGroups =
+            <({DownloadGroup group, List<DownloadItem> items})>[];
+        for (final group in queue) {
+          final items = group.items
+              .where((item) => !manager.isItemComplete(item))
+              .toList();
+          if (items.isNotEmpty) {
+            pendingGroups.add((group: group, items: items));
+          }
+        }
+        return Padding(
+          padding: EdgeInsets.fromLTRB(
+            16,
+            16,
+            16,
+            MediaQuery.of(context).viewInsets.bottom + 16,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                _displayText('下載管理', context),
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 4),
+              Text(
+                _displayText(
+                  '已下載 ${manager.downloadedWorkCount} 部經文 · '
+                  '${manager.downloadedJuanCount} 卷',
+                  context,
+                ),
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 16),
+              if (manager.isDownloading && progress != null) ...[
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _displayText(
+                          '下載中：${progress.completedItems}/${progress.totalItems} 部'
+                          ' · ${progress.completedJuans}/${progress.totalJuans} 卷',
+                          context,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      _displayText(
+                        '速度 ${formatDownloadSpeed(manager.downloadSpeedBytesPerSecond)}',
+                        context,
+                      ),
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                LinearProgressIndicator(value: progress.fraction),
+                if (progress.currentWork != null) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    _displayText(
+                      progress.currentJuan == null
+                          ? '目前：${progress.currentWork}'
+                          : '目前：${progress.currentWork} 卷 ${progress.currentJuan}',
+                      context,
+                    ),
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: manager.cancelDownload,
+                        child: Text(_displayText('暫停', context)),
+                      ),
+                    ),
+                  ],
+                ),
+              ] else ...[
+                if (manager.status == DownloadStatus.completed)
+                  Text(
+                    _displayText('下載完成', context),
+                    style: const TextStyle(color: Colors.green),
+                  )
+                else if (manager.status == DownloadStatus.cancelled)
+                  Text(_displayText('已暫停下載', context))
+                else if (manager.status == DownloadStatus.failed)
+                  Text(
+                    _displayText('下載中斷，尚有未完成的經卷', context),
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  )
+                else if (manager.hasQueuedItems)
+                  Text(_displayText('有未完成的下載任務', context))
+                else
+                  Text(_displayText('目前沒有下載任務', context)),
+                if (manager.canResume) ...[
+                  const SizedBox(height: 8),
+                  FilledButton.icon(
+                    onPressed: manager.resumeDownload,
+                    icon: const Icon(Icons.play_arrow_rounded),
+                    label: Text(_displayText('繼續下載', context)),
+                  ),
+                ],
+              ],
+              if (pendingGroups.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                const Divider(),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _displayText(
+                          '下載隊列（${manager.pendingWorkCount} 部待下載）',
+                          context,
+                        ),
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: _displayText('刪除所有下載任務', context),
+                      icon: const Icon(Icons.delete_sweep_outlined),
+                      onPressed: () {
+                        manager.clearQueue();
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text(_displayText('已清除所有下載任務', context)),
+                          ),
+                        );
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 200),
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: pendingGroups.length,
+                    itemBuilder: (context, index) {
+                      final entry = pendingGroups[index];
+                      final group = entry.group;
+                      final juanCount = entry.items.fold<int>(
+                        0,
+                        (sum, item) => sum + manager.pendingJuans(item).length,
+                      );
+                      return ListTile(
+                        dense: true,
+                        title: Text(
+                          _displayText(
+                            group.label.replaceFirst(
+                              RegExp(r'（\d+ 部）\s*$'),
+                              '（${entry.items.length} 部）',
+                            ),
+                            context,
+                          ),
+                        ),
+                        subtitle: Text(
+                          _displayText(
+                            '${entry.items.length} 部經典 · $juanCount 卷',
+                            context,
+                          ),
+                        ),
+                        trailing: IconButton(
+                          tooltip: _displayText('移除此下載任務', context),
+                          icon: const Icon(Icons.delete_outline),
+                          onPressed: () => manager.removeFromQueue(group.id),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+              const SizedBox(height: 16),
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: Text(_displayText('關閉', context)),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
 }
 
 class _ScriptDisplayButton extends StatelessWidget {
@@ -1085,6 +1379,7 @@ class CbetaSearchApp extends StatelessWidget {
         return _ScriptDisplayScope(
           notifier: settings,
           child: MaterialApp(
+            navigatorKey: _navigatorKey,
             debugShowCheckedModeBanner: false,
             title: 'CBETA 經文搜尋',
             locale: const Locale('zh', 'TW'),
@@ -1101,6 +1396,14 @@ class CbetaSearchApp extends StatelessWidget {
               ),
               inputDecorationTheme: const InputDecorationTheme(
                 hintStyle: TextStyle(color: Color(0xFF84918D)),
+              ),
+              dialogTheme: DialogThemeData(
+                backgroundColor: settings.backgroundColor,
+                surfaceTintColor: Colors.transparent,
+              ),
+              bottomSheetTheme: BottomSheetThemeData(
+                backgroundColor: settings.backgroundColor,
+                surfaceTintColor: Colors.transparent,
               ),
             ),
             home: const ScriptureSearchPage(),
@@ -1149,6 +1452,9 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
   bool showAllHomeBookmarks = false;
   bool aiMode = false;
   bool offlineSearchActive = false;
+  _OfflineSearchSession? offlineSearchSession;
+  int offlineScannedVolumes = 0;
+  int offlineTotalVolumes = 0;
   AppUpdateInfo? _availableUpdate;
   String _currentVersion = '';
   bool _isUpdating = false;
@@ -1639,6 +1945,9 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       catalogSearchResults = const [];
       showAllCatalogResults = false;
       offlineSearchActive = false;
+      offlineSearchSession = null;
+      offlineScannedVolumes = 0;
+      offlineTotalVolumes = 0;
       isLoading = true;
       isKeywordSearchPending = true;
       isCatalogSearchPending = true;
@@ -1670,7 +1979,8 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
         nextStart = batch.nextStart;
         totalFound = batch.totalFound;
         totalTermHits = batch.totalTermHits;
-        hasMore = nextStart < totalFound && batch.results.isNotEmpty;
+        hasMore = batch.hasMore;
+        offlineSearchSession = null;
         _prioritizeSearchResultsByCatalog();
         _FullTextSearchCache.remember(
           query,
@@ -1678,17 +1988,13 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
           nextStart: nextStart,
           totalFound: totalFound,
           totalTermHits: totalTermHits,
+          hasMore: hasMore,
         );
       });
     } catch (error) {
       if (!mounted || token != requestToken) return;
       if (_isNetworkFailure(error)) {
-        await _applyOfflineKeywordResults(
-          query,
-          token,
-          start: 0,
-          replace: true,
-        );
+        await _applyOfflineKeywordResults(query, token, replace: true);
         return;
       }
       setState(() => keywordSearchError = '全文搜尋失敗：$error');
@@ -1754,10 +2060,14 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
   Future<void> _applyOfflineKeywordResults(
     String query,
     int token, {
-    required int start,
     required bool replace,
   }) async {
-    final batch = await _searchOfflineVolumes(query, start: start);
+    var session = offlineSearchSession;
+    if (replace || session == null || session.query != query) {
+      session = _OfflineSearchSession(query);
+      offlineSearchSession = session;
+    }
+    final batch = await session.nextPage();
     if (!mounted || token != requestToken) return;
     setState(() {
       offlineSearchActive = true;
@@ -1767,7 +2077,9 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       nextStart = batch.nextStart;
       totalFound = batch.totalFound;
       totalTermHits = batch.totalTermHits;
-      hasMore = nextStart < totalFound && batch.results.isNotEmpty;
+      hasMore = batch.hasMore;
+      offlineScannedVolumes = batch.scannedVolumes;
+      offlineTotalVolumes = batch.totalVolumes;
       _prioritizeSearchResultsByCatalog();
       _FullTextSearchCache.remember(
         query,
@@ -1775,6 +2087,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
         nextStart: nextStart,
         totalFound: totalFound,
         totalTermHits: totalTermHits,
+        hasMore: hasMore,
       );
     });
   }
@@ -1862,8 +2175,9 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       loadMoreError = null;
     });
     try {
-      final batch = offlineSearchActive
-          ? await _searchOfflineVolumes(submittedQuery, start: nextStart)
+      final session = offlineSearchSession;
+      final batch = offlineSearchActive && session != null
+          ? await session.nextPage()
           : await _searchAllInOne(submittedQuery, start: nextStart);
       if (!mounted || token != requestToken) return;
       setState(() {
@@ -1871,7 +2185,9 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
         nextStart = batch.nextStart;
         totalFound = batch.totalFound;
         totalTermHits = batch.totalTermHits;
-        hasMore = nextStart < totalFound && batch.results.isNotEmpty;
+        hasMore = batch.hasMore;
+        offlineScannedVolumes = batch.scannedVolumes;
+        offlineTotalVolumes = batch.totalVolumes;
         isLoadingMore = false;
         _prioritizeSearchResultsByCatalog();
         _FullTextSearchCache.remember(
@@ -1880,17 +2196,13 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
           nextStart: nextStart,
           totalFound: totalFound,
           totalTermHits: totalTermHits,
+          hasMore: hasMore,
         );
       });
     } catch (error) {
       if (!mounted || token != requestToken) return;
       if (!offlineSearchActive && _isNetworkFailure(error)) {
-        await _applyOfflineKeywordResults(
-          submittedQuery,
-          token,
-          start: 0,
-          replace: true,
-        );
+        await _applyOfflineKeywordResults(submittedQuery, token, replace: true);
         if (mounted && token == requestToken) {
           setState(() => isLoadingMore = false);
         }
@@ -1917,6 +2229,9 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       keywordSearchSucceeded = false;
       catalogSearchSucceeded = false;
       offlineSearchActive = false;
+      offlineSearchSession = null;
+      offlineScannedVolumes = 0;
+      offlineTotalVolumes = 0;
       isLoading = false;
       isKeywordSearchPending = false;
       isCatalogSearchPending = false;
@@ -2038,46 +2353,47 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
     }
   }
 
-  Future<void> _clearRecentReadingsAndOfflineScriptures() async {
+  Future<void> _clearRecentReadings() async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('清除最近閱讀與離線經文？'),
-        content: const Text(
-          '此操作會刪除最近閱讀記錄及所有已下載的離線經文。'
-          '書籤和介面設定不會受影響，且無法復原。',
+        title: Text(_displayText('清除最近閱讀記錄？', dialogContext)),
+        content: Text(
+          _displayText(
+            '此操作只會清除首頁的最近閱讀記錄，已下載的離線經文不會被刪除。'
+            '書籤和介面設定不會受影響。',
+            dialogContext,
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(dialogContext).pop(false),
-            child: const Text('取消'),
+            child: Text(_displayText('取消', dialogContext)),
           ),
           FilledButton(
             onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: const Text('清除'),
+            child: Text(_displayText('清除', dialogContext)),
           ),
         ],
       ),
     );
     if (confirmed != true || !mounted) return;
     try {
-      await scriptureVolumeStore.clearAll();
       final preferences = await SharedPreferences.getInstance();
       final removed = await preferences.remove(_readingHistoryKey);
       if (!removed && preferences.containsKey(_readingHistoryKey)) {
         throw StateError('無法清除最近閱讀記錄');
       }
-      scriptureCacheUpdates.value = {};
       await _loadHomeSections();
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('已清除最近閱讀記錄及離線經文')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_displayText('已清除最近閱讀記錄', context))),
+      );
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('清除最近閱讀及離線經文失敗：$error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_displayText('清除最近閱讀記錄失敗：$error', context))),
+      );
     }
   }
 
@@ -2104,7 +2420,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
               icon: Icons.history_rounded,
               items: recentReadings.take(recentReadingsVisibleCount).toList(),
               onTap: _openHistoryItem,
-              onClear: _clearRecentReadingsAndOfflineScriptures,
+              onClear: _clearRecentReadings,
               onMore: recentReadings.length > recentReadingsVisibleCount
                   ? () => setState(
                       () =>
@@ -2232,13 +2548,35 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
           child: Padding(
             padding: const EdgeInsets.all(24),
             child: _NoResults(
-              message: offlineSearchActive
+              message: offlineSearchActive && hasMore
+                  ? '正在掃描本地經卷…\n'
+                        '已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷，'
+                        '目前找到 $totalFound 筆'
+                  : offlineSearchActive
                   ? '離線模式下，本地已儲存的經目與經文中找不到「$submittedQuery」'
                   : '找不到「$submittedQuery」相關經文'
                         '${partialWarning == null ? '' : '\n$partialWarning'}',
             ),
           ),
         ),
+        if (offlineSearchActive && hasMore)
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+              child: Center(
+                child: FilledButton.tonalIcon(
+                  onPressed: isLoadingMore ? null : loadMore,
+                  icon: isLoadingMore
+                      ? const SizedBox.square(
+                          dimension: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.expand_more_rounded),
+                  label: Text(isLoadingMore ? '掃描中…' : '繼續搜尋本地經卷'),
+                ),
+              ),
+            ),
+          ),
       ];
     }
 
@@ -2271,7 +2609,10 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
         Padding(
           padding: const EdgeInsets.only(bottom: 12),
           child: Text(
-            '「$submittedQuery」經目查詢：找到 ${catalogSearchResults.length} 部作品',
+            offlineSearchActive && hasMore
+                ? '「$submittedQuery」已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷，'
+                      '尚在搜尋本地經文…'
+                : '「$submittedQuery」經目查詢：找到 ${catalogSearchResults.length} 部作品',
             style: Theme.of(
               context,
             ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF687671)),
@@ -2281,7 +2622,10 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
         Padding(
           padding: const EdgeInsets.only(bottom: 12),
           child: Text(
-            '「$submittedQuery」搜尋結果：找到 $totalFound 筆結果，共 $totalTermHits 處出現',
+            offlineSearchActive && hasMore
+                ? '「$submittedQuery」離線搜尋：已找到 $totalFound 筆，'
+                      '共 $totalTermHits 處出現（已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷）'
+                : '「$submittedQuery」搜尋結果：找到 $totalFound 筆結果，共 $totalTermHits 處出現',
             style: Theme.of(
               context,
             ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF687671)),
@@ -2313,7 +2657,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
         const SizedBox(height: 12),
         Text(loadMoreError!, textAlign: TextAlign.center),
       ],
-      if (results.isNotEmpty && hasMore) ...[
+      if (hasMore) ...[
         const SizedBox(height: 16),
         Center(
           child: FilledButton.tonalIcon(
@@ -2377,24 +2721,30 @@ class _HomeHistorySection extends StatelessWidget {
             const SizedBox(width: 6),
             Expanded(
               child: Text(
-                title,
+                _displayText(title, context),
                 style: Theme.of(
                   context,
                 ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
               ),
             ),
             if (onClear != null)
-              TextButton(onPressed: onClear, child: const Text('清空')),
+              TextButton(
+                onPressed: onClear,
+                child: Text(_displayText('清空', context)),
+              ),
           ],
         ),
         for (final item in items)
           ListTile(
             dense: true,
             contentPadding: EdgeInsets.zero,
-            title: Text(item.title),
+            title: Text(_displayText(item.title, context)),
             subtitle: Text(
-              '${item.work}　卷 ${item.juan}'
-              '${item.linehead == null ? '' : ' · ${item.linehead!.split('_p').last}'}',
+              _displayText(
+                '${item.work}　卷 ${item.juan}'
+                '${item.linehead == null ? '' : ' · ${item.linehead!.split('_p').last}'}',
+                context,
+              ),
             ),
             trailing: const Icon(Icons.chevron_right_rounded),
             onTap: () => onTap(item),
@@ -2404,7 +2754,7 @@ class _HomeHistorySection extends StatelessWidget {
             alignment: Alignment.center,
             child: TextButton(
               onPressed: onMore,
-              child: Text(moreLabel ?? '顯示全部'),
+              child: Text(_displayText(moreLabel ?? '顯示全部', context)),
             ),
           ),
       ],
@@ -2838,7 +3188,6 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
     _refreshBookmarkState();
     _persistReadingHistory();
     scriptureDisplaySettings.addListener(_onDisplaySettingsChanged);
-    scriptureCacheUpdates.addListener(_onCachedScripturesUpdated);
   }
 
   Future<void> _persistReadingHistory() async {
@@ -2914,7 +3263,6 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
     if (!mounted) return;
     await showModalBottomSheet<void>(
       context: context,
-      backgroundColor: scriptureDisplaySettings.surfaceColor,
       isScrollControlled: true,
       builder: (sheetContext) => SafeArea(
         child: SizedBox(
@@ -3139,22 +3487,6 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
         editable.localToGlobal(caretRect.topLeft).dy - viewportTop;
   }
 
-  void _onCachedScripturesUpdated() {
-    final work = currentPassage.work;
-    final juan = currentPassage.juan;
-    if (!mounted ||
-        work == null ||
-        juan == null ||
-        !scriptureCacheUpdates.value.contains('$work:$juan')) {
-      return;
-    }
-    juanCache.remove('$work:$juan');
-    setState(() {
-      didScrollToMatch = false;
-      linesFuture = _cachedJuan(currentPassage);
-    });
-  }
-
   Future<List<ScriptureLine>> _cachedJuan(ScripturePassage passage) {
     final linehead = passage.linehead;
     final workMatch = RegExp(
@@ -3261,7 +3593,6 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
   @override
   void dispose() {
     scriptureDisplaySettings.removeListener(_onDisplaySettingsChanged);
-    scriptureCacheUpdates.removeListener(_onCachedScripturesUpdated);
     readerScrollController.dispose();
     localSearchController.dispose();
     super.dispose();
@@ -5631,12 +5962,18 @@ class _SearchBatch {
     required this.nextStart,
     required this.totalFound,
     required this.totalTermHits,
+    this.hasMore = false,
+    this.scannedVolumes = 0,
+    this.totalVolumes = 0,
   });
 
   final List<ScriptureSearchResult> results;
   final int nextStart;
   final int totalFound;
   final int totalTermHits;
+  final bool hasMore;
+  final int scannedVolumes;
+  final int totalVolumes;
 }
 
 /// 判斷錯誤是否來自網路連線不可用，而非遠端服務回傳的錯誤。
@@ -5657,48 +5994,92 @@ int _countOccurrences(String haystack, String needle) {
   return count;
 }
 
-/// 在無網路連線時，改以本地已儲存的離線經卷進行全文比對，
-/// 盡量沿用與線上搜尋相同的結果結構與分頁行為。
-Future<_SearchBatch> _searchOfflineVolumes(
-  String query, {
-  int start = 0,
-  int pageSize = 20,
-}) async {
-  final needle = query.trim().toLowerCase();
-  if (needle.isEmpty) {
-    return const _SearchBatch(
-      results: [],
-      nextStart: 0,
-      totalFound: 0,
-      totalTermHits: 0,
-    );
-  }
-  final volumes = await scriptureVolumeStore.list();
-  volumes.sort((left, right) {
-    final byWork = left.work.compareTo(right.work);
-    if (byWork != 0) return byWork;
-    return (int.tryParse(left.juan) ?? 0).compareTo(
-      int.tryParse(right.juan) ?? 0,
-    );
-  });
-  final workJuans = <String, Set<int>>{};
-  for (final volume in volumes) {
-    final juan = int.tryParse(volume.juan);
-    if (juan != null) {
-      workJuans.putIfAbsent(volume.work, () => <int>{}).add(juan);
+/// 分頁掃描本地已儲存的離線經卷，每卷只解析一次。
+///
+/// 每次 [nextPage] 最多掃描 [maxVolumesPerPage] 卷，找到足夠結果就提前返回；
+/// 使用者往下捲動載入下一頁時再繼續掃描，避免一次解析全部經卷造成卡頓。
+class _OfflineSearchSession {
+  _OfflineSearchSession(this.query, {int published = 0})
+    : _published = published;
+
+  static const int _volumesPerChunk = 8;
+  static const int maxVolumesPerPage = 60;
+
+  final String query;
+  List<ScriptureVolumeRef>? _refs;
+  Map<String, Set<int>> _workJuans = {};
+  int _nextVolume = 0;
+  int _published;
+  final List<ScriptureSearchResult> _results = [];
+  int _totalTermHits = 0;
+  bool _finished = false;
+
+  int get scannedVolumes => _nextVolume;
+  int get totalVolumes => _refs?.length ?? 0;
+
+  Future<void> _ensureRefs() async {
+    if (_refs != null) return;
+    final refs = await scriptureVolumeStore.listRefs();
+    refs.sort((left, right) {
+      final byWork = left.work.compareTo(right.work);
+      if (byWork != 0) return byWork;
+      return (int.tryParse(left.juan) ?? 0).compareTo(
+        int.tryParse(right.juan) ?? 0,
+      );
+    });
+    _workJuans = {};
+    for (final ref in refs) {
+      final juan = int.tryParse(ref.juan);
+      if (juan != null) {
+        _workJuans.putIfAbsent(ref.work, () => <int>{}).add(juan);
+      }
     }
+    _refs = refs;
   }
-  final results = <ScriptureSearchResult>[];
-  var totalTermHits = 0;
-  for (final volume in volumes) {
+
+  Future<_SearchBatch> nextPage({int pageSize = 20}) async {
+    await _ensureRefs();
+    final refs = _refs!;
+    final needle = query.trim().toLowerCase();
+    var scannedThisPage = 0;
+    while (!_finished &&
+        _results.length - _published < pageSize &&
+        scannedThisPage < maxVolumesPerPage) {
+      final start = _nextVolume;
+      final end = _nextVolume + _volumesPerChunk < refs.length
+          ? _nextVolume + _volumesPerChunk
+          : refs.length;
+      for (; _nextVolume < end; _nextVolume++) {
+        final volume = await scriptureVolumeStore.readRef(refs[_nextVolume]);
+        if (volume != null) _scanVolume(volume, needle);
+        await Future<void>.delayed(Duration.zero);
+      }
+      scannedThisPage += end - start;
+      if (_nextVolume >= refs.length) _finished = true;
+    }
+    final page = _results.skip(_published).take(pageSize).toList();
+    _published += page.length;
+    return _SearchBatch(
+      results: page,
+      nextStart: _published,
+      totalFound: _results.length,
+      totalTermHits: _totalTermHits,
+      hasMore: !_finished || _published < _results.length,
+      scannedVolumes: _nextVolume,
+      totalVolumes: refs.length,
+    );
+  }
+
+  void _scanVolume(CachedScriptureVolume volume, String needle) {
+    if (needle.isEmpty) return;
     final List<ScriptureLine> lines;
     try {
       lines = parseScriptureHtml(volume.html);
     } catch (_) {
-      continue;
+      return;
     }
     final title = _localWorkTitle(lines);
-    final juans = (workJuans[volume.work]?.toList() ?? <int>[])..sort();
+    final juans = (_workJuans[volume.work]?.toList() ?? <int>[])..sort();
     final passages = <ScripturePassage>[];
     for (final line in lines) {
       if (line.role == ScriptureLineRole.volumeTitle ||
@@ -5709,7 +6090,7 @@ Future<_SearchBatch> _searchOfflineVolumes(
       if (text.isEmpty) continue;
       final lower = text.toLowerCase();
       if (!lower.contains(needle)) continue;
-      totalTermHits += _countOccurrences(lower, needle);
+      _totalTermHits += _countOccurrences(lower, needle);
       final linehead = line.linehead;
       final lineLabel = linehead == null ? '' : linehead.split('_p').last;
       passages.add(
@@ -5727,8 +6108,8 @@ Future<_SearchBatch> _searchOfflineVolumes(
         ),
       );
     }
-    if (passages.isEmpty) continue;
-    results.add(
+    if (passages.isEmpty) return;
+    _results.add(
       ScriptureSearchResult(
         title: '${volume.work} ${title.isEmpty ? '（離線經文）' : title}'.trim(),
         description: '離線經文 · 命中 ${passages.length} 處',
@@ -5736,13 +6117,6 @@ Future<_SearchBatch> _searchOfflineVolumes(
       ),
     );
   }
-  final page = results.skip(start).take(pageSize).toList();
-  return _SearchBatch(
-    results: page,
-    nextStart: start + page.length,
-    totalFound: results.length,
-    totalTermHits: totalTermHits,
-  );
 }
 
 List<ScriptureLine>? _tryParseLocalVolume(CachedScriptureVolume volume) {
@@ -5776,17 +6150,20 @@ String _localWorkTitle(List<ScriptureLine> lines) {
   return stripped.isEmpty ? title : stripped;
 }
 
-List<int> _cachedJuansForWork(
-  List<CachedScriptureVolume> volumes,
-  String work,
-) =>
-    volumes
-        .where((volume) => volume.work == work)
-        .map((volume) => int.tryParse(volume.juan))
+List<int> _cachedJuansForRefs(List<ScriptureVolumeRef> refs, String work) =>
+    refs
+        .where((ref) => ref.work == work)
+        .map((ref) => int.tryParse(ref.juan))
         .whereType<int>()
         .toSet()
         .toList()
       ..sort();
+
+int _juanNumber(ScriptureVolumeRef ref) => int.tryParse(ref.juan) ?? 0;
+
+void _sortRefsByJuan(List<ScriptureVolumeRef> refs) {
+  refs.sort((left, right) => _juanNumber(left).compareTo(_juanNumber(right)));
+}
 
 String _lineheadWorkId(String linehead) {
   final match = RegExp(r'^([A-Z]+)\d+n(\d+)_p').firstMatch(linehead);
@@ -5819,17 +6196,15 @@ Future<ScripturePassage?> _localWorkPassage(
   String? targetLinehead,
 }) async {
   if (work.isEmpty) return null;
-  final volumes = await scriptureVolumeStore.list();
-  final workVolumes = volumes.where((volume) => volume.work == work).toList()
-    ..sort(
-      (left, right) => (int.tryParse(left.juan) ?? 0).compareTo(
-        int.tryParse(right.juan) ?? 0,
-      ),
-    );
-  if (workVolumes.isEmpty) return null;
-  final juans = _cachedJuansForWork(volumes, work);
+  final allRefs = await scriptureVolumeStore.listRefs();
+  final workRefs = allRefs.where((ref) => ref.work == work).toList();
+  if (workRefs.isEmpty) return null;
+  _sortRefsByJuan(workRefs);
+  final juans = _cachedJuansForRefs(allRefs, work);
   if (targetLinehead != null) {
-    for (final volume in workVolumes) {
+    for (final ref in workRefs) {
+      final volume = await scriptureVolumeStore.readRef(ref);
+      if (volume == null) continue;
       final lines = _tryParseLocalVolume(volume);
       if (lines != null &&
           lines.any((line) => line.linehead == targetLinehead)) {
@@ -5843,7 +6218,8 @@ Future<ScripturePassage?> _localWorkPassage(
       }
     }
   }
-  final target = workVolumes.first;
+  final target = await scriptureVolumeStore.readRef(workRefs.first);
+  if (target == null) return null;
   final lines = _tryParseLocalVolume(target) ?? const <ScriptureLine>[];
   return _localPassage(work: work, volume: target, lines: lines, juans: juans);
 }
@@ -5852,8 +6228,13 @@ Future<ScripturePassage?> _localWorkPassage(
 Future<ScripturePassage?> _resolveGotoPassageLocally(String linehead) async {
   final work = _lineheadWorkId(linehead);
   if (work.isEmpty) return null;
-  final volumes = await scriptureVolumeStore.list();
-  for (final volume in volumes.where((volume) => volume.work == work)) {
+  final refs = await scriptureVolumeStore.listRefs();
+  final workRefs = refs.where((ref) => ref.work == work).toList();
+  _sortRefsByJuan(workRefs);
+  final juans = _cachedJuansForRefs(refs, work);
+  for (final ref in workRefs) {
+    final volume = await scriptureVolumeStore.readRef(ref);
+    if (volume == null) continue;
     final lines = _tryParseLocalVolume(volume);
     if (lines == null || !lines.any((line) => line.linehead == linehead)) {
       continue;
@@ -5862,7 +6243,7 @@ Future<ScripturePassage?> _resolveGotoPassageLocally(String linehead) async {
       work: work,
       volume: volume,
       lines: lines,
-      juans: _cachedJuansForWork(volumes, work),
+      juans: juans,
       linehead: linehead,
     );
   }
@@ -5870,38 +6251,60 @@ Future<ScripturePassage?> _resolveGotoPassageLocally(String linehead) async {
 }
 
 /// 離線時以本地已儲存經卷的經名／作譯者進行經目查詢。
+///
+/// 優先使用已載入的經目資料，避免為了查詢而解析大量經文 HTML；
+/// 只有經目未收錄的經卷才需要讀取內容。
 Future<List<Map<String, dynamic>>> _searchOfflineCatalog(String query) async {
-  final needle = query.trim().toLowerCase();
+  final needle = query.trim();
   if (needle.isEmpty) return const [];
-  final volumes = await scriptureVolumeStore.list();
-  final byWork = <String, List<CachedScriptureVolume>>{};
-  for (final volume in volumes) {
-    byWork
-        .putIfAbsent(volume.work, () => <CachedScriptureVolume>[])
-        .add(volume);
-  }
+  final refs = await scriptureVolumeStore.listRefs();
+  if (refs.isEmpty) return const [];
+  final downloadedWorks = {for (final ref in refs) ref.work};
   final results = <Map<String, dynamic>>[];
-  for (final entry in byWork.entries) {
-    final volume = entry.value.reduce(
-      (left, right) =>
-          (int.tryParse(left.juan) ?? 0) <= (int.tryParse(right.juan) ?? 0)
-          ? left
-          : right,
-    );
+  final seenWorks = <String>{};
+  final catalog = CatalogCache.instance;
+
+  if (catalog.isLoaded) {
+    for (final item in catalog.searchWorks(needle, limit: 5000)) {
+      final work = '${item['work'] ?? ''}';
+      if (work.isEmpty || !downloadedWorks.contains(work)) continue;
+      if (!seenWorks.add(work)) continue;
+      results.add({...item, 'offline': true});
+    }
+  }
+
+  final firstRefByWork = <String, ScriptureVolumeRef>{};
+  for (final ref in refs) {
+    if (seenWorks.contains(ref.work)) continue;
+    if (catalog.isLoaded && catalog.lookupWork(ref.work) != null) continue;
+    final existing = firstRefByWork[ref.work];
+    if (existing == null || _juanNumber(ref) < _juanNumber(existing)) {
+      firstRefByWork[ref.work] = ref;
+    }
+  }
+
+  final lowerNeedle = needle.toLowerCase();
+  var processed = 0;
+  for (final entry in firstRefByWork.entries) {
+    final volume = await scriptureVolumeStore.readRef(entry.value);
+    if (volume == null) continue;
     final lines = _tryParseLocalVolume(volume);
     if (lines == null) continue;
     final info = _localVolumeInfo(lines);
-    final title = _localWorkTitle(lines).isNotEmpty
-        ? _localWorkTitle(lines)
-        : entry.key;
+    final workTitle = _localWorkTitle(lines);
+    final title = workTitle.isNotEmpty ? workTitle : entry.key;
     final haystack = '$title ${info.byline} ${entry.key}'.toLowerCase();
-    if (!haystack.contains(needle)) continue;
+    if (!haystack.contains(lowerNeedle)) continue;
     results.add({
       'work': entry.key,
       'title': title,
       if (info.byline.isNotEmpty) 'byline': info.byline,
       'offline': true,
     });
+    processed++;
+    if (processed % 8 == 0) {
+      await Future<void>.delayed(Duration.zero);
+    }
   }
   results.sort(
     (left, right) => '${left['title']}'.compareTo('${right['title']}'),
@@ -5939,6 +6342,9 @@ Future<_SearchBatch> _fetchSearchBatch(String query, {int start = 0}) async {
     nextStart: start + rows.length,
     totalFound: payload['num_found'] as int? ?? start + rows.length,
     totalTermHits: (payload['total_term_hits'] as num?)?.toInt() ?? 0,
+    hasMore:
+        rows.isNotEmpty &&
+        start + rows.length < (payload['num_found'] as int? ?? 0),
   );
 }
 
@@ -6220,12 +6626,14 @@ class _FullTextSearchSnapshot {
     required this.nextStart,
     required this.totalFound,
     required this.totalTermHits,
+    this.hasMore = false,
   });
 
   final List<ScriptureSearchResult> results;
   final int nextStart;
   final int totalFound;
   final int totalTermHits;
+  final bool hasMore;
 }
 
 class _FullTextSearchCache {
@@ -6239,32 +6647,40 @@ class _FullTextSearchCache {
     required int nextStart,
     required int totalFound,
     required int totalTermHits,
+    bool hasMore = false,
   }) {
     _snapshots[query] = _FullTextSearchSnapshot(
       results: List.unmodifiable(results),
       nextStart: nextStart,
       totalFound: totalFound,
       totalTermHits: totalTermHits,
+      hasMore: hasMore,
     );
   }
 }
 
 class _FullTextSearchPageState extends State<_FullTextSearchPage> {
   late final TextEditingController controller;
+  final ScrollController scrollController = ScrollController();
   List<ScriptureSearchResult> results = const [];
   String submittedQuery = '';
   String? error;
   bool loading = false;
   bool loadingMore = false;
   bool offlineMode = false;
+  bool hasMore = false;
   int nextStart = 0;
   int totalFound = 0;
   int totalTermHits = 0;
+  int scannedVolumes = 0;
+  int totalVolumes = 0;
+  _OfflineSearchSession? offlineSession;
 
   @override
   void initState() {
     super.initState();
     controller = TextEditingController(text: widget.initialQuery);
+    scrollController.addListener(_onScroll);
     if (widget.initialQuery.trim().isNotEmpty) {
       final query = SimplifiedTraditionalConverter.convert(
         widget.initialQuery.trim(),
@@ -6276,9 +6692,21 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
         nextStart = cached.nextStart;
         totalFound = cached.totalFound;
         totalTermHits = cached.totalTermHits;
+        hasMore = cached.hasMore;
       } else {
         WidgetsBinding.instance.addPostFrameCallback((_) => search());
       }
+    }
+  }
+
+  void _onScroll() {
+    if (scrollController.hasClients &&
+        scrollController.position.extentAfter < 400 &&
+        hasMore &&
+        !loading &&
+        !loadingMore) {
+      setState(() => loadingMore = true);
+      _loadPage(submittedQuery, nextStart);
     }
   }
 
@@ -6319,6 +6747,10 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
       loadingMore = false;
       error = null;
       offlineMode = false;
+      hasMore = false;
+      scannedVolumes = 0;
+      totalVolumes = 0;
+      offlineSession = null;
       submittedQuery = query;
       results = const [];
       nextStart = 0;
@@ -6329,8 +6761,14 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
 
   Future<void> _loadPage(String query, int start) async {
     try {
+      final session = offlineMode
+          ? (offlineSession ??= _OfflineSearchSession(
+              query,
+              published: results.length,
+            ))
+          : null;
       final batch = offlineMode
-          ? await _searchOfflineVolumes(query, start: start)
+          ? await session!.nextPage()
           : await _fetchSearchBatch(query, start: start);
       if (!mounted) return;
       setState(() {
@@ -6338,6 +6776,11 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
         nextStart = batch.nextStart;
         totalFound = batch.totalFound;
         totalTermHits = batch.totalTermHits;
+        hasMore = batch.hasMore;
+        if (offlineMode) {
+          scannedVolumes = batch.scannedVolumes;
+          totalVolumes = batch.totalVolumes;
+        }
         loading = false;
         loadingMore = false;
         _FullTextSearchCache.remember(
@@ -6346,19 +6789,25 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
           nextStart: nextStart,
           totalFound: totalFound,
           totalTermHits: totalTermHits,
+          hasMore: hasMore,
         );
       });
     } catch (exception) {
       if (!mounted) return;
       if (!offlineMode && _isNetworkFailure(exception)) {
-        final batch = await _searchOfflineVolumes(query, start: start);
+        final session = _OfflineSearchSession(query);
+        final batch = await session.nextPage();
         if (!mounted) return;
         setState(() {
           offlineMode = true;
-          results = [...results, ...batch.results];
+          offlineSession = session;
+          results = batch.results;
           nextStart = batch.nextStart;
           totalFound = batch.totalFound;
           totalTermHits = batch.totalTermHits;
+          hasMore = batch.hasMore;
+          scannedVolumes = batch.scannedVolumes;
+          totalVolumes = batch.totalVolumes;
           loading = false;
           loadingMore = false;
           _FullTextSearchCache.remember(
@@ -6367,6 +6816,7 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
             nextStart: nextStart,
             totalFound: totalFound,
             totalTermHits: totalTermHits,
+            hasMore: hasMore,
           );
         });
         return;
@@ -6394,6 +6844,9 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
 
   @override
   void dispose() {
+    scrollController
+      ..removeListener(_onScroll)
+      ..dispose();
     controller.dispose();
     super.dispose();
   }
@@ -6441,7 +6894,8 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
               alignment: Alignment.centerLeft,
               child: Text(
                 offlineMode
-                    ? '「$submittedQuery」離線模式，本地找到 $totalFound 筆'
+                    ? '「$submittedQuery」離線模式，已找到 $totalFound 筆'
+                          '${hasMore ? '（已掃描 $scannedVolumes/$totalVolumes 卷）' : ''}'
                     : '「$submittedQuery」找到 $totalFound 筆',
               ),
             ),
@@ -6451,17 +6905,28 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
               ? const Center(child: CircularProgressIndicator())
               : error != null
               ? _NoResults(message: error!)
-              : results.isEmpty
+              : results.isEmpty && !hasMore
               ? const _SearchPrompt()
               : ListView(
+                  controller: scrollController,
                   children: [
+                    if (results.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: _NoResults(
+                          message:
+                              '正在掃描本地經卷…\n'
+                              '已掃描 $scannedVolumes/$totalVolumes 卷，'
+                              '目前找到 $totalFound 筆',
+                        ),
+                      ),
                     for (final result in results)
                       _SearchResultCard(
                         result: result,
                         query: submittedQuery,
                         onPassageTap: _openPassage,
                       ),
-                    if (nextStart < totalFound)
+                    if (hasMore)
                       Center(
                         child: TextButton(
                           onPressed: loadingMore
@@ -6884,14 +7349,12 @@ class _WorkPickerPage extends StatefulWidget {
 
 class _WorkPickerResponseCache {
   static final Map<String, Future<Map<String, dynamic>>> json = {};
-  static final Map<String, Future<String>> text = {};
 }
 
 /// 清空選擇佛經頁的 API 回應快取（僅供測試使用）。
 @visibleForTesting
 void resetWorkPickerResponseCache() {
   _WorkPickerResponseCache.json.clear();
-  _WorkPickerResponseCache.text.clear();
 }
 
 Future<Map<String, dynamic>> _cachedPickerJson(
@@ -6916,25 +7379,6 @@ Future<Map<String, dynamic>> _cachedPickerJson(
   }
 }
 
-Future<String> _cachedPickerText(Uri uri, String serviceName) async {
-  final key = uri.toString();
-  final future = _WorkPickerResponseCache.text.putIfAbsent(key, () async {
-    final response = await http.get(uri).timeout(const Duration(seconds: 20));
-    if (response.statusCode != 200) {
-      throw Exception('$serviceName 回傳 ${response.statusCode}');
-    }
-    return utf8.decode(response.bodyBytes);
-  });
-  try {
-    return await future;
-  } catch (_) {
-    if (identical(_WorkPickerResponseCache.text[key], future)) {
-      _WorkPickerResponseCache.text.remove(key);
-    }
-    rethrow;
-  }
-}
-
 class _WorkPickerPageState extends State<_WorkPickerPage> {
   static const _tabs = ['部類', '冊別', '作譯者', '年代', '經目查詢', 'Goto 查詢', '詞典查詢'];
 
@@ -6946,8 +7390,8 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   final TextEditingController creatorController = TextEditingController();
   final TextEditingController tocController = TextEditingController();
   final TextEditingController gotoController = TextEditingController();
-  List<MapEntry<String, Map<String, dynamic>>> creators = [];
-  List<Map<String, dynamic>> dynasties = [];
+  List<MapEntry<String, CreatorEntry>> creators = [];
+  List<DynastyEntry> dynasties = [];
   List<Map<String, dynamic>> listedWorks = [];
   int selectedTab = 0;
   int activeCatalogTab = 0;
@@ -6958,10 +7402,18 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   String creatorQuery = '';
   String? error;
   String? resultMessage;
+  bool downloadMode = false;
+  final Set<String> selectedDownloadWorks = {};
 
   @override
   void initState() {
     super.initState();
+    _initLocalCatalog();
+  }
+
+  Future<void> _initLocalCatalog() async {
+    await CatalogCache.instance.load();
+    if (!mounted) return;
     _loadCatalog(0, 'CBETA');
   }
 
@@ -6972,9 +7424,6 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     Uri.https('cbdata.dila.edu.tw', '/stable/$path', parameters),
     'CBETA API',
   );
-
-  Future<String> _getText(String path) =>
-      _cachedPickerText(Uri.https('cbdata.dila.edu.tw', path), 'CBETA 下載');
 
   Future<void> _loadCatalog(
     int tab,
@@ -6988,10 +7437,10 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       showingWorks = false;
     });
     try {
-      final payload = await _getJson('catalog_entry', {'q': query});
-      final nextEntries = (payload['results'] as List<dynamic>? ?? const [])
-          .whereType<Map<String, dynamic>>()
-          .toList();
+      final cache = CatalogCache.instance;
+      final node = cache.findNode(query);
+      if (node == null) throw Exception('找不到目錄節點：$query');
+      final nextEntries = cache.nodeToItems(node);
       if (!mounted) return;
       setState(() {
         catalogEntries[tab] = nextEntries;
@@ -7001,14 +7450,14 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
           levels.removeRange(breadcrumbIndex + 1, levels.length);
         }
         if (levels.isEmpty || levels.last.q != query) {
-          levels.add((q: query, label: '${payload['label'] ?? query}'));
+          levels.add((q: query, label: node.label));
         } else {
-          levels[levels.length - 1] = (
-            q: query,
-            label: '${payload['label'] ?? query}',
-          );
+          levels[levels.length - 1] = (q: query, label: node.label);
         }
       });
+      if (downloadMode) {
+        _addWorksToSelection(node.collectWorkIds());
+      }
     } catch (exception) {
       if (!mounted) return;
       setState(() {
@@ -7024,6 +7473,10 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       error = null;
       resultMessage = null;
       showingWorks = false;
+      if (downloadMode) {
+        downloadMode = false;
+        selectedDownloadWorks.clear();
+      }
     });
     if (tab == 0 && catalogLevels[0]!.isEmpty) {
       await _loadCatalog(0, 'CBETA');
@@ -7034,6 +7487,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     } else if (tab == 3 && dynasties.isEmpty) {
       await _loadDynasties();
     }
+    _autoSelectCurrentView();
   }
 
   Future<void> _loadCreators() async {
@@ -7043,19 +7497,13 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     });
     try {
       await _ensureCreatorCollator();
-      final payload = await _getJson('download/all-creators-with-alias.json');
+      await CatalogCache.instance.load();
       if (!mounted) return;
       setState(() {
-        creators = payload.entries
-            .whereType<MapEntry<String, dynamic>>()
-            .where((entry) => entry.value is Map<String, dynamic>)
-            .map(
-              (entry) =>
-                  MapEntry(entry.key, entry.value as Map<String, dynamic>),
-            )
-            .toList();
+        creators = CatalogCache.instance.creators.entries.toList();
         loadingCreators = false;
       });
+      _autoSelectCurrentView();
     } catch (exception) {
       if (!mounted) return;
       setState(() {
@@ -7071,27 +7519,13 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       error = null;
     });
     try {
-      final csv = await _getText('/stable/download/stat/dynasty-all.csv');
-      final rows = const LineSplitter()
-          .convert(csv)
-          .skip(1)
-          .where((line) => line.isNotEmpty)
-          .map((line) => line.split(','))
-          .where((cells) => cells.length >= 4)
-          .map(
-            (cells) => {
-              'name': cells[0],
-              'start': cells[1],
-              'end': cells[2],
-              'count': cells[3],
-            },
-          )
-          .toList();
+      await CatalogCache.instance.load();
       if (!mounted) return;
       setState(() {
-        dynasties = rows;
+        dynasties = CatalogCache.instance.dynasties;
         loadingDynasties = false;
       });
+      _autoSelectCurrentView();
     } catch (exception) {
       if (!mounted) return;
       setState(() {
@@ -7112,17 +7546,29 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       showingWorks = true;
     });
     try {
-      final payload = await _getJson('works', parameters);
-      final results = (payload['results'] as List<dynamic>? ?? const [])
-          .whereType<Map<String, dynamic>>()
-          .toList();
+      final cache = CatalogCache.instance;
+      List<Map<String, dynamic>> results;
+      final creatorId = parameters['creator_id'];
+      final dynasty = parameters['dynasty'];
+      if (creatorId != null) {
+        final creator = cache.creators[creatorId];
+        results = (creator?.works ?? const []).map((w) => w.toMap()).toList();
+      } else if (dynasty != null) {
+        final dynastyEntry = cache.dynasties.firstWhere(
+          (d) => d.name == dynasty,
+          orElse: () => const DynastyEntry(name: '', start: '', end: ''),
+        );
+        results = dynastyEntry.works.map((w) => w.toMap()).toList();
+      } else {
+        results = const [];
+      }
       if (!mounted) return;
       setState(() {
         listedWorks = results;
-        resultMessage =
-            '$description：${payload['num_found'] ?? results.length} 部作品';
+        resultMessage = '$description：${results.length} 部作品';
         loading = false;
       });
+      _autoSelectCurrentView();
     } catch (exception) {
       if (!mounted) return;
       setState(() {
@@ -7153,26 +7599,53 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       // 記錄失敗不影響查詢。
     }
     if (!mounted) return;
+    final localResults = CatalogCache.instance.searchWorks(query);
     setState(() {
       loading = true;
       error = null;
       resultMessage = null;
+      if (localResults.isNotEmpty) {
+        listedWorks = localResults;
+        showingWorks = true;
+      }
     });
     try {
       final payload = await _getJson('search/toc', {'q': query});
-      final results = (payload['results'] as List<dynamic>? ?? const [])
+      final remoteResults = (payload['results'] as List<dynamic>? ?? const [])
           .whereType<Map<String, dynamic>>()
           .where((result) => result['type'] == 'work')
           .toList();
+      final merged = <Map<String, dynamic>>[...remoteResults];
+      final seenWorks = remoteResults
+          .map((result) => '${result['work'] ?? ''}')
+          .toSet();
+      for (final result in localResults) {
+        if (seenWorks.add('${result['work'] ?? ''}')) {
+          merged.add(result);
+        }
+      }
       if (!mounted) return;
       setState(() {
-        listedWorks = results;
+        listedWorks = merged;
         showingWorks = true;
-        resultMessage = '找到 ${payload['num_found'] ?? results.length} 筆經目';
+        resultMessage =
+            '找到 ${payload['num_found'] ?? remoteResults.length} 筆經目'
+            '${localResults.isEmpty ? '' : '，本地經目 ${localResults.length} 部'}';
         loading = false;
       });
+      _autoSelectCurrentView();
     } catch (exception) {
       if (!mounted) return;
+      if (localResults.isNotEmpty) {
+        setState(() {
+          listedWorks = localResults;
+          showingWorks = true;
+          resultMessage = '離線模式：本地經目找到 ${localResults.length} 部作品';
+          loading = false;
+        });
+        _autoSelectCurrentView();
+        return;
+      }
       setState(() {
         error = '經目查詢失敗：$exception';
         loading = false;
@@ -7223,20 +7696,23 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       error = null;
     });
     try {
-      final payload = await _getJson('works/toc', {'work': work});
-      final result = (payload['results'] as List<dynamic>? ?? const [])
-          .whereType<Map<String, dynamic>>()
-          .firstOrNull;
-      final juans = _tocJuanEntries(result);
-      if (juans.isEmpty) throw FormatException('此作品沒有可讀取的卷');
+      await CatalogCache.instance.load();
+      final cache = CatalogCache.instance;
+      final allWorksEntry = cache.lookupWork(work);
+      final juanStrings = allWorksEntry?.juans ?? const <String>[];
       final availableJuans =
-          juans
-              .map((item) => item['juan'])
-              .whereType<num>()
-              .map((value) => value.toInt())
+          juanStrings
+              .map((s) => int.tryParse(s))
+              .whereType<int>()
               .toSet()
               .toList()
             ..sort();
+      if (availableJuans.isEmpty) {
+        throw FormatException('此作品沒有可讀取的卷');
+      }
+      final file = (item['file'] as String?)?.trim().isNotEmpty == true
+          ? item['file'] as String
+          : cache.lookupWorkFile(work) ?? work;
       final targetJuan = targetLinehead == null
           ? null
           : int.tryParse('${item['juan'] ?? ''}');
@@ -7244,36 +7720,26 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
         availableJuans.add(targetJuan);
         availableJuans.sort();
       }
-      final selectedJuan = targetJuan == null
-          ? null
-          : juans.where((juan) => juan['juan'] == targetJuan).firstOrNull;
       final firstJuan = availableJuans.first;
-      final selected =
-          selectedJuan ??
-          (targetJuan == null
-              ? null
-              : {
-                  'file': item['file'],
-                  'juan': targetJuan,
-                  'lb': item['lb'] ?? targetLinehead!.split('_p').last,
-                }) ??
-          juans.where((juan) => juan['juan'] == firstJuan).firstOrNull ??
-          juans.first;
-      final file = '${selected['file'] ?? item['file'] ?? work}';
+      final selectedJuan = targetJuan ?? firstJuan;
       final line = targetLinehead == null
-          ? '${selected['lb'] ?? ''}'
+          ? ''
           : targetLinehead.split('_p').last;
-      final rawTitle = '${item['title'] ?? item['label'] ?? work}';
+      final rawTitle =
+          allWorksEntry?.title ??
+          item['title'] as String? ??
+          item['label'] as String? ??
+          work;
       final title = rawTitle.replaceFirst(
         RegExp('^${RegExp.escape(work)}\\s+'),
         '',
       );
       final passage = ScripturePassage(
         title: title,
-        reference: '卷 ${selected['juan']}',
+        reference: '卷 $selectedJuan',
         text: '',
         linehead: line.isEmpty ? null : '${file}_p$line',
-        juan: '${selected['juan']}',
+        juan: '$selectedJuan',
         work: work,
         availableJuans: availableJuans,
       );
@@ -7290,20 +7756,19 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
 
   List<Object> get visibleCreatorRows {
     final query = creatorQuery.trim().toLowerCase();
-    final groups = <String, List<MapEntry<String, Map<String, dynamic>>>>{};
+    final groups = <String, List<MapEntry<String, CreatorEntry>>>{};
     for (final entry in creators) {
-      final name = '${entry.value['regular_name'] ?? ''}';
-      final aliases = (entry.value['aliases_all'] as List<dynamic>? ?? const [])
-          .whereType<String>()
-          .toList();
+      final name = entry.value.name;
       if (query.isNotEmpty &&
           ![
             name,
-            ...aliases,
+            ...entry.value.aliases,
           ].any((value) => value.toLowerCase().contains(query))) {
         continue;
       }
-      final group = _creatorStrokeGroup(name);
+      final group = entry.value.strokeGroup.isNotEmpty
+          ? entry.value.strokeGroup
+          : _creatorStrokeGroup(name);
       groups.putIfAbsent(group, () => []).add(entry);
     }
 
@@ -7322,14 +7787,126 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       rows.add(group);
       final names = groups[group]!
         ..sort(
-          (left, right) => _compareCreatorNames(
-            '${left.value['regular_name'] ?? ''}',
-            '${right.value['regular_name'] ?? ''}',
-          ),
+          (left, right) =>
+              _compareCreatorNames(left.value.name, right.value.name),
         );
       rows.addAll(names);
     }
     return rows;
+  }
+
+  Set<String> _workIdsForItem(Map<String, dynamic> item) {
+    final work = item['work'];
+    if (work is String && work.isNotEmpty) return {work};
+    final query = item['n'];
+    if (query is String && query.isNotEmpty) {
+      final node = CatalogCache.instance.findNode(query);
+      if (node != null) return CatalogCache.instance.workIdsInNode(node);
+    }
+    return const {};
+  }
+
+  Iterable<String> _currentViewWorkIds() sync* {
+    final cache = CatalogCache.instance;
+    if (selectedTab == 0 || selectedTab == 1) {
+      final levels = catalogLevels[selectedTab]!;
+      if (levels.isNotEmpty) {
+        final node = cache.findNode(levels.last.q);
+        if (node != null) yield* node.collectWorkIds();
+      }
+      return;
+    }
+    if (selectedTab == 2) {
+      if (showingWorks) {
+        for (final item in listedWorks) {
+          yield* _workIdsForItem(item);
+        }
+      } else {
+        for (final entry in creators) {
+          for (final work in entry.value.works) {
+            yield work.work;
+          }
+        }
+      }
+      return;
+    }
+    if (selectedTab == 3 && !showingWorks) {
+      for (final dynasty in dynasties) {
+        for (final work in dynasty.works) {
+          yield work.work;
+        }
+      }
+      return;
+    }
+    for (final item in listedWorks) {
+      yield* _workIdsForItem(item);
+    }
+  }
+
+  void _autoSelectCurrentView() {
+    if (!downloadMode) return;
+    _addWorksToSelection(_currentViewWorkIds());
+  }
+
+  void _addWorksToSelection(Iterable<String> works) {
+    final additions = works
+        .where(
+          (work) => work.isNotEmpty && !selectedDownloadWorks.contains(work),
+        )
+        .toList();
+    if (additions.isEmpty) return;
+    setState(() => selectedDownloadWorks.addAll(additions));
+  }
+
+  void _toggleWorkIds(Iterable<String> works, bool selected) {
+    final ids = works.where((work) => work.isNotEmpty).toSet();
+    if (ids.isEmpty) return;
+    setState(() {
+      if (selected) {
+        selectedDownloadWorks.addAll(ids);
+      } else {
+        selectedDownloadWorks.removeAll(ids);
+      }
+    });
+  }
+
+  bool _allSelected(Iterable<String> works) {
+    var hasWork = false;
+    for (final work in works) {
+      if (work.isEmpty) continue;
+      hasWork = true;
+      if (!selectedDownloadWorks.contains(work)) return false;
+    }
+    return hasWork;
+  }
+
+  bool _noneSelected(Iterable<String> works) {
+    for (final work in works) {
+      if (selectedDownloadWorks.contains(work)) return false;
+    }
+    return true;
+  }
+
+  int _missingCount(Iterable<String> works) => works
+      .where(
+        (work) => work.isNotEmpty && !downloadManager.isWorkDownloaded(work),
+      )
+      .length;
+
+  Widget? _downloadCheckbox(Iterable<String> works) {
+    if (!downloadMode) return null;
+    final ids = works.where((work) => work.isNotEmpty).toList();
+    if (ids.isEmpty) return null;
+    return Checkbox(
+      tristate: true,
+      value: _allSelected(ids)
+          ? true
+          : _noneSelected(ids)
+          ? false
+          : null,
+      onChanged: (checked) =>
+          _toggleWorkIds(ids, checked ?? !_allSelected(ids)),
+    );
   }
 
   Widget _buildCatalog(int tab) {
@@ -7383,24 +7960,49 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     itemBuilder: (context, index) {
       final item = items[index];
       final work = item['work'] is String;
-      final title = '${item['title'] ?? item['label'] ?? item['name'] ?? ''}';
+      var title = '${item['title'] ?? ''}';
+      if (title.isEmpty) {
+        title = '${item['label'] ?? item['name'] ?? ''}';
+      }
       final workId = item['work']?.toString();
       final label = work && workId != null && !title.startsWith('$workId ')
           ? '$workId $title'
           : title;
-      final details = [
-        if (!work && item['start'] != null && item['end'] != null)
+      final period = item['period'];
+      final baseDetails = [
+        if (!work && period is String && period.isNotEmpty)
+          period
+        else if (!work && item['start'] != null && item['end'] != null)
           '${item['start']}–${item['end']} CE',
         if (item['vol'] != null) '${item['vol']}',
         if (item['juan'] != null) '共 ${item['juan']} 卷',
-        if (item['byline'] is String) '${item['byline']}',
+        if (item['byline'] is String && '${item['byline']}'.isNotEmpty)
+          '${item['byline']}',
         if (item['count'] != null) '${item['count']} 部',
       ].join(' · ');
+      final workIds = _workIdsForItem(item);
+      final isDownloaded =
+          work && workId != null && downloadManager.isWorkDownloaded(workId);
+      final details = !downloadMode || workIds.isEmpty
+          ? baseDetails
+          : [
+              baseDetails,
+              if (work)
+                isDownloaded ? '已下載' : '本地缺少'
+              else
+                '本地缺少 ${_missingCount(workIds)} 部',
+            ].where((detail) => detail.isNotEmpty).join(' · ');
+      final checkbox = _downloadCheckbox(workIds);
+
       return ListTile(
-        leading: Icon(work ? Icons.menu_book_outlined : Icons.folder_outlined),
-        title: Text(label),
-        subtitle: details.isEmpty ? null : Text(details),
-        trailing: const Icon(Icons.chevron_right_rounded),
+        leading:
+            checkbox ??
+            Icon(work ? Icons.menu_book_outlined : Icons.folder_outlined),
+        title: Text(_displayText(label, context)),
+        subtitle: details.isEmpty ? null : Text(_displayText(details, context)),
+        trailing: isDownloaded
+            ? const Icon(Icons.download_done, color: Colors.green)
+            : const Icon(Icons.chevron_right_rounded),
         onTap: () => onTap(item),
       );
     },
@@ -7481,18 +8083,27 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
                           ),
                         );
                       }
-                      if (row
-                          case MapEntry<String, Map<String, dynamic>> entry) {
-                        final name = '${entry.value['regular_name'] ?? ''}';
-                        final aliases =
-                            (entry.value['aliases_all'] as List<dynamic>? ??
-                                    const [])
-                                .whereType<String>()
-                                .take(3)
-                                .join('、');
+                      if (row case MapEntry<String, CreatorEntry> entry) {
+                        final name = entry.value.name;
+                        final aliases = entry.value.aliases;
+                        final workIds = entry.value.works
+                            .map((work) => work.work)
+                            .toList();
                         return ListTile(
+                          leading: _downloadCheckbox(workIds),
                           title: Text(name),
-                          subtitle: aliases.isEmpty ? null : Text(aliases),
+                          subtitle: downloadMode
+                              ? Text(
+                                  '共 ${workIds.length} 部 · '
+                                  '本地缺少 ${_missingCount(workIds)} 部',
+                                )
+                              : aliases.isEmpty
+                              ? null
+                              : Text(
+                                  aliases.take(3).join('、'),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
                           trailing: const Icon(Icons.chevron_right_rounded),
                           onTap: () => _loadWorks({
                             'creator_id': entry.key,
@@ -7512,11 +8123,11 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     children: [
       Expanded(
         child: _buildItemList(
-          showingWorks ? listedWorks : dynasties,
+          showingWorks ? listedWorks : dynasties.map((d) => d.toMap()).toList(),
           onTap: (item) => showingWorks
               ? _openWork(item)
               : _loadWorks({
-                  'dynasty': '${item['name']}'.replaceAll('/', ','),
+                  'dynasty': '${item['name']}',
                 }, description: '${item['name']}'),
         ),
       ),
@@ -7617,6 +8228,19 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
           },
           icon: const Icon(Icons.arrow_back_rounded),
         ),
+        actions: [
+          AnimatedBuilder(
+            animation: downloadManager,
+            builder: (context, _) => _DownloadInfoButton(
+              onPressed: () => _showDownloadStatusPanel(context),
+            ),
+          ),
+          IconButton(
+            tooltip: _displayText(downloadMode ? '取消下載模式' : '下載', context),
+            onPressed: _toggleDownloadMode,
+            icon: Icon(downloadMode ? Icons.close : Icons.download_rounded),
+          ),
+        ],
       ),
       body: Column(
         children: [
@@ -7669,10 +8293,114 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
               _ => _buildDictionaryTab(),
             },
           ),
+          if (downloadMode) _buildDownloadBottomBar(),
         ],
       ),
     ),
   );
+
+  Widget _buildDownloadBottomBar() {
+    final selected = selectedDownloadWorks;
+    final missing = selected
+        .where((work) => !downloadManager.isWorkDownloaded(work))
+        .toList();
+    final totalJuans = selected.fold<int>(
+      0,
+      (sum, work) =>
+          sum + (CatalogCache.instance.lookupWork(work)?.juans.length ?? 0),
+    );
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: scriptureDisplaySettings.surfaceColor,
+        border: Border(top: BorderSide(color: Colors.grey.shade300)),
+      ),
+      child: SafeArea(
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                _displayText(
+                  '已選 ${selected.length} 部 · 共 $totalJuans 卷\n'
+                  '本地缺少 ${missing.length} 部',
+                  context,
+                ),
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+            ),
+            TextButton(
+              onPressed: () => setState(() {
+                downloadMode = false;
+                selectedDownloadWorks.clear();
+              }),
+              child: Text(_displayText('取消', context)),
+            ),
+            const SizedBox(width: 8),
+            FilledButton(
+              onPressed: missing.isEmpty
+                  ? null
+                  : () => _confirmDownload(context),
+              child: Text(_displayText('確認下載', context)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _toggleDownloadMode() {
+    final entering = !downloadMode;
+    setState(() {
+      downloadMode = entering;
+      if (!entering) selectedDownloadWorks.clear();
+    });
+    if (entering) _autoSelectCurrentView();
+  }
+
+  Future<void> _confirmDownload(BuildContext context) async {
+    final grouped = <String, List<DownloadItem>>{};
+    for (final workId in selectedDownloadWorks) {
+      if (downloadManager.isWorkDownloaded(workId)) continue;
+      final entry = CatalogCache.instance.lookupWork(workId);
+      if (entry == null) continue;
+      final department =
+          CatalogCache.instance.departmentForWork(workId) ?? '其他';
+      grouped
+          .putIfAbsent(department, () => [])
+          .add(
+            DownloadItem(
+              work: workId,
+              title: entry.title,
+              juans: entry.juans,
+              creators: entry.creators,
+              category: department,
+            ),
+          );
+    }
+    if (grouped.isEmpty) return;
+    final stamp = DateTime.now().microsecondsSinceEpoch;
+    var index = 0;
+    final groups = grouped.entries.map((entry) {
+      final group = DownloadGroup(
+        id: '$stamp-${index++}',
+        label: '${entry.key}（${entry.value.length} 部）',
+        items: entry.value,
+      );
+      return group;
+    }).toList();
+    downloadManager.addToQueue(groups);
+    setState(() {
+      downloadMode = false;
+      selectedDownloadWorks.clear();
+    });
+    unawaited(downloadManager.startDownload());
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(_displayText('已加入下載隊列，共 ${groups.length} 部', context)),
+      ),
+    );
+  }
 
   Future<String> _getFodictBaseDir() async {
     final dir = await getApplicationDocumentsDirectory();

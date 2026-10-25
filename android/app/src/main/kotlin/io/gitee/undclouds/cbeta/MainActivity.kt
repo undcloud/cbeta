@@ -1,21 +1,27 @@
 package io.gitee.undclouds.cbeta
 
+import android.Manifest
 import android.app.PendingIntent
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageInstaller
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileInputStream
 
 class MainActivity : FlutterActivity() {
     private val channelName = "xuefo/app_updater"
+    private val downloadChannelName = "xuefo/download_notifications"
+    private var downloadChannel: MethodChannel? = null
+    private var pendingOpenDownloadManager = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -75,6 +81,116 @@ class MainActivity : FlutterActivity() {
                 }
                 else -> result.notImplemented()
             }
+        }
+        val notificationChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            downloadChannelName,
+        )
+        downloadChannel = notificationChannel
+        notificationChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "requestPermission" -> {
+                    requestNotificationPermission()
+                    result.success(null)
+                }
+                "start" -> dispatchDownloadService(
+                    DownloadForegroundService.ACTION_START,
+                    call,
+                    result,
+                )
+                "update" -> dispatchDownloadService(
+                    DownloadForegroundService.ACTION_UPDATE,
+                    call,
+                    result,
+                )
+                "stop" -> dispatchDownloadService(
+                    DownloadForegroundService.ACTION_STOP,
+                    call,
+                    result,
+                )
+                "consumeOpenDownloadManager" -> {
+                    result.success(pendingOpenDownloadManager)
+                    pendingOpenDownloadManager = false
+                }
+                else -> result.notImplemented()
+            }
+        }
+        if (intent?.getBooleanExtra(
+                DownloadForegroundService.EXTRA_OPEN_DOWNLOAD_MANAGER,
+                false,
+            ) == true
+        ) {
+            intent.removeExtra(DownloadForegroundService.EXTRA_OPEN_DOWNLOAD_MANAGER)
+            pendingOpenDownloadManager = true
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (!intent.getBooleanExtra(
+                DownloadForegroundService.EXTRA_OPEN_DOWNLOAD_MANAGER,
+                false,
+            )
+        ) {
+            return
+        }
+        intent.removeExtra(DownloadForegroundService.EXTRA_OPEN_DOWNLOAD_MANAGER)
+        val channel = downloadChannel
+        if (channel == null) {
+            pendingOpenDownloadManager = true
+        } else {
+            channel.invokeMethod("openDownloadManager", null)
+        }
+    }
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                2001,
+            )
+        }
+    }
+
+    private fun dispatchDownloadService(
+        action: String,
+        call: MethodCall,
+        result: MethodChannel.Result,
+    ) {
+        val intent = Intent(this, DownloadForegroundService::class.java).apply {
+            this.action = action
+            putExtra(
+                DownloadForegroundService.EXTRA_TITLE,
+                call.argument<String>("title") ?: "正在下載經文",
+            )
+            putExtra(
+                DownloadForegroundService.EXTRA_TEXT,
+                call.argument<String>("text") ?: "",
+            )
+            putExtra(
+                DownloadForegroundService.EXTRA_PROGRESS,
+                call.argument<Int>("progress") ?: 0,
+            )
+            putExtra(
+                DownloadForegroundService.EXTRA_MAX,
+                call.argument<Int>("max") ?: 1,
+            )
+        }
+        try {
+            if (action == DownloadForegroundService.ACTION_START &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+            ) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            result.success(null)
+        } catch (error: Exception) {
+            result.error("download_service_failed", error.message, null)
         }
     }
 

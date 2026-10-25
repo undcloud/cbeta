@@ -1,12 +1,11 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-
-final scriptureCacheUpdates = ValueNotifier<Set<String>>({});
 
 class CachedScriptureVolume {
   const CachedScriptureVolume({
@@ -48,6 +47,16 @@ class CachedScriptureVolume {
     'html': html,
     'contentVersion': contentVersion,
   };
+}
+
+class ScriptureVolumeRef {
+  const ScriptureVolumeRef({required this.work, required this.juan, this.path});
+
+  final String work;
+  final String juan;
+  final String? path;
+
+  String get key => '$work:$juan';
 }
 
 class ScriptureVolumeStore {
@@ -96,6 +105,63 @@ class ScriptureVolumeStore {
       throw FormatException('離線經卷識別碼不符：$work 卷 $juan');
     }
     return volume;
+  }
+
+  /// 只列出已儲存經卷的識別碼，不讀取經文內容，供大量經卷搜尋使用。
+  Future<List<ScriptureVolumeRef>> listRefs() async {
+    if (kIsWeb) {
+      final preferences = await SharedPreferences.getInstance();
+      final refs = <ScriptureVolumeRef>[];
+      for (final key in preferences.getKeys()) {
+        if (!key.startsWith(_webKeyPrefix)) continue;
+        final ref = _refFromKey(key.substring(_webKeyPrefix.length));
+        if (ref != null) refs.add(ref);
+      }
+      return refs;
+    }
+    final directory = await _cacheDirectory();
+    if (!await directory.exists()) return const [];
+    final refs = <ScriptureVolumeRef>[];
+    await for (final entity in directory.list()) {
+      if (entity is! File || !entity.path.endsWith('.json')) continue;
+      final name = entity.uri.pathSegments.last;
+      final ref = _refFromKey(name.substring(0, name.length - 5));
+      if (ref != null) {
+        refs.add(
+          ScriptureVolumeRef(work: ref.work, juan: ref.juan, path: entity.path),
+        );
+      }
+    }
+    return refs;
+  }
+
+  Future<CachedScriptureVolume?> readRef(ScriptureVolumeRef ref) async {
+    try {
+      if (kIsWeb) {
+        return read(ref.work, ref.juan);
+      }
+      final path = ref.path ?? '';
+      if (path.isEmpty) return read(ref.work, ref.juan);
+      final file = File(path);
+      if (!await file.exists()) return null;
+      return CachedScriptureVolume.fromJson(
+        jsonDecode(await file.readAsString()) as Map<String, dynamic>,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static ScriptureVolumeRef? _refFromKey(String fileKey) {
+    final separator = fileKey.lastIndexOf('-');
+    if (separator <= 0 || separator >= fileKey.length - 1) return null;
+    final work = fileKey.substring(0, separator);
+    final juan = fileKey.substring(separator + 1);
+    if (!RegExp(r'^[A-Za-z0-9]+$').hasMatch(work) ||
+        !RegExp(r'^\d+$').hasMatch(juan)) {
+      return null;
+    }
+    return ScriptureVolumeRef(work: work, juan: juan);
   }
 
   Future<void> write(CachedScriptureVolume volume) async {
@@ -175,35 +241,39 @@ class ScriptureVolumeStore {
 
 var scriptureVolumeStore = ScriptureVolumeStore();
 
-class ScriptureCacheUpdateResult {
-  const ScriptureCacheUpdateResult({
-    required this.updated,
-    required this.unchanged,
-    required this.errors,
-  });
-
-  final int updated;
-  final int unchanged;
-  final List<String> errors;
-}
-
 Future<CachedScriptureVolume> fetchScriptureVolume(
   String work,
-  String juan,
-) async {
-  final response = await http
-      .get(
-        Uri.https('cbdata.dila.edu.tw', '/stable/juans', {
-          'work': work,
-          'juan': juan,
-        }),
-      )
-      .timeout(const Duration(seconds: 20));
-  if (response.statusCode != 200) {
-    throw Exception('經卷 API 回傳 ${response.statusCode}');
+  String juan, {
+  void Function(int bytes)? onBytesReceived,
+}) async {
+  final client = http.Client();
+  final Map<String, dynamic> payload;
+  try {
+    final request = http.Request(
+      'GET',
+      Uri.https('cbdata.dila.edu.tw', '/stable/juans', {
+        'work': work,
+        'juan': juan,
+      }),
+    );
+    final response = await client
+        .send(request)
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode != 200) {
+      throw Exception('經卷 API 回傳 ${response.statusCode}');
+    }
+    final bytes = BytesBuilder(copy: false);
+    await response.stream
+        .forEach((chunk) {
+          bytes.add(chunk);
+          onBytesReceived?.call(chunk.length);
+        })
+        .timeout(const Duration(seconds: 20));
+    payload =
+        jsonDecode(utf8.decode(bytes.takeBytes())) as Map<String, dynamic>;
+  } finally {
+    client.close();
   }
-  final payload =
-      jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
   if (payload['success'] == false) {
     throw Exception('CBETA 經卷下載失敗：${payload['error'] ?? '未知錯誤'}');
   }
@@ -218,39 +288,5 @@ Future<CachedScriptureVolume> fetchScriptureVolume(
     juan: juan,
     html: html,
     contentVersion: payload['content'] as String?,
-  );
-}
-
-Future<ScriptureCacheUpdateResult> checkAndUpdateCachedScriptures() async {
-  final cachedVolumes = await scriptureVolumeStore.list();
-  var updated = 0;
-  var unchanged = 0;
-  final updatedKeys = <String>{};
-  final errors = <String>[];
-  for (final cached in cachedVolumes) {
-    try {
-      final latest = await fetchScriptureVolume(cached.work, cached.juan);
-      final isUpdated =
-          cached.contentVersion != null && latest.contentVersion != null
-          ? cached.contentVersion != latest.contentVersion
-          : cached.html != latest.html;
-      if (isUpdated) {
-        await scriptureVolumeStore.write(latest);
-        updated++;
-        updatedKeys.add(cached.key);
-      } else {
-        unchanged++;
-      }
-    } catch (error) {
-      errors.add('${cached.work} 卷 ${cached.juan}：$error');
-    }
-  }
-  if (updatedKeys.isNotEmpty) {
-    scriptureCacheUpdates.value = Set.unmodifiable(updatedKeys);
-  }
-  return ScriptureCacheUpdateResult(
-    updated: updated,
-    unchanged: unchanged,
-    errors: List.unmodifiable(errors),
   );
 }

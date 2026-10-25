@@ -7,6 +7,7 @@ environment:
   sdk: ^3.11.4
 
 dependencies:
+  archive: ^4.5.2
   flutter:
     sdk: flutter
   flutter_localizations:
@@ -38,6 +39,11 @@ flutter:
     - assets/hanzi_traditional_to_simplified.json
     - assets/phrases_simplified_to_traditional.json
     - assets/phrases_traditional_to_simplified.json
+    - assets/cbeta_catalog/category.json
+    - assets/cbeta_catalog/vol.json
+    - assets/cbeta_catalog/creators-by-strokes-with-works.json
+    - assets/cbeta_catalog/dynasty-works.json
+    - assets/cbeta_catalog/work_files.json
     - assets/fodict/012.weishi-j/fodict.dat
     - assets/fodict/013.fajie-j/fodict.dat
     - assets/fodict/013.fajie-j/fodict.idx

@@ -46,3 +46,6 @@ app.*.map.json
 /android/app/release
 
 fodict
+# CBETA crawler cache
+tool/.catalog_cache/
+assets/cbeta_catalog
