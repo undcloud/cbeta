@@ -963,20 +963,19 @@ class _DownloadInfoButtonState extends State<_DownloadInfoButton>
   @override
   Widget build(BuildContext context) {
     final isDownloading = downloadManager.isDownloading;
-    final iconColor = isDownloading
-        ? Color.lerp(
-            Colors.green.shade400,
-            Colors.green.shade800,
-            _flashController.value,
-          )
-        : null;
+    final idleColor = Theme.of(context).colorScheme.onSurface;
     return AnimatedBuilder(
       animation: _flashController,
-      builder: (context, _) => IconButton(
-        tooltip: _displayText('下載管理', context),
-        onPressed: widget.onPressed,
-        icon: Icon(Icons.info_outline_rounded, color: iconColor),
-      ),
+      builder: (context, _) {
+        final iconColor = isDownloading
+            ? (_flashController.value < 0.5 ? idleColor : Colors.green)
+            : null;
+        return IconButton(
+          tooltip: _displayText('下載管理', context),
+          onPressed: widget.onPressed,
+          icon: Icon(Icons.info_outline_rounded, color: iconColor),
+        );
+      },
     );
   }
 }
