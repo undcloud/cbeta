@@ -59,10 +59,10 @@ class DownloadForegroundService : Service() {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "經文下載",
+            "經文下載與更新",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "顯示經文下載進度"
+            description = "顯示經文下載與更新進度"
             setShowBadge(false)
             enableVibration(false)
         }
@@ -88,11 +88,15 @@ class DownloadForegroundService : Service() {
             .setContentTitle(title)
             .setContentText(text)
             .setProgress(max, progress, false)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setOngoing(ongoing)
             .setOnlyAlertOnce(true)
             .setContentIntent(contentIntent)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setForegroundServiceBehavior(
+                NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE,
+            )
             .build()
     }
 
@@ -127,6 +131,7 @@ class DownloadForegroundService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
+        // Flutter 引擎會隨 Activity 結束，保留服務只會留下過期的進度通知。
         stopDownloadService()
         super.onTaskRemoved(rootIntent)
     }

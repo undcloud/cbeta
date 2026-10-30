@@ -218,6 +218,7 @@ void main() {
       }, () => client);
 
       expect(requested, [
+        'https://cbdata.dila.edu.tw/stable/changes?work=T0001',
         'https://cbdata.dila.edu.tw/stable/download/html/T0001.html.zip',
       ]);
     });

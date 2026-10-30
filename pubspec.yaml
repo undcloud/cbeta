@@ -44,9 +44,5 @@ flutter:
     - assets/cbeta_catalog/creators-by-strokes-with-works.json
     - assets/cbeta_catalog/dynasty-works.json
     - assets/cbeta_catalog/work_files.json
-    - assets/fodict/012.weishi-j/fodict.dat
-    - assets/fodict/013.fajie-j/fodict.dat
-    - assets/fodict/013.fajie-j/fodict.idx
-    - assets/fodict/014.famen-j/fodict.dat
-    - assets/fodict/014.famen-j/fodict.idx
-    - assets/fodict/014.famen-j/fodict.ini
+    - assets/fodict/030.dila-dingfubao/fodict.dat
+    - assets/fodict/030.dila-dingfubao/fodict.ini

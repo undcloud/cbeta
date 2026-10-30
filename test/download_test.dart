@@ -93,6 +93,7 @@ void main() {
         work: 'T0001',
         juan: '1',
         ver: '2023Q4',
+        release: '2026.R2',
         savedAt: now,
       );
       final json = version.toJson();
@@ -100,8 +101,19 @@ void main() {
       expect(restored.work, 'T0001');
       expect(restored.juan, '1');
       expect(restored.ver, '2023Q4');
+      expect(restored.release, '2026.R2');
       expect(restored.savedAt, now);
       expect(restored.key, 'T0001:1');
+    });
+
+    test('reads old records without a release field', () {
+      final restored = LocalVersion.fromJson({
+        'work': 'T0001',
+        'juan': '1',
+        'ver': 'v1',
+        'savedAt': DateTime.utc(2024, 1, 15).toIso8601String(),
+      });
+      expect(restored.release, isNull);
     });
   });
 

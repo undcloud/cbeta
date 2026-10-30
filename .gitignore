@@ -12,6 +12,7 @@
 .swiftpm/
 migrate_working_dir/
 todo.md
+.ssh
 
 # IntelliJ related
 *.iml
@@ -49,3 +50,4 @@ fodict
 # CBETA crawler cache
 tool/.catalog_cache/
 assets/cbeta_catalog
+/cbeta-fodict/

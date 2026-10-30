@@ -16,9 +16,21 @@ class ScriptureDisplaySettings extends ChangeNotifier {
   bool showCollation = true;
   bool showLineBeginnings = false;
   bool showSimplifiedText = false;
+
+  /// 系统是否为深色模式；为 true 时强制使用「夜間」配色（不持久化）。
+  bool platformDark = false;
+
+  /// true 時完全不做簡繁轉換，保持文字原始樣式（字典等外部資料用）。
+  bool showOriginalText = false;
   SharedPreferences? _preferences;
 
-  Color get backgroundColor => switch (backgroundTheme) {
+  /// 實際生效的背景配色：系統深色時強制「夜間」，否則使用使用者選擇。
+  String get effectiveBackgroundTheme =>
+      platformDark ? 'night' : backgroundTheme;
+
+  bool get isDark => effectiveBackgroundTheme == 'night';
+
+  Color get backgroundColor => switch (effectiveBackgroundTheme) {
     'warm' => const Color(0xFFF5E6C8),
     'green' => const Color(0xFFE3EDCD),
     'white' => const Color(0xFFFFFFFF),
@@ -27,12 +39,19 @@ class ScriptureDisplaySettings extends ChangeNotifier {
     _ => const Color(0xFFF5EFE0),
   };
 
-  Color get textColor => backgroundTheme == 'night'
+  Color get textColor => effectiveBackgroundTheme == 'night'
       ? const Color(0xFFDCD0BA)
       : const Color(0xFF2C1810);
 
   Color get surfaceColor =>
-      backgroundTheme == 'default' ? paperSurface : backgroundColor;
+      effectiveBackgroundTheme == 'default' ? paperSurface : backgroundColor;
+
+  /// 更新系统深浅色状态；仅在变化时通知重建。
+  void setPlatformDark(bool value) {
+    if (platformDark == value) return;
+    platformDark = value;
+    notifyListeners();
+  }
 
   String get fontFamilyName => switch (fontFamily) {
     'sans' => 'Noto Sans TC',
@@ -50,6 +69,7 @@ class ScriptureDisplaySettings extends ChangeNotifier {
     showCollation = true;
     showLineBeginnings = false;
     showSimplifiedText = false;
+    showOriginalText = false;
     final stored = _preferences!.getString(_storageKey);
     if (stored == null) return;
     final values = jsonDecode(stored) as Map<String, dynamic>;
@@ -60,6 +80,7 @@ class ScriptureDisplaySettings extends ChangeNotifier {
     final savedCollation = values['showCollation'];
     final savedLineBeginnings = values['showLineBeginnings'];
     final savedSimplifiedText = values['showSimplifiedText'];
+    final savedOriginalText = values['showOriginalText'];
     if (savedFontSize is int && savedFontSize >= 14 && savedFontSize <= 32) {
       fontSize = savedFontSize;
     }
@@ -90,6 +111,9 @@ class ScriptureDisplaySettings extends ChangeNotifier {
     if (savedSimplifiedText is bool) {
       showSimplifiedText = savedSimplifiedText;
     }
+    if (savedOriginalText is bool) {
+      showOriginalText = savedOriginalText;
+    }
   }
 
   Future<void> update({
@@ -100,6 +124,7 @@ class ScriptureDisplaySettings extends ChangeNotifier {
     bool? showCollation,
     bool? showLineBeginnings,
     bool? showSimplifiedText,
+    bool? showOriginalText,
   }) async {
     if (fontSize != null) this.fontSize = fontSize.clamp(14, 32);
     if (lineHeight != null) {
@@ -113,6 +138,9 @@ class ScriptureDisplaySettings extends ChangeNotifier {
     }
     if (showSimplifiedText != null) {
       this.showSimplifiedText = showSimplifiedText;
+    }
+    if (showOriginalText != null) {
+      this.showOriginalText = showOriginalText;
     }
     notifyListeners();
 
@@ -130,8 +158,23 @@ class ScriptureDisplaySettings extends ChangeNotifier {
         'showCollation': this.showCollation,
         'showLineBeginnings': this.showLineBeginnings,
         'showSimplifiedText': this.showSimplifiedText,
+        'showOriginalText': this.showOriginalText,
       }),
     );
     if (!saved) throw StateError('無法儲存經文顯示設定');
   }
+
+  /// 目前簡繁顯示模式：'traditional'（繁）、'simplified'（简）、'original'（原样）。
+  String get scriptMode => switch ((showOriginalText, showSimplifiedText)) {
+    (true, _) => 'original',
+    (false, true) => 'simplified',
+    (false, false) => 'traditional',
+  };
+
+  /// 依 繁 → 简 → 原样 → 繁 循環切換顯示模式。
+  Future<void> cycleScriptMode() => switch (scriptMode) {
+    'traditional' => update(showOriginalText: false, showSimplifiedText: true),
+    'simplified' => update(showOriginalText: true, showSimplifiedText: false),
+    _ => update(showOriginalText: false, showSimplifiedText: false),
+  };
 }

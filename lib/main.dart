@@ -20,9 +20,12 @@ import 'package:url_launcher/url_launcher.dart';
 
 import 'ai/ai_chunk.dart';
 import 'ai/ai_search_service.dart';
-import 'dictionary/dictionary_page.dart';
+import 'dictionary/fodict_catalog.dart';
+import 'dictionary/fodict_download_manager.dart';
+import 'dictionary/fodict_service.dart';
 import 'scripture/cache.dart';
 import 'scripture/models.dart';
+import 'scripture/offline_scan.dart';
 import 'scripture/parser.dart';
 import 'search/candidates.dart';
 import 'search/conversion.dart';
@@ -30,10 +33,14 @@ import 'search/goto.dart';
 import 'search/history.dart';
 import 'search/search_input.dart';
 import 'download/catalog_cache.dart';
+import 'download/catalog_store.dart';
 import 'download/download_manager.dart';
 import 'download/download_models.dart';
 import 'download/download_notifications.dart';
+import 'download/update_manager.dart';
 import 'settings/display_settings.dart';
+import 'work_picker/work_picker_state.dart';
+import 'feedback/feedback_dialog.dart';
 
 export 'scripture/cache.dart';
 export 'scripture/models.dart';
@@ -46,7 +53,10 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SimplifiedTraditionalConverter.load();
   await scriptureDisplaySettings.load();
+  CatalogCache.instance.localFileLoader = catalogStore.read;
   await downloadManager.initialize();
+  await updateManager.initialize();
+  await fodictDownloadManager.initialize();
   downloadNotifications
     ..initialize()
     ..onOpenDownloadManager = _openDownloadManagerFromNotification;
@@ -328,14 +338,22 @@ Future<void> _openApkWithFilex(String apkPath) async {
   }
 }
 
-Future<void> _showDisplaySettings(BuildContext context) {
+Future<void> _showDisplaySettings(
+  BuildContext context, {
+  AppUpdateInfo? availableUpdate,
+  VoidCallback? onUpdate,
+}) {
   return showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
     builder: (context) => SafeArea(
       child: FractionallySizedBox(
         heightFactor: 0.88,
-        child: _DisplaySettingsPanel(onAbout: () => _showAbout(context)),
+        child: _DisplaySettingsPanel(
+          onAbout: () => _showAbout(context),
+          availableUpdate: availableUpdate,
+          onUpdate: onUpdate,
+        ),
       ),
     ),
   );
@@ -608,9 +626,15 @@ class _ScriptDisplayScope extends InheritedNotifier<ScriptureDisplaySettings> {
 }
 
 class _DisplaySettingsPanel extends StatelessWidget {
-  const _DisplaySettingsPanel({required this.onAbout});
+  const _DisplaySettingsPanel({
+    required this.onAbout,
+    this.availableUpdate,
+    this.onUpdate,
+  });
 
   final VoidCallback onAbout;
+  final AppUpdateInfo? availableUpdate;
+  final VoidCallback? onUpdate;
 
   @override
   Widget build(BuildContext context) {
@@ -788,7 +812,36 @@ class _DisplaySettingsPanel extends StatelessWidget {
                     trailing: const Icon(Icons.chevron_right_rounded),
                     onTap: onAbout,
                   ),
-                  const _AppVersionLabel(),
+                  const Divider(),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 16, bottom: 8),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Expanded(
+                          child: Center(child: const _AppVersionLabel()),
+                        ),
+                        if (availableUpdate != null && onUpdate != null)
+                          TextButton(
+                            onPressed: onUpdate,
+                            style: TextButton.styleFrom(
+                              minimumSize: const Size(0, 28),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                              ),
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                              backgroundColor: const Color(0xFF176B67),
+                              foregroundColor: Colors.white,
+                              textStyle: const TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            child: const Text('更新'),
+                          ),
+                      ],
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -911,12 +964,19 @@ class _BackgroundChip extends StatelessWidget {
 }
 
 class _SettingsButton extends StatelessWidget {
-  const _SettingsButton();
+  const _SettingsButton({this.availableUpdate, this.onUpdate});
+
+  final AppUpdateInfo? availableUpdate;
+  final VoidCallback? onUpdate;
 
   @override
   Widget build(BuildContext context) => IconButton(
     tooltip: _displayText('介面設定', context),
-    onPressed: () => _showDisplaySettings(context),
+    onPressed: () => _showDisplaySettings(
+      context,
+      availableUpdate: availableUpdate,
+      onUpdate: onUpdate,
+    ),
     icon: const Icon(Icons.settings_outlined),
   );
 }
@@ -941,10 +1001,14 @@ class _DownloadInfoButtonState extends State<_DownloadInfoButton>
       duration: const Duration(milliseconds: 800),
     );
     downloadManager.addListener(_onManagerChanged);
+    fodictDownloadManager.addListener(_onManagerChanged);
+    updateManager.addListener(_onManagerChanged);
   }
 
   void _onManagerChanged() {
-    if (downloadManager.isDownloading) {
+    if (downloadManager.isDownloading ||
+        fodictDownloadManager.isDownloading ||
+        updateManager.isUpdating) {
       if (!_flashController.isAnimating) _flashController.repeat(reverse: true);
     } else {
       _flashController.stop();
@@ -956,13 +1020,18 @@ class _DownloadInfoButtonState extends State<_DownloadInfoButton>
   @override
   void dispose() {
     downloadManager.removeListener(_onManagerChanged);
+    fodictDownloadManager.removeListener(_onManagerChanged);
+    updateManager.removeListener(_onManagerChanged);
     _flashController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final isDownloading = downloadManager.isDownloading;
+    final isDownloading =
+        downloadManager.isDownloading ||
+        fodictDownloadManager.isDownloading ||
+        updateManager.isUpdating;
     final idleColor = Theme.of(context).colorScheme.onSurface;
     return AnimatedBuilder(
       animation: _flashController,
@@ -999,7 +1068,11 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: downloadManager,
+      animation: Listenable.merge([
+        downloadManager,
+        fodictDownloadManager,
+        updateManager,
+      ]),
       builder: (context, _) {
         final manager = downloadManager;
         final progress = manager.progress;
@@ -1030,15 +1103,35 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
                 style: Theme.of(context).textTheme.titleLarge,
               ),
               const SizedBox(height: 4),
-              Text(
-                _displayText(
-                  '已下載 ${manager.downloadedWorkCount} 部經文 · '
-                  '${manager.downloadedJuanCount} 卷',
-                  context,
-                ),
-                style: Theme.of(context).textTheme.bodySmall,
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _displayText(
+                        '已下載 ${manager.downloadedWorkCount} 部經文 · '
+                        '${manager.downloadedJuanCount} 卷',
+                        context,
+                      ),
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton.icon(
+                    onPressed: manager.isDownloading
+                        ? null
+                        : () => _confirmUpdate(context),
+                    icon: const Icon(Icons.sync_rounded, size: 18),
+                    label: Text(
+                      _displayText(
+                        updateManager.canResume ? '繼續更新' : '更新',
+                        context,
+                      ),
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(height: 16),
+              ..._buildUpdateSection(context),
               if (manager.isDownloading && progress != null) ...[
                 Row(
                   children: [
@@ -1105,7 +1198,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
                   Text(_displayText('有未完成的下載任務', context))
                 else
                   Text(_displayText('目前沒有下載任務', context)),
-                if (manager.canResume) ...[
+                if (manager.canResume && !updateManager.isUpdating) ...[
                   const SizedBox(height: 8),
                   FilledButton.icon(
                     onPressed: manager.resumeDownload,
@@ -1183,6 +1276,9 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
                 ),
               ],
               const SizedBox(height: 16),
+              const Divider(),
+              ..._buildFodictDownloadSection(context),
+              const SizedBox(height: 16),
               TextButton(
                 onPressed: () => Navigator.of(context).pop(),
                 child: Text(_displayText('關閉', context)),
@@ -1192,6 +1288,264 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
         );
       },
     );
+  }
+
+  Future<void> _confirmUpdate(BuildContext context) async {
+    if (downloadManager.isDownloading) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_displayText('經文下載中，完成後再更新', context))),
+      );
+      return;
+    }
+    if (updateManager.canResume) {
+      updateManager.resume();
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(_displayText('更新經目與經文', dialogContext)),
+        content: Text(
+          _displayText(
+            '確定要檢查並更新部類、冊別、作譯者、年代與已下載經文嗎？\n'
+            '只有遠端有變更時才會下載。',
+            dialogContext,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(_displayText('取消', dialogContext)),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(_displayText('更新', dialogContext)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !context.mounted) return;
+    final started = await updateManager.start();
+    if (!started && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_displayText('目前無法更新，請等經文下載完成後再試', context))),
+      );
+    }
+  }
+
+  List<Widget> _buildUpdateSection(BuildContext context) {
+    final manager = updateManager;
+    final progress = manager.progress;
+    if (manager.status == UpdateStatus.idle) return const [];
+    final counts = progress.totalWorks == 0
+        ? ''
+        : '（${progress.checkedWorks}/${progress.totalWorks} 部）';
+    final statusText = switch (manager.status) {
+      UpdateStatus.completed => progress.message ?? '更新完成',
+      UpdateStatus.failed => progress.message ?? '更新中斷',
+      _ => '${progress.message ?? ''}$counts',
+    };
+    return [
+      Row(
+        children: [
+          const Icon(Icons.sync_rounded, size: 18),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              _displayText('經目與經文更新', context),
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ),
+          if (manager.isUpdating)
+            IconButton(
+              tooltip: _displayText('暫停更新', context),
+              onPressed: manager.pause,
+              icon: const Icon(Icons.pause_rounded),
+            )
+          else if (manager.canResume)
+            IconButton(
+              tooltip: _displayText('繼續更新', context),
+              onPressed: manager.resume,
+              icon: const Icon(Icons.play_arrow_rounded),
+            ),
+          IconButton(
+            tooltip: _displayText('刪除更新任務', context),
+            onPressed: manager.deleteTask,
+            icon: const Icon(Icons.delete_outline),
+          ),
+        ],
+      ),
+      Text(
+        _displayText(statusText, context),
+        style: manager.status == UpdateStatus.failed
+            ? TextStyle(color: Theme.of(context).colorScheme.error)
+            : null,
+      ),
+      const SizedBox(height: 2),
+      Text(
+        _displayText(
+          '已更新 ${progress.updatedWorks} 部 · '
+          '已是最新 ${progress.skippedWorks} 部'
+          '${progress.failedWorks > 0 ? ' · 失敗 ${progress.failedWorks} 部' : ''}',
+          context,
+        ),
+        style: Theme.of(context).textTheme.bodySmall,
+      ),
+      if (manager.isUpdating) ...[
+        const SizedBox(height: 6),
+        LinearProgressIndicator(value: progress.fraction),
+        if (progress.currentWork != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            _displayText('目前：${progress.currentWork}', context),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ],
+        if (progress.receivedBytes > 0) ...[
+          const SizedBox(height: 2),
+          Text(
+            _displayText(
+              '${_formatDownloadBytes(progress.receivedBytes)}'
+              '${progress.totalBytes > 0 ? ' / ${_formatDownloadBytes(progress.totalBytes)}' : ''}'
+              ' · 速度 ${formatDownloadSpeed(manager.downloadSpeedBytesPerSecond)}',
+              context,
+            ),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ],
+      ],
+      if (manager.status == UpdateStatus.failed && manager.error != null) ...[
+        const SizedBox(height: 4),
+        Text(
+          manager.error!,
+          style: TextStyle(color: Theme.of(context).colorScheme.error),
+        ),
+      ],
+      const SizedBox(height: 12),
+      const Divider(),
+    ];
+  }
+
+  List<Widget> _buildFodictDownloadSection(BuildContext context) {
+    final manager = fodictDownloadManager;
+    final tasks = manager.queue;
+    final current = manager.currentTask;
+    final children = <Widget>[
+      Row(
+        children: [
+          const Icon(Icons.cloud_download_outlined, size: 18),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              _displayText('詞典下載', context),
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ),
+          if (manager.isDownloading)
+            IconButton(
+              tooltip: _displayText('暫停下載', context),
+              onPressed: manager.pauseDownload,
+              icon: const Icon(Icons.pause_rounded),
+            )
+          else if (manager.canResume)
+            IconButton(
+              tooltip: _displayText('繼續下載', context),
+              onPressed: manager.resumeDownload,
+              icon: const Icon(Icons.play_arrow_rounded),
+            ),
+          if (tasks.isNotEmpty)
+            IconButton(
+              tooltip: _displayText('清除詞典下載任務', context),
+              onPressed: manager.clearQueue,
+              icon: const Icon(Icons.delete_sweep_outlined),
+            ),
+        ],
+      ),
+      Text(
+        _displayText('已安裝 ${manager.installedIds.length} 部下載詞典', context),
+        style: Theme.of(context).textTheme.bodySmall,
+      ),
+    ];
+
+    if (tasks.isEmpty) {
+      children.add(const SizedBox(height: 8));
+      children.add(
+        Text(
+          _displayText(
+            manager.status == FodictDownloadStatus.completed
+                ? '詞典下載完成'
+                : '目前沒有詞典下載任務',
+            context,
+          ),
+          style: manager.status == FodictDownloadStatus.completed
+              ? const TextStyle(color: Colors.green)
+              : null,
+        ),
+      );
+    } else {
+      if (current != null) {
+        children.add(const SizedBox(height: 8));
+        children.add(
+          Text(
+            '${_displayText('下載中', context)}：'
+            '${_displayText(current.name, context)}',
+          ),
+        );
+        children.add(const SizedBox(height: 4));
+        children.add(LinearProgressIndicator(value: manager.progress));
+        children.add(const SizedBox(height: 4));
+        children.add(
+          Text(
+            '${_formatDownloadBytes(manager.receivedBytes)} / '
+            '${_formatDownloadBytes(manager.totalBytes)} · '
+            '速度 ${formatDownloadSpeed(manager.downloadSpeedBytesPerSecond)}',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        );
+      }
+      children.add(const SizedBox(height: 8));
+      children.add(
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 160),
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: tasks.length,
+            itemBuilder: (context, index) {
+              final task = tasks[index];
+              final isCurrent = current?.id == task.id;
+              return ListTile(
+                dense: true,
+                title: Text(_displayText(task.name, context)),
+                subtitle: Text(
+                  _displayText(
+                    isCurrent
+                        ? '下載中 ${(manager.progress * 100).toStringAsFixed(0)}%'
+                        : '等待下載',
+                    context,
+                  ),
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                trailing: IconButton(
+                  tooltip: _displayText('移除此下載任務', context),
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () => manager.removeTask(task.id),
+                ),
+              );
+            },
+          ),
+        ),
+      );
+      if (manager.error != null) {
+        children.add(const SizedBox(height: 8));
+        children.add(
+          Text(
+            manager.error!,
+            style: TextStyle(color: Theme.of(context).colorScheme.error),
+          ),
+        );
+      }
+    }
+    return children;
   }
 }
 
@@ -1203,27 +1557,67 @@ class _ScriptDisplayButton extends StatelessWidget {
     final settings = scriptureDisplaySettings;
     return AnimatedBuilder(
       animation: settings,
-      builder: (context, _) => IconButton(
-        tooltip: _displayText('切換簡體／繁體', context),
-        onPressed: () => _updateDisplaySetting(
-          context,
-          () =>
-              settings.update(showSimplifiedText: !settings.showSimplifiedText),
-        ),
-        icon: flutter_material.Text(
-          settings.showSimplifiedText ? '繁' : '简',
-          style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700),
-        ),
-      ),
+      builder: (context, _) {
+        final currentIcon = switch (settings.scriptMode) {
+          'traditional' => '繁',
+          'simplified' => '简',
+          _ => '原',
+        };
+        return IconButton(
+          tooltip: _displayText('切換簡體／繁體／原样', context),
+          onPressed: () =>
+              _updateDisplaySetting(context, settings.cycleScriptMode),
+          icon: flutter_material.Text(
+            currentIcon,
+            style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700),
+          ),
+        );
+      },
     );
   }
 }
 
+String _formatDownloadBytes(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+}
+
 String _displayText(String text, [BuildContext? context]) {
   if (context != null) _ScriptDisplayScope.dependOn(context);
+  if (scriptureDisplaySettings.showOriginalText) return text;
   return scriptureDisplaySettings.showSimplifiedText
       ? SimplifiedTraditionalConverter.toSimplified(text)
       : SimplifiedTraditionalConverter.toTraditionalDisplay(text);
+}
+
+/// 熱路徑上的正則表達式只構造一次。`new RegExp` 每次都會重新編譯模式,
+/// 而離線掃描與結果分組會在同一幀內成千上万次地呼叫這些輔助函式。
+final _whitespacePattern = RegExp(r'\s+');
+final _leadingParentheticalPattern = RegExp(r'^\s*（[^）]*）\s*');
+final _workIdPattern = RegExp(r'^([A-Z]+\d+)');
+final _fileWorkIdPattern = RegExp(r'^([A-Z]+)\d+n(\d+)');
+final _citationBrPattern = RegExp(r'<br\s*/?>', caseSensitive: false);
+final _htmlTagPattern = RegExp(r'<[^>]*>');
+final _citationLineheadPattern = RegExp(
+  r'^([A-Z]\d+)n(\d+)_p(\d{4})([a-z])(\d+)$',
+);
+
+String _cleanFodictDefinition(String definition) {
+  return definition
+      .replaceAll(_leadingParentheticalPattern, '')
+      .replaceAll('<SEEALSO>', '【參見】')
+      .replaceAll('</SEEALSO>', '】')
+      .trim();
+}
+
+String _fodictDefinitionSnippet(String definition, {int maxLength = 80}) {
+  final compact = _cleanFodictDefinition(
+    definition,
+  ).replaceAll(_whitespacePattern, ' ');
+  final runes = compact.runes.toList();
+  if (runes.length <= maxLength) return compact;
+  return '${String.fromCharCodes(runes.take(maxLength))}…';
 }
 
 InlineSpan _displayInlineSpan(InlineSpan span) {
@@ -1360,8 +1754,38 @@ class _DisplaySelectableText extends StatelessWidget {
   }
 }
 
-class CbetaSearchApp extends StatelessWidget {
+class CbetaSearchApp extends StatefulWidget {
   const CbetaSearchApp({super.key});
+
+  @override
+  State<CbetaSearchApp> createState() => _CbetaSearchAppState();
+}
+
+class _CbetaSearchAppState extends State<CbetaSearchApp>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    scriptureDisplaySettings.setPlatformDark(
+      WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+          Brightness.dark,
+    );
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangePlatformBrightness() {
+    scriptureDisplaySettings.setPlatformDark(
+      WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+          Brightness.dark,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1371,10 +1795,14 @@ class CbetaSearchApp extends StatelessWidget {
       animation: scriptureDisplaySettings,
       builder: (context, _) {
         final settings = scriptureDisplaySettings;
-        final colors = ColorScheme.fromSeed(seedColor: green).copyWith(
-          surface: settings.surfaceColor,
-          onSurface: settings.textColor,
-        );
+        final colors =
+            ColorScheme.fromSeed(
+              seedColor: green,
+              brightness: settings.isDark ? Brightness.dark : Brightness.light,
+            ).copyWith(
+              surface: settings.surfaceColor,
+              onSurface: settings.textColor,
+            );
         return _ScriptDisplayScope(
           notifier: settings,
           child: MaterialApp(
@@ -1392,6 +1820,30 @@ class CbetaSearchApp extends StatelessWidget {
                 backgroundColor: settings.surfaceColor,
                 foregroundColor: settings.textColor,
                 surfaceTintColor: Colors.transparent,
+              ),
+              cardTheme: CardThemeData(
+                color: settings.surfaceColor,
+                surfaceTintColor: Colors.transparent,
+                elevation: 0,
+                margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              ),
+              expansionTileTheme: ExpansionTileThemeData(
+                backgroundColor: settings.surfaceColor,
+                collapsedBackgroundColor: settings.surfaceColor,
+                iconColor: settings.textColor,
+                textColor: settings.textColor,
+              ),
+              drawerTheme: DrawerThemeData(
+                backgroundColor: settings.surfaceColor,
+              ),
+              navigationDrawerTheme: NavigationDrawerThemeData(
+                backgroundColor: settings.surfaceColor,
+                surfaceTintColor: Colors.transparent,
+              ),
+              snackBarTheme: SnackBarThemeData(
+                backgroundColor: settings.surfaceColor,
+                contentTextStyle: TextStyle(color: settings.textColor),
+                actionTextColor: green,
               ),
               inputDecorationTheme: const InputDecorationTheme(
                 hintStyle: TextStyle(color: Color(0xFF84918D)),
@@ -1440,10 +1892,44 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
   bool catalogSearchSucceeded = false;
   List<Map<String, dynamic>> catalogSearchResults = const [];
   bool showAllCatalogResults = false;
+  List<FodictEntry> dictionarySearchResults = const [];
+  bool isDictionarySearchPending = false;
+  String? dictionarySearchError;
+  bool showAllDictionaryResults = false;
+  bool catalogSectionExpanded = true;
+  bool dictionarySectionExpanded = true;
+  bool keywordSectionExpanded = true;
   int nextStart = 0;
   int totalFound = 0;
   int totalTermHits = 0;
   int requestToken = 0;
+
+  /// 分組結果的快取。分組本身是 O(命中數) 的列表重建,不該在每次
+  /// 全頁重建時重跑;簽名同時捕捉順序與每組命中數,因此就地排序
+  /// 或載入更多都會讓它失效。
+  List<ScriptureSearchResult>? _groupedResultsCache;
+  String _groupedResultsSignature = '';
+
+  /// 自動載入更多但沒有任何進展時停住,避免捲動事件每幀重複觸發掃描。
+  bool _scrollLoadMoreHalted = false;
+  int catalogVisibleCount = 1;
+  int dictionaryVisibleCount = 1;
+
+  /// 離線連續掃描動輒累積數百卷,正文分區一次只渲染這麼多部作品,
+  /// 全部建立成 Card 會讓路由轉場的每一幀都重畫整串卡片;
+  /// 捲動到底會自動再放行一頁,「載入更多結果」只在線上分批時出現。
+  int keywordVisibleGroups = _resultSectionPageSize;
+  int _keywordTotalGroups = 0;
+
+  /// 正文搜尋結果中當前展開的 work key，用於實現互斥展開。
+  String? _expandedWorkKey;
+
+  /// 主頁字典搜尋結果中當前展開的詞典 ID，用於實現互斥展開。
+  final Set<String> _expandedDictionaryIds = {};
+
+  /// 主頁字典搜尋結果中已展開的詞條（`dictionaryId:keyword`）。
+  final Set<String> _expandedHomepageDictionaryEntries = {};
+
   List<_ReaderBookmark> recentReadings = [];
   List<_ReaderBookmark> homeBookmarks = [];
   List<String> recentSearches = [];
@@ -1451,15 +1937,28 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
   bool showAllHomeBookmarks = false;
   bool aiMode = false;
   bool offlineSearchActive = false;
-  _OfflineSearchSession? offlineSearchSession;
+  OfflineScanSession? offlineSearchSession;
   int offlineScannedVolumes = 0;
   int offlineTotalVolumes = 0;
+
+  /// 連續掃描每一塊都會更新進度;先把這些更新合併,最多每 300 毫秒才寫回
+  /// state,否則掃描期間會不斷重建整個結果頁。
+  static const Duration _offlinePublishInterval = Duration(milliseconds: 300);
+  Timer? _offlinePublishTimer;
+  OfflineScanProgress? _pendingOfflineProgress;
+  ModalRoute<Object?>? _ownRoute;
+  bool _offlineScanPausedByUser = false;
+  bool _offlineScanPausedByLifecycle = false;
   AppUpdateInfo? _availableUpdate;
   String _currentVersion = '';
   bool _isUpdating = false;
   bool _awaitingInstallPermission = false;
   bool _installLaunched = false;
   String? _pendingInstallApkPath;
+  String? _fodictBaseDir;
+  Future<void>? _fodictBaseDirTask;
+  SearchSelection? _pendingSearchSelection;
+  final FodictService _fodictService = FodictService();
 
   @override
   void initState() {
@@ -1468,13 +1967,64 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
     scriptureDisplaySettings.addListener(_onDisplaySettingsChanged);
     resultsScrollController.addListener(_onResultsScroll);
     _loadHomeSections();
+    _fodictBaseDirTask = _loadFodictBaseDir();
     unawaited(_checkForAppUpdate());
+    // 經目查詢改走本地全量目錄,先暖好，第一次搜尋才不用等解析 4 MB JSON。
+    unawaited(CatalogCache.instance.load().catchError((_) {}));
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (!identical(route, _ownRoute)) {
+      _ownRoute?.secondaryAnimation?.removeListener(_onRouteTransitionChanged);
+      _ownRoute = route;
+      route?.secondaryAnimation?.addListener(_onRouteTransitionChanged);
+    }
+  }
+
+  /// 上方頁面完全蓋住或移開時,轉場已經結束,這時才補上留住的掃描進度。
+  void _onRouteTransitionChanged() {
+    final animation = _ownRoute?.secondaryAnimation;
+    if (animation == null || animation.status != AnimationStatus.dismissed) {
+      return;
+    }
+    if (_pendingOfflineProgress != null &&
+        !(_offlinePublishTimer?.isActive ?? false)) {
+      _flushOfflineScan();
+    }
+  }
+
+  Future<void> _loadFodictBaseDir() async {
+    try {
+      final baseDir = await FodictService.defaultBaseDir();
+      if (!mounted) return;
+      setState(() => _fodictBaseDir = baseDir);
+    } catch (_) {
+      // 沒有字典目錄時仍可搜尋，只是不統計 key 命中次數。
+    }
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) {
+      // 離開前台時先暫停離線掃描,回到前台再自動接上。
+      if (offlineSearchSession != null &&
+          !_offlineScanPausedByUser &&
+          !_offlineScanPausedByLifecycle) {
+        offlineSearchSession?.pause();
+        _offlineScanPausedByLifecycle = true;
+      }
       return;
+    }
+    if (_offlineScanPausedByLifecycle) {
+      _offlineScanPausedByLifecycle = false;
+      final session = offlineSearchSession;
+      if (session != null && !session.finished && !_offlineScanPausedByUser) {
+        session.resume();
+        setState(() {});
+      }
     }
     final apkPath = _pendingInstallApkPath;
     if (_awaitingInstallPermission) {
@@ -1822,20 +2372,43 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
   }
 
   void _onResultsScroll() {
-    if (resultsScrollController.hasClients &&
-        resultsScrollController.position.extentAfter < 400) {
-      loadMore();
+    if (!resultsScrollController.hasClients) return;
+    if (resultsScrollController.position.extentAfter >= 400) return;
+    // 離線掃描的結果是自己累積上來的,捲到底就再放行一頁作品卡片。
+    if (offlineSearchActive) {
+      _revealMoreKeywordGroups();
+      return;
     }
+    if (_scrollLoadMoreHalted) return;
+    loadMore(fromScroll: true);
+  }
+
+  void _revealMoreKeywordGroups() {
+    if (keywordVisibleGroups >= _keywordTotalGroups) return;
+    setState(() => keywordVisibleGroups += _resultSectionPageSize);
   }
 
   Future<void> search([String? value]) async {
     final raw = (value ?? searchController.text).trim();
     if (value != null) searchController.text = raw;
+    final pending = _pendingSearchSelection;
+    _pendingSearchSelection = null;
+    if (pending != null && (raw == pending.rawInput || raw == pending.query)) {
+      await _executeSearch(pending.rawInput, pending.query);
+      return;
+    }
     await _executeSearch(raw, null);
   }
 
   Future<void> _onSearchSelection(SearchSelection selection) async {
-    await _executeSearch(selection.rawInput, selection.query);
+    final raw = selection.rawInput.trim();
+    final pending = _pendingSearchSelection;
+    _pendingSearchSelection = null;
+    if (pending != null && (raw == pending.rawInput || raw == pending.query)) {
+      await _executeSearch(pending.rawInput, pending.query);
+      return;
+    }
+    await _executeSearch(raw, selection.query);
   }
 
   Future<void> _executeSearch(String rawInput, String? selectedQuery) async {
@@ -1848,7 +2421,14 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
         submittedQuery = '';
         results = const [];
         catalogSearchResults = const [];
+        dictionarySearchResults = const [];
+        isDictionarySearchPending = false;
+        dictionarySearchError = null;
         showAllCatalogResults = false;
+        showAllDictionaryResults = false;
+        catalogSectionExpanded = true;
+        dictionarySectionExpanded = true;
+        keywordSectionExpanded = true;
         errorMessage = null;
         isLoading = false;
         isKeywordSearchPending = false;
@@ -1900,7 +2480,14 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       } catch (_) {
         // 歷史記錄損壞時不影響搜尋。
       }
-      query = preferredQueryFor(rawInput, selections);
+      query = await resolveSearchQuery(
+        rawInput,
+        selections: selections,
+        keyMatchCounter: _fodictBaseDir == null
+            ? null
+            : (candidates) =>
+                  _fodictService.countKeyMatches(_fodictBaseDir!, candidates),
+      );
     }
     if (query.isEmpty) return;
     if (!mounted || token != requestToken) return;
@@ -1932,6 +2519,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
   }
 
   Future<void> _runKeywordSearch(String query, int token) async {
+    _stopOfflineScan();
     setState(() {
       submittedQuery = query;
       results = const [];
@@ -1943,8 +2531,15 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       catalogSearchSucceeded = false;
       catalogSearchResults = const [];
       showAllCatalogResults = false;
+      dictionarySearchResults = const [];
+      dictionarySearchError = null;
+      isDictionarySearchPending = true;
+      showAllDictionaryResults = false;
+      _expandedHomepageDictionaryEntries.clear();
+      catalogSectionExpanded = true;
+      dictionarySectionExpanded = true;
+      keywordSectionExpanded = true;
       offlineSearchActive = false;
-      offlineSearchSession = null;
       offlineScannedVolumes = 0;
       offlineTotalVolumes = 0;
       isLoading = true;
@@ -1955,6 +2550,10 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       nextStart = 0;
       totalFound = 0;
       totalTermHits = 0;
+      catalogVisibleCount = 1;
+      dictionaryVisibleCount = 1;
+      keywordVisibleGroups = _resultSectionPageSize;
+      _scrollLoadMoreHalted = false;
     });
     if (resultsScrollController.hasClients) {
       resultsScrollController.jumpTo(0);
@@ -1962,6 +2561,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
 
     unawaited(_loadKeywordResults(query, token));
     unawaited(_loadCatalogSearchResults(query, token));
+    unawaited(_loadDictionarySearchResults(query, token));
   }
 
   Future<void> _loadKeywordResults(String query, int token) async {
@@ -1969,8 +2569,25 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       if (kIsWeb) {
         throw Exception('CBETA 搜尋服務未開放網頁跨域存取；請使用桌面或行動版 App。');
       }
+      final cached = _FullTextSearchCache.get(query);
+      if (cached != null && mounted && token == requestToken) {
+        // 同一個字再查一次時先用上次的結果頂住畫面,回覆後再整批取代;
+        // 高频單字的 API 要等數秒,不該讓使用者對著轉圈發呆。
+        setState(() {
+          offlineSearchActive = false;
+          keywordSearchSucceeded = true;
+          isLoading = false;
+          results = cached.results;
+          nextStart = cached.nextStart;
+          totalFound = cached.totalFound;
+          totalTermHits = cached.totalTermHits;
+          hasMore = cached.hasMore;
+          _prioritizeSearchResultsByCatalog();
+        });
+      }
       final batch = await _searchAllInOne(query, start: 0);
       if (!mounted || token != requestToken) return;
+      _stopOfflineScan();
       setState(() {
         offlineSearchActive = false;
         keywordSearchSucceeded = true;
@@ -1979,7 +2596,8 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
         totalFound = batch.totalFound;
         totalTermHits = batch.totalTermHits;
         hasMore = batch.hasMore;
-        offlineSearchSession = null;
+        offlineScannedVolumes = 0;
+        offlineTotalVolumes = 0;
         _prioritizeSearchResultsByCatalog();
         _FullTextSearchCache.remember(
           query,
@@ -1992,8 +2610,18 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       });
     } catch (error) {
       if (!mounted || token != requestToken) return;
+      if (_isRequestTimeout(error)) {
+        // 伺服器只是慢,不代表沒有網路:保留畫面上已有的結果,讓使用者重試,
+        // 不要在第 20 秒悄悄切到本地掃描。
+        setState(
+          () => keywordSearchError =
+              '全文搜尋逾時（等待超過 ${_keywordSearchTimeout.inSeconds} 秒）：'
+              '常用單字伺服端要跑十幾秒以上，請稍後重試或改用較長的關鍵字。',
+        );
+        return;
+      }
       if (_isNetworkFailure(error)) {
-        await _applyOfflineKeywordResults(query, token, replace: true);
+        await _applyOfflineKeywordResults(query, token);
         return;
       }
       setState(() => keywordSearchError = '全文搜尋失敗：$error');
@@ -2013,36 +2641,25 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
 
   Future<void> _loadCatalogSearchResults(String query, int token) async {
     try {
-      if (kIsWeb) {
-        throw Exception('CBETA 經目查詢未開放網頁跨域存取；請使用桌面或行動版 App。');
-      }
-      final matches = await _fetchCatalogSearchResults(query);
+      // 經目分區完全離線回答：先用內建全量目錄的書名／編號查，查不到再看本地
+      // 已儲存經卷的經名。伺服器的 toc 端點不吃 rows/start，常見字彙要回傳
+      // 上千筆、七十秒左右，而且它是按朝代／譯者等元数据匹配，跟書名查詢
+      // 不是同一件事（作譯者与年代在「選擇佛經」側欄有各自分頁）。
+      var matches = await _searchLocalCatalog(query);
+      if (matches.isEmpty) matches = await _searchOfflineCatalog(query);
       if (!mounted || token != requestToken) return;
       setState(() {
         catalogSearchSucceeded = true;
+        catalogSearchError = null;
         catalogSearchResults = matches;
         _prioritizeSearchResultsByCatalog();
         isLoading =
             results.isEmpty && matches.isEmpty && isKeywordSearchPending;
         _updateCombinedSearchError();
       });
-    } catch (error) {
-      if (!mounted || token != requestToken) return;
-      if (_isNetworkFailure(error)) {
-        // 離線時改以本地已儲存經卷的經名／作譯者查詢經目。
-        final matches = await _searchOfflineCatalog(query);
-        if (!mounted || token != requestToken) return;
-        setState(() {
-          offlineSearchActive = true;
-          catalogSearchSucceeded = true;
-          catalogSearchError = null;
-          catalogSearchResults = matches;
-          _prioritizeSearchResultsByCatalog();
-        });
-        return;
-      }
-      setState(() => catalogSearchError = '經目查詢失敗：$error');
     } finally {
+      // 本地查不到也要清掉 pending：部分失敗的警告與 isLoading 都要等兩個
+      // pending 都結束後才會更新，卡在 true 會讓全文逾時完全不被顯示。
       if (mounted && token == requestToken) {
         setState(() {
           isCatalogSearchPending = false;
@@ -2056,32 +2673,131 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
     }
   }
 
-  Future<void> _applyOfflineKeywordResults(
-    String query,
-    int token, {
-    required bool replace,
-  }) async {
-    var session = offlineSearchSession;
-    if (replace || session == null || session.query != query) {
-      session = _OfflineSearchSession(query);
-      offlineSearchSession = session;
+  Future<void> _loadDictionarySearchResults(String query, int token) async {
+    try {
+      await _fodictBaseDirTask;
+      if (!mounted || token != requestToken) return;
+      final baseDir = _fodictBaseDir ?? '';
+      final variants = <String>[];
+      void add(String value) {
+        final text = value.trim();
+        if (text.isEmpty || variants.contains(text)) return;
+        variants.add(text);
+      }
+
+      add(query);
+      add(SimplifiedTraditionalConverter.toSimplified(query));
+      add(SimplifiedTraditionalConverter.toTraditionalDisplay(query));
+
+      var matches = const <FodictEntry>[];
+      for (final variant in variants) {
+        final found = await _fodictService.searchByKey(
+          baseDir,
+          variant,
+          maxResults: 100,
+        );
+        if (found.isEmpty) continue;
+        matches = found;
+        break;
+      }
+      if (!mounted || token != requestToken) return;
+      setState(() {
+        dictionarySearchError = null;
+        isDictionarySearchPending = false;
+        dictionarySearchResults = matches;
+      });
+    } catch (error) {
+      if (!mounted || token != requestToken) return;
+      setState(() {
+        dictionarySearchError = '字典搜尋失敗：$error';
+        isDictionarySearchPending = false;
+      });
     }
-    final batch = await session.nextPage();
+  }
+
+  Future<void> _applyOfflineKeywordResults(String query, int token) async {
+    _stopOfflineScan();
+    final session = OfflineScanSession(query);
+    offlineSearchSession = session;
+    session.progress.addListener(_onOfflineScanProgress);
+    await session.prepare();
+    // 先掃一塊讓首屏就有結果,其餘由會話自行連續推進,不再依賴捲動觸發。
+    await session.scanChunk();
     if (!mounted || token != requestToken) return;
+    _publishOfflineScan(session.current);
+    if (!_offlineScanPausedByUser && !_offlineScanPausedByLifecycle) {
+      session.start();
+    }
+  }
+
+  void _stopOfflineScan() {
+    _offlinePublishTimer?.cancel();
+    _offlinePublishTimer = null;
+    _pendingOfflineProgress = null;
+    _offlineScanPausedByUser = false;
+    _offlineScanPausedByLifecycle = false;
+    final session = offlineSearchSession;
+    offlineSearchSession = null;
+    if (session != null) {
+      session.progress.removeListener(_onOfflineScanProgress);
+      session.dispose();
+    }
+  }
+
+  void _toggleOfflineScan() {
+    final session = offlineSearchSession;
+    if (session == null || session.finished) return;
+    setState(() {
+      if (session.scanning) {
+        _offlineScanPausedByUser = true;
+        session.pause();
+      } else {
+        _offlineScanPausedByUser = false;
+        session.resume();
+      }
+    });
+  }
+
+  void _onOfflineScanProgress() {
+    final session = offlineSearchSession;
+    if (session == null) return;
+    _pendingOfflineProgress = session.current;
+    if (_offlinePublishTimer?.isActive ?? false) return;
+    _flushOfflineScan();
+    _offlinePublishTimer = Timer(_offlinePublishInterval, _flushOfflineScan);
+  }
+
+  void _flushOfflineScan() {
+    _offlinePublishTimer?.cancel();
+    _offlinePublishTimer = null;
+    final progress = _pendingOfflineProgress;
+    _pendingOfflineProgress = null;
+    if (progress == null) return;
+    _publishOfflineScan(progress);
+  }
+
+  void _publishOfflineScan(OfflineScanProgress progress) {
+    if (!mounted || offlineSearchSession == null) return;
+    // 被上一頁（例如閱讀器）蓋住時先留住進度,轉場結束再一次更新;
+    // 否則掃描會在路由動畫期間不斷重建底下的整串結果卡,點擊最後一卷就會卡死。
+    if (!(_ownRoute?.isCurrent ?? true)) {
+      _pendingOfflineProgress = progress;
+      return;
+    }
     setState(() {
       offlineSearchActive = true;
       keywordSearchSucceeded = true;
       keywordSearchError = null;
-      results = replace ? batch.results : [...results, ...batch.results];
-      nextStart = batch.nextStart;
-      totalFound = batch.totalFound;
-      totalTermHits = batch.totalTermHits;
-      hasMore = batch.hasMore;
-      offlineScannedVolumes = batch.scannedVolumes;
-      offlineTotalVolumes = batch.totalVolumes;
+      results = progress.results;
+      nextStart = progress.results.length;
+      totalFound = progress.results.length;
+      totalTermHits = progress.termHits;
+      hasMore = !progress.finished;
+      offlineScannedVolumes = progress.scannedVolumes;
+      offlineTotalVolumes = progress.totalVolumes;
       _prioritizeSearchResultsByCatalog();
       _FullTextSearchCache.remember(
-        query,
+        submittedQuery,
         results: results,
         nextStart: nextStart,
         totalFound: totalFound,
@@ -2121,11 +2837,21 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       final work = _catalogResultWorkId(catalogSearchResults[index]);
       if (work.isNotEmpty) priority.putIfAbsent(work, () => index);
     }
-    results.sort((left, right) {
-      final leftRank = priority[_searchResultWorkId(left)] ?? priority.length;
-      final rightRank = priority[_searchResultWorkId(right)] ?? priority.length;
-      return leftRank.compareTo(rightRank);
+    final fallback = priority.length;
+    // work id 每筆只解析一次,而不是每次比較都解析一次。
+    final keyed = [
+      for (var index = 0; index < results.length; index++)
+        (
+          result: results[index],
+          rank: priority[_searchResultWorkId(results[index])] ?? fallback,
+          index: index,
+        ),
+    ];
+    keyed.sort((left, right) {
+      final byRank = left.rank.compareTo(right.rank);
+      return byRank != 0 ? byRank : left.index.compareTo(right.index);
     });
+    results = [for (final item in keyed) item.result];
   }
 
   Future<void> _openGotoSearch(String input, int token) async {
@@ -2166,27 +2892,28 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
     }
   }
 
-  Future<void> loadMore() async {
+  Future<void> loadMore({bool fromScroll = false}) async {
     if (isLoadingMore || !hasMore) return;
+    if (fromScroll && _scrollLoadMoreHalted) return;
+    // 離線掃描自己會一塊一塊推進,不需要捲動或按鈕再觸發。
+    if (offlineSearchActive) return;
+    // 手動按下「載入更多」永遠保留重試能力。
+    if (!fromScroll) _scrollLoadMoreHalted = false;
     final token = requestToken;
     setState(() {
       isLoadingMore = true;
       loadMoreError = null;
     });
     try {
-      final session = offlineSearchSession;
-      final batch = offlineSearchActive && session != null
-          ? await session.nextPage()
-          : await _searchAllInOne(submittedQuery, start: nextStart);
+      final batch = await _searchAllInOne(submittedQuery, start: nextStart);
       if (!mounted || token != requestToken) return;
+      _scrollLoadMoreHalted = fromScroll && batch.results.isEmpty;
       setState(() {
         results = [...results, ...batch.results];
         nextStart = batch.nextStart;
         totalFound = batch.totalFound;
         totalTermHits = batch.totalTermHits;
         hasMore = batch.hasMore;
-        offlineScannedVolumes = batch.scannedVolumes;
-        offlineTotalVolumes = batch.totalVolumes;
         isLoadingMore = false;
         _prioritizeSearchResultsByCatalog();
         _FullTextSearchCache.remember(
@@ -2200,8 +2927,17 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       });
     } catch (error) {
       if (!mounted || token != requestToken) return;
+      if (_isRequestTimeout(error)) {
+        // 已經有結果了,下一批慢就只是慢,不切換到離線模式。
+        setState(() {
+          isLoadingMore = false;
+          loadMoreError =
+              '載入更多結果逾時（等待超過 ${_keywordSearchTimeout.inSeconds} 秒），請再按一次。';
+        });
+        return;
+      }
       if (!offlineSearchActive && _isNetworkFailure(error)) {
-        await _applyOfflineKeywordResults(submittedQuery, token, replace: true);
+        await _applyOfflineKeywordResults(submittedQuery, token);
         if (mounted && token == requestToken) {
           setState(() => isLoadingMore = false);
         }
@@ -2217,18 +2953,25 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
   void clearSearch() {
     FocusScope.of(context).unfocus();
     searchController.clear();
+    _stopOfflineScan();
     setState(() {
       submittedQuery = '';
       results = const [];
       catalogSearchResults = const [];
       showAllCatalogResults = false;
+      dictionarySearchResults = const [];
+      isDictionarySearchPending = false;
+      dictionarySearchError = null;
+      showAllDictionaryResults = false;
+      catalogSectionExpanded = true;
+      dictionarySectionExpanded = true;
+      keywordSectionExpanded = true;
       errorMessage = null;
       keywordSearchError = null;
       catalogSearchError = null;
       keywordSearchSucceeded = false;
       catalogSearchSucceeded = false;
       offlineSearchActive = false;
-      offlineSearchSession = null;
       offlineScannedVolumes = 0;
       offlineTotalVolumes = 0;
       isLoading = false;
@@ -2240,6 +2983,10 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       nextStart = 0;
       totalFound = 0;
       totalTermHits = 0;
+      catalogVisibleCount = 1;
+      dictionaryVisibleCount = 1;
+      keywordVisibleGroups = _resultSectionPageSize;
+      _scrollLoadMoreHalted = false;
       requestToken++;
     });
   }
@@ -2251,6 +2998,8 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     scriptureDisplaySettings.removeListener(_onDisplaySettingsChanged);
+    _ownRoute?.secondaryAnimation?.removeListener(_onRouteTransitionChanged);
+    _stopOfflineScan();
     searchController.dispose();
     resultsScrollController
       ..removeListener(_onResultsScroll)
@@ -2275,23 +3024,22 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
             onPressed: _openWorkPicker,
             icon: const Icon(Icons.menu_rounded),
           ),
-          actions: const [
+          actions: [
             _ScriptDisplayButton(),
-            _SettingsButton(),
+            _SettingsButton(
+              availableUpdate: _availableUpdate,
+              onUpdate: _promptForAppUpdate,
+            ),
             SizedBox(width: 8),
           ],
           title: _HomeBrand(
             onTap: submittedQuery.isEmpty ? () {} : clearSearch,
-            showUpdateButton: _availableUpdate != null,
-            onUpdate: _promptForAppUpdate,
           ),
         ),
         body: SafeArea(
           child: CustomScrollView(
             controller: resultsScrollController,
             slivers: [
-              if (submittedQuery.isEmpty)
-                SliverToBoxAdapter(child: _buildWelcome(context)),
               SliverToBoxAdapter(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
@@ -2302,12 +3050,25 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
                     onClear: clearSearch,
                     aiMode: aiMode,
                     onToggleAiMode: () => setState(() => aiMode = !aiMode),
+                    onSelectionChanged: (selection) =>
+                        _pendingSearchSelection = selection,
+                    keyMatchCounter: aiMode || _fodictBaseDir == null
+                        ? null
+                        : (candidates) => _fodictService.countKeyMatches(
+                            _fodictBaseDir!,
+                            candidates,
+                          ),
+                    countScope: _fodictBaseDir,
                     anchorKey: searchFieldAnchorKey,
                   ),
                 ),
               ),
               if (submittedQuery.isEmpty)
+                SliverToBoxAdapter(child: _buildWelcome(context)),
+              if (submittedQuery.isEmpty)
                 SliverToBoxAdapter(child: _buildHomeSections(context)),
+              if (submittedQuery.isEmpty)
+                SliverToBoxAdapter(child: _buildFeedbackButton(context)),
               ..._buildResultSlivers(context),
             ],
           ),
@@ -2451,6 +3212,31 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
     );
   }
 
+  Widget _buildFeedbackButton(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 32),
+      child: Center(
+        child: TextButton.icon(
+          onPressed: () => showFeedbackDialog(context),
+          icon: Icon(
+            Icons.feedback_outlined,
+            color: theme.colorScheme.primary,
+            size: 20,
+          ),
+          label: Text(
+            '告訴我們你的想法',
+            style: TextStyle(
+              color: theme.colorScheme.primary,
+              fontSize: 15,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildWelcome(BuildContext context) => Padding(
     padding: const EdgeInsets.fromLTRB(24, 30, 24, 0),
     child: Column(
@@ -2491,10 +3277,6 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
             context,
           ).textTheme.bodySmall?.copyWith(color: const Color(0xFF687671)),
         ),
-        TextButton(
-          onPressed: () => _showAbout(context),
-          child: const Text('關於我們'),
-        ),
       ],
     ),
   );
@@ -2524,102 +3306,503 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       ];
     }
 
-    final catalogResultsToShow = showAllCatalogResults
-        ? catalogSearchResults
-        : catalogSearchResults.take(2).toList();
     final partialWarning = _partialSearchWarning();
-    final partialWarningWidgets = partialWarning == null
-        ? const <Widget>[]
-        : <Widget>[
-            Padding(
-              padding: const EdgeInsets.only(bottom: 12),
-              child: Text(
-                partialWarning,
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.error,
+    final slivers = <Widget>[
+      SliverPadding(
+        padding: const EdgeInsets.fromLTRB(24, 4, 24, 0),
+        sliver: SliverList(
+          delegate: SliverChildListDelegate([
+            if (offlineSearchActive)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(
+                  '目前為離線模式，顯示本地經目與經文',
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF687671),
+                  ),
+                ),
+              ),
+            if (partialWarning != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(
+                  partialWarning,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.error,
+                  ),
+                ),
+              ),
+            _buildResultSection(
+              context,
+              title: '經目搜尋結果（本地經目）',
+              count: catalogSearchResults.length,
+              expanded: catalogSectionExpanded,
+              onToggle: () => setState(() {
+                if (!catalogSectionExpanded) {
+                  dictionarySectionExpanded = false;
+                  keywordSectionExpanded = false;
+                }
+                catalogSectionExpanded = !catalogSectionExpanded;
+              }),
+              pending: isCatalogSearchPending,
+              content: _buildCatalogSectionContent(context),
+            ),
+          ]),
+        ),
+      ),
+    ];
+
+    // 字典分区：使用 sticky header
+    slivers.addAll(_buildDictionarySectionSlivers(context));
+
+    // 关键词分区：使用 sticky header
+    slivers.addAll(_buildKeywordSectionSlivers(context));
+
+    return slivers;
+  }
+
+  Widget _buildResultSection(
+    BuildContext context, {
+    required String title,
+    required int count,
+    required bool expanded,
+    required VoidCallback onToggle,
+    required bool pending,
+    required Widget content,
+  }) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Card(
+        margin: EdgeInsets.zero,
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            InkWell(
+              onTap: onToggle,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                child: Row(
+                  children: [
+                    Icon(
+                      expanded
+                          ? Icons.expand_less_rounded
+                          : Icons.expand_more_rounded,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _displayText(title, context),
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      pending ? '搜尋中…' : '$count 筆',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF687671),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
-          ];
-    if (results.isEmpty && catalogSearchResults.isEmpty) {
-      return [
+            if (expanded) ...[
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
+                child: content,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSectionMessage(String message) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+      child: Text(
+        message,
+        style: Theme.of(
+          context,
+        ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF687671)),
+      ),
+    );
+  }
+
+  Widget _buildCatalogSectionContent(BuildContext context) {
+    if (isCatalogSearchPending && catalogSearchResults.isEmpty) {
+      return _buildSectionMessage(_displayText('經目搜尋中…', context));
+    }
+    if (catalogSearchResults.isEmpty) {
+      return _buildSectionMessage(
+        catalogSearchError ??
+            _displayText('本地經目沒有書名含「$submittedQuery」的作品', context),
+      );
+    }
+    final visibleCount = showAllCatalogResults ? catalogVisibleCount : 1;
+    final catalogResultsToShow = catalogSearchResults
+        .take(visibleCount)
+        .toList();
+    final remaining = catalogSearchResults.length - catalogResultsToShow.length;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final match in catalogResultsToShow)
+          _CatalogSearchMatch(
+            result: match,
+            onTap: () => _openCatalogSearchResult(match),
+          ),
+        if (catalogSearchResults.length > 1)
+          Center(
+            child: TextButton(
+              onPressed: () => setState(() {
+                if (!showAllCatalogResults) {
+                  showAllCatalogResults = true;
+                  catalogVisibleCount = _resultSectionPageSize;
+                } else if (remaining > 0) {
+                  catalogVisibleCount += _resultSectionPageSize;
+                } else {
+                  showAllCatalogResults = false;
+                  catalogVisibleCount = 1;
+                }
+              }),
+              child: Text(
+                _displayText(
+                  !showAllCatalogResults
+                      ? '顯示更多'
+                      : remaining > 0
+                      ? '再顯示更多（剩餘 $remaining 筆）'
+                      : '收起',
+                  context,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  List<Widget> _buildDictionarySectionSlivers(BuildContext context) {
+    final slivers = <Widget>[];
+    final theme = Theme.of(context);
+
+    // 字典分区的标题
+    slivers.add(
+      SliverToBoxAdapter(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+          child: Card(
+            margin: EdgeInsets.zero,
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: () => setState(() {
+                if (!dictionarySectionExpanded) {
+                  catalogSectionExpanded = false;
+                  keywordSectionExpanded = false;
+                }
+                dictionarySectionExpanded = !dictionarySectionExpanded;
+              }),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                child: Row(
+                  children: [
+                    Icon(
+                      dictionarySectionExpanded
+                          ? Icons.expand_less_rounded
+                          : Icons.expand_more_rounded,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _displayText('字典搜尋結果', context),
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      isDictionarySearchPending
+                          ? '搜尋中…'
+                          : '${dictionarySearchResults.length} 筆',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF687671),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    // 字典分区的内容
+    if (dictionarySectionExpanded) {
+      slivers.addAll(_buildDictionaryContentSlivers(context));
+    }
+
+    return slivers;
+  }
+
+  List<Widget> _buildDictionaryContentSlivers(BuildContext context) {
+    final slivers = <Widget>[];
+
+    if (isDictionarySearchPending && dictionarySearchResults.isEmpty) {
+      slivers.add(
         SliverToBoxAdapter(
           child: Padding(
             padding: const EdgeInsets.all(24),
-            child: _NoResults(
-              message: offlineSearchActive && hasMore
-                  ? '正在掃描本地經卷…\n'
-                        '已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷，'
-                        '目前找到 $totalFound 筆'
-                  : offlineSearchActive
-                  ? '離線模式下，本地已儲存的經目與經文中找不到「$submittedQuery」'
-                  : '找不到「$submittedQuery」相關經文'
-                        '${partialWarning == null ? '' : '\n$partialWarning'}',
-            ),
+            child: _buildSectionMessage(_displayText('字典搜尋中…', context)),
           ),
         ),
-        if (offlineSearchActive && hasMore)
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
-              child: Center(
-                child: FilledButton.tonalIcon(
-                  onPressed: isLoadingMore ? null : loadMore,
-                  icon: isLoadingMore
-                      ? const SizedBox.square(
-                          dimension: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.expand_more_rounded),
-                  label: Text(isLoadingMore ? '掃描中…' : '繼續搜尋本地經卷'),
+      );
+      return slivers;
+    }
+
+    if (dictionarySearchResults.isEmpty) {
+      slivers.add(
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+            child: Card(
+              margin: EdgeInsets.zero,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  dictionarySearchError ?? _displayText('沒有字典結果', context),
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF687671),
+                  ),
                 ),
               ),
             ),
           ),
-      ];
+        ),
+      );
+      return slivers;
     }
 
-    final children = <Widget>[
-      if (offlineSearchActive)
-        Padding(
-          padding: const EdgeInsets.only(bottom: 12),
-          child: Text(
-            '目前為離線模式，顯示本地已儲存的經目與經文',
-            style: Theme.of(
-              context,
-            ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF687671)),
+    // 按词典分组
+    final groups = <String, List<FodictEntry>>{};
+    for (final entry in dictionarySearchResults) {
+      groups.putIfAbsent(entry.dictionaryId, () => []).add(entry);
+    }
+    final dictIds = groups.keys.toList()..sort((a, b) => a.compareTo(b));
+
+    final visibleCount = showAllDictionaryResults ? dictionaryVisibleCount : 1;
+    final visibleDictIds = dictIds.take(visibleCount).toList();
+
+    // 为每个词典创建 sticky header
+    for (final dictId in visibleDictIds) {
+      final entries = groups[dictId]!;
+      slivers.add(
+        _HomepageDictionaryStickyHeader(
+          dictId: dictId,
+          entries: entries,
+          dictName: entries.first.dictionaryName,
+          isExpanded: _expandedDictionaryIds.contains(dictId),
+          onExpansionChanged: (expanded) {
+            setState(() {
+              if (expanded) {
+                _expandedDictionaryIds.add(dictId);
+              } else {
+                _expandedDictionaryIds.remove(dictId);
+              }
+            });
+          },
+          onEntryTap: (entry) {
+            final entryKey = '${entry.dictionaryId}:${entry.keyword}';
+            setState(() {
+              if (!_expandedHomepageDictionaryEntries.add(entryKey)) {
+                _expandedHomepageDictionaryEntries.remove(entryKey);
+              }
+            });
+          },
+          expandedEntryKeys: _expandedHomepageDictionaryEntries,
+          context: context,
+        ),
+      );
+    }
+
+    // 显示更多按钮
+    if (dictIds.length > 1) {
+      final remaining = dictIds.length - visibleDictIds.length;
+      slivers.add(
+        SliverToBoxAdapter(
+          child: Center(
+            child: TextButton(
+              onPressed: () => setState(() {
+                if (!showAllDictionaryResults) {
+                  showAllDictionaryResults = true;
+                  dictionaryVisibleCount = _resultSectionPageSize;
+                } else if (remaining > 0) {
+                  dictionaryVisibleCount += _resultSectionPageSize;
+                } else {
+                  showAllDictionaryResults = false;
+                  dictionaryVisibleCount = 1;
+                }
+              }),
+              child: Text(
+                _displayText(
+                  !showAllDictionaryResults
+                      ? '顯示更多字典結果'
+                      : remaining > 0
+                      ? '再顯示更多字典結果（剩餘 $remaining 筆）'
+                      : '收起字典結果',
+                  context,
+                ),
+              ),
+            ),
           ),
         ),
-      ...partialWarningWidgets,
-      for (final match in catalogResultsToShow)
-        _CatalogSearchMatch(
-          result: match,
-          onTap: () => _openCatalogSearchResult(match),
-        ),
-      if (catalogSearchResults.length > 2)
-        Center(
-          child: TextButton(
-            onPressed: () =>
-                setState(() => showAllCatalogResults = !showAllCatalogResults),
-            child: Text(showAllCatalogResults ? '收起' : '顯示更多'),
+      );
+    }
+
+    return slivers;
+  }
+
+  List<ScriptureSearchResult> _groupedSearchResults() {
+    final signature = StringBuffer();
+    for (final result in results) {
+      signature
+        ..write(_resultWorkKey(result))
+        ..write('#')
+        ..write(result.passages.length)
+        ..write('|');
+    }
+    final text = signature.toString();
+    final cached = _groupedResultsCache;
+    if (cached != null && text == _groupedResultsSignature) return cached;
+    final grouped = _groupResultsByWork(results);
+    _groupedResultsCache = grouped;
+    _groupedResultsSignature = text;
+    return grouped;
+  }
+
+  List<Widget> _buildKeywordSectionSlivers(BuildContext context) {
+    final slivers = <Widget>[];
+    final theme = Theme.of(context);
+
+    // 关键词分区的标题
+    slivers.add(
+      SliverToBoxAdapter(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+          child: Card(
+            margin: EdgeInsets.zero,
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: () => setState(() {
+                if (!keywordSectionExpanded) {
+                  catalogSectionExpanded = false;
+                  dictionarySectionExpanded = false;
+                }
+                keywordSectionExpanded = !keywordSectionExpanded;
+              }),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                child: Row(
+                  children: [
+                    Icon(
+                      keywordSectionExpanded
+                          ? Icons.expand_less_rounded
+                          : Icons.expand_more_rounded,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _displayText('正文搜尋結果', context),
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      isKeywordSearchPending ? '搜尋中…' : '$totalFound 筆',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF687671),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ),
         ),
-      if (results.isEmpty)
-        Padding(
-          padding: const EdgeInsets.only(bottom: 12),
-          child: Text(
-            offlineSearchActive && hasMore
-                ? '「$submittedQuery」已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷，'
-                      '尚在搜尋本地經文…'
-                : '「$submittedQuery」經目查詢：找到 ${catalogSearchResults.length} 部作品',
-            style: Theme.of(
-              context,
-            ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF687671)),
+      ),
+    );
+
+    // 关键词分区的内容
+    if (keywordSectionExpanded) {
+      slivers.addAll(_buildKeywordContentSlivers(context));
+    }
+
+    return slivers;
+  }
+
+  List<Widget> _buildKeywordContentSlivers(BuildContext context) {
+    final slivers = <Widget>[];
+
+    if (isKeywordSearchPending && results.isEmpty) {
+      slivers.add(
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: _buildSectionMessage(_displayText('關鍵字搜尋中…', context)),
           ),
-        )
-      else
-        Padding(
-          padding: const EdgeInsets.only(bottom: 12),
+        ),
+      );
+      return slivers;
+    }
+
+    if (results.isEmpty) {
+      if (keywordSearchError == null && !(offlineSearchActive && hasMore)) {
+        slivers.add(
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+              child: Card(
+                margin: EdgeInsets.zero,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    offlineSearchActive
+                        ? '離線模式下，本地已儲存的經目與經文中找不到「$submittedQuery」'
+                        : '找不到「$submittedQuery」相關經文',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: const Color(0xFF687671),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      }
+      if (offlineSearchActive) {
+        slivers.add(
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+              child: _buildOfflineScanControls(),
+            ),
+          ),
+        );
+      }
+      return slivers;
+    }
+
+    // 搜索结果统计
+    slivers.add(
+      SliverToBoxAdapter(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
           child: Text(
             offlineSearchActive && hasMore
                 ? '「$submittedQuery」離線搜尋：已找到 $totalFound 筆，'
@@ -2630,10 +3813,33 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
             ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF687671)),
           ),
         ),
-      for (var index = 0; index < results.length; index++) ...[
-        _SearchResultCard(
-          result: results[index],
+      ),
+    );
+
+    // Work 列表，每个 work 使用 sticky header
+    final groupedResults = _groupedSearchResults();
+    _keywordTotalGroups = groupedResults.length;
+    final visibleGroups = offlineSearchActive
+        ? groupedResults.take(keywordVisibleGroups).toList()
+        : groupedResults;
+    final hiddenGroups = groupedResults.length - visibleGroups.length;
+
+    for (var index = 0; index < visibleGroups.length; index++) {
+      final result = visibleGroups[index];
+      final workKey = _resultWorkKey(result);
+      slivers.add(
+        _WorkStickyHeader(
+          key: ValueKey('work:$workKey:$index'),
+          result: result,
           query: submittedQuery,
+          workKey: workKey,
+          isExpanded: _expandedWorkKey == workKey,
+          scrollController: resultsScrollController,
+          onExpansionChanged: (expanded) {
+            setState(() {
+              _expandedWorkKey = expanded ? workKey : null;
+            });
+          },
           onPassageTap: (passage, passages) {
             Navigator.of(context)
                 .push<void>(
@@ -2649,43 +3855,127 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
                 .then((_) => _loadHomeSections());
           },
         ),
-        if (index != results.length - 1)
-          const Divider(height: 1, indent: 16, endIndent: 16),
-      ],
-      if (loadMoreError != null) ...[
-        const SizedBox(height: 12),
-        Text(loadMoreError!, textAlign: TextAlign.center),
-      ],
-      if (hasMore) ...[
-        const SizedBox(height: 16),
-        Center(
-          child: FilledButton.tonalIcon(
-            onPressed: isLoadingMore ? null : loadMore,
-            icon: isLoadingMore
-                ? const SizedBox.square(
-                    dimension: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.expand_more_rounded),
-            label: Text(isLoadingMore ? '載入中…' : '載入更多結果'),
+      );
+    }
+
+    // 离线模式的"显示更多"按钮
+    if (offlineSearchActive &&
+        (hiddenGroups > 0 || keywordVisibleGroups > _resultSectionPageSize)) {
+      slivers.add(
+        SliverToBoxAdapter(
+          child: Center(
+            child: TextButton(
+              onPressed: () => setState(() {
+                if (hiddenGroups > 0) {
+                  keywordVisibleGroups += _resultSectionPageSize;
+                } else {
+                  keywordVisibleGroups = _resultSectionPageSize;
+                }
+              }),
+              child: Text(
+                hiddenGroups > 0 ? '顯示更多作品（剩餘 $hiddenGroups 部）' : '收合多顯示的作品',
+              ),
+            ),
           ),
         ),
-      ] else if (results.isNotEmpty) ...[
-        const SizedBox(height: 20),
-        Text('已載入全部 $totalFound 筆結果', textAlign: TextAlign.center),
-      ],
-      if (isKeywordSearchPending || isCatalogSearchPending)
-        const Padding(
-          padding: EdgeInsets.symmetric(vertical: 12),
-          child: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    // loadMore 错误提示
+    if (loadMoreError != null) {
+      slivers.add(
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+            child: Text(loadMoreError!, textAlign: TextAlign.center),
+          ),
         ),
-    ];
-    return [
-      SliverPadding(
-        padding: const EdgeInsets.fromLTRB(24, 4, 24, 32),
-        sliver: SliverList(delegate: SliverChildListDelegate(children)),
+      );
+    }
+
+    // "载入更多结果"按钮
+    if (hasMore && !offlineSearchActive) {
+      slivers.add(
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 16, 24, 0),
+            child: Center(
+              child: FilledButton.tonalIcon(
+                onPressed: isLoadingMore ? null : loadMore,
+                icon: isLoadingMore
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.expand_more_rounded),
+                label: Text(isLoadingMore ? '載入中…' : '載入更多結果'),
+              ),
+            ),
+          ),
+        ),
+      );
+    } else if (!hasMore && !offlineSearchActive) {
+      slivers.add(
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 20, 24, 0),
+            child: Text('已載入全部 $totalFound 筆結果', textAlign: TextAlign.center),
+          ),
+        ),
+      );
+    }
+
+    // 离线扫描控制
+    if (offlineSearchActive) {
+      slivers.add(
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+            child: _buildOfflineScanControls(),
+          ),
+        ),
+      );
+    }
+
+    // 底部间距
+    slivers.add(SliverToBoxAdapter(child: const SizedBox(height: 32)));
+
+    return slivers;
+  }
+
+  Widget _buildOfflineScanControls() {
+    final session = offlineSearchSession;
+    final scanning = session?.scanning ?? false;
+    final finished = session?.finished ?? true;
+    if (finished) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            scanning
+                ? '離線掃描中…已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷，目前找到 $totalFound 筆'
+                : '已暫停掃描（已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷）',
+            textAlign: TextAlign.center,
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: const Color(0xFF687671)),
+          ),
+          const SizedBox(height: 8),
+          Center(
+            child: OutlinedButton.icon(
+              onPressed: _toggleOfflineScan,
+              icon: Icon(
+                scanning ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                size: 18,
+              ),
+              label: Text(scanning ? '暫停掃描' : '繼續掃描'),
+            ),
+          ),
+        ],
       ),
-    ];
+    );
   }
 }
 
@@ -2762,17 +4052,10 @@ class _HomeHistorySection extends StatelessWidget {
 }
 
 class _HomeBrand extends StatelessWidget {
-  const _HomeBrand({
-    required this.onTap,
-    this.color,
-    this.showUpdateButton = false,
-    this.onUpdate,
-  });
+  const _HomeBrand({required this.onTap, this.color});
 
   final VoidCallback onTap;
   final Color? color;
-  final bool showUpdateButton;
-  final VoidCallback? onUpdate;
 
   @override
   Widget build(BuildContext context) => GestureDetector(
@@ -2799,24 +4082,6 @@ class _HomeBrand extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
             ),
           ),
-          if (showUpdateButton && onUpdate != null) ...[
-            const SizedBox(width: 8),
-            TextButton(
-              onPressed: onUpdate,
-              style: TextButton.styleFrom(
-                minimumSize: const Size(0, 28),
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                backgroundColor: const Color(0xFF176B67),
-                foregroundColor: Colors.white,
-                textStyle: const TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              child: const Text('更新'),
-            ),
-          ],
         ],
       ),
     ),
@@ -2859,6 +4124,9 @@ class _SearchField extends StatelessWidget {
     required this.onClear,
     required this.aiMode,
     required this.onToggleAiMode,
+    this.onSelectionChanged,
+    this.keyMatchCounter,
+    this.countScope,
     this.anchorKey,
   });
 
@@ -2868,6 +4136,9 @@ class _SearchField extends StatelessWidget {
   final VoidCallback onClear;
   final bool aiMode;
   final VoidCallback onToggleAiMode;
+  final ValueChanged<SearchSelection?>? onSelectionChanged;
+  final KeyMatchCounter? keyMatchCounter;
+  final String? countScope;
   final GlobalKey? anchorKey;
 
   @override
@@ -2899,6 +4170,9 @@ class _SearchField extends StatelessWidget {
                 recentSearches: recentSearches,
                 showCandidates: !aiMode,
                 onSearch: onSearch,
+                onSelectionChanged: onSelectionChanged,
+                keyMatchCounter: keyMatchCounter,
+                countScope: countScope,
                 textBuilder: (text) => _displayText(text, context),
                 displayListenable: scriptureDisplaySettings,
                 widthAnchorKey: anchorKey,
@@ -3071,6 +4345,358 @@ class _CatalogSearchMatch extends StatelessWidget {
   }
 }
 
+String _resultWorkKey(ScriptureSearchResult result) {
+  final work = result.passages.isEmpty
+      ? ''
+      : (result.passages.first.work ?? '');
+  return work.isNotEmpty ? work : result.title;
+}
+
+/// 把同一部作品（work）跨卷的搜尋結果合併成一筆，讓結果只以作品為一級分組。
+List<ScriptureSearchResult> _groupResultsByWork(
+  List<ScriptureSearchResult> results,
+) {
+  final order = <String>[];
+  final titles = <String, String>{};
+  final descriptions = <String, String>{};
+  final passages = <String, List<ScripturePassage>>{};
+  for (final result in results) {
+    final key = _resultWorkKey(result);
+    final bucket = passages[key];
+    if (bucket == null) {
+      order.add(key);
+      passages[key] = List.of(result.passages);
+      titles[key] = result.title;
+      descriptions[key] = result.description;
+      continue;
+    }
+    // 直接追加,不要再重建整個 passages 列表（原本是 O(n²) 複製）。
+    bucket.addAll(result.passages);
+  }
+  return [
+    for (final key in order)
+      ScriptureSearchResult(
+        title: titles[key]!,
+        description: descriptions[key]!,
+        passages: passages[key]!,
+      ),
+  ];
+}
+
+class _WorkStickyHeader extends StatefulWidget {
+  const _WorkStickyHeader({
+    super.key,
+    required this.result,
+    required this.query,
+    required this.onPassageTap,
+    required this.workKey,
+    required this.isExpanded,
+    required this.onExpansionChanged,
+    required this.scrollController,
+  });
+
+  final ScriptureSearchResult result;
+  final String query;
+  final void Function(ScripturePassage passage, List<ScripturePassage> passages)
+  onPassageTap;
+  final String workKey;
+  final bool isExpanded;
+  final ValueChanged<bool> onExpansionChanged;
+  final ScrollController scrollController;
+
+  @override
+  State<_WorkStickyHeader> createState() => _WorkStickyHeaderState();
+}
+
+class _WorkStickyHeaderState extends State<_WorkStickyHeader>
+    with AutomaticKeepAliveClientMixin {
+  bool _childrenBuilt = false;
+  final _headerKey = GlobalKey();
+
+  @override
+  bool get wantKeepAlive => widget.isExpanded;
+
+  @override
+  void didUpdateWidget(_WorkStickyHeader oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isExpanded && !_childrenBuilt) {
+      setState(() => _childrenBuilt = true);
+    }
+    // 当从展开变为折叠时，滚动到 header 位置
+    if (oldWidget.isExpanded && !widget.isExpanded) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scrollToHeader();
+      });
+    }
+  }
+
+  void _scrollToHeader() {
+    final context = _headerKey.currentContext;
+    if (context != null) {
+      Scrollable.ensureVisible(
+        context,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeInOut,
+        alignment: 0.0,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+
+    return SliverMainAxisGroup(
+      slivers: [
+        SliverPersistentHeader(
+          pinned: true,
+          delegate: _WorkStickyHeaderDelegate(
+            headerKey: _headerKey,
+            title: widget.result.title,
+            description: widget.result.description,
+            isExpanded: widget.isExpanded,
+            onToggle: () {
+              final newExpanded = !widget.isExpanded;
+              widget.onExpansionChanged(newExpanded);
+              if (newExpanded && !_childrenBuilt) {
+                setState(() => _childrenBuilt = true);
+              }
+            },
+          ),
+        ),
+        if (widget.isExpanded && _childrenBuilt)
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+              child: Card(
+                margin: EdgeInsets.zero,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: _buildChildren(),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  List<Widget> _buildChildren() {
+    final groups = <String, List<ScripturePassage>>{};
+    final order = <String>[];
+    for (final passage in widget.result.passages) {
+      final juan = passage.juan ?? '';
+      if (!groups.containsKey(juan)) {
+        groups[juan] = <ScripturePassage>[];
+        order.add(juan);
+      }
+      groups[juan]!.add(passage);
+    }
+    return [
+      for (final juan in order)
+        _JuanResultGroup(
+          juan: juan,
+          passages: groups[juan]!,
+          allPassages: widget.result.passages,
+          query: widget.query,
+          onPassageTap: widget.onPassageTap,
+        ),
+    ];
+  }
+}
+
+class _WorkStickyHeaderDelegate extends SliverPersistentHeaderDelegate {
+  _WorkStickyHeaderDelegate({
+    required this.headerKey,
+    required this.title,
+    required this.description,
+    required this.isExpanded,
+    required this.onToggle,
+  });
+
+  final GlobalKey headerKey;
+  final String title;
+  final String description;
+  final bool isExpanded;
+  final VoidCallback onToggle;
+
+  @override
+  double get minExtent => 60;
+
+  @override
+  double get maxExtent => description.isEmpty ? 60 : 80;
+
+  @override
+  Widget build(
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
+    final theme = Theme.of(context);
+    final elevation = isExpanded && shrinkOffset > 0 ? 4.0 : 0.0;
+
+    return Material(
+      key: headerKey,
+      color: theme.colorScheme.surface,
+      elevation: elevation,
+      child: InkWell(
+        onTap: onToggle,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Row(
+            children: [
+              Icon(
+                isExpanded
+                    ? Icons.expand_less_rounded
+                    : Icons.expand_more_rounded,
+                color: const Color(0xFF176B67),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: Color(0xFF176B67),
+                        fontWeight: FontWeight.w700,
+                        fontSize: 16,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    if (description.isNotEmpty)
+                      Text(
+                        description,
+                        style: const TextStyle(color: Color(0xFF78847F)),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  bool shouldRebuild(covariant _WorkStickyHeaderDelegate oldDelegate) {
+    return title != oldDelegate.title ||
+        description != oldDelegate.description ||
+        isExpanded != oldDelegate.isExpanded;
+  }
+}
+
+class _JuanResultGroup extends StatefulWidget {
+  const _JuanResultGroup({
+    required this.juan,
+    required this.passages,
+    required this.allPassages,
+    required this.query,
+    required this.onPassageTap,
+  });
+
+  final String juan;
+  final List<ScripturePassage> passages;
+  final List<ScripturePassage> allPassages;
+  final String query;
+  final void Function(ScripturePassage passage, List<ScripturePassage> passages)
+  onPassageTap;
+
+  @override
+  State<_JuanResultGroup> createState() => _JuanResultGroupState();
+}
+
+class _JuanResultGroupState extends State<_JuanResultGroup> {
+  /// 一部作品可能在同一卷命中數百處,一次全部建立 Paragraph 會卡住捲動,
+  /// 因此命中列也走分頁增長。
+  int _visiblePassages = _resultSectionPageSize;
+
+  @override
+  Widget build(BuildContext context) {
+    final passages = widget.passages;
+    final shown = passages.take(_visiblePassages).toList();
+    final remaining = passages.length - shown.length;
+    return ExpansionTile(
+      initiallyExpanded: true,
+      tilePadding: const EdgeInsets.symmetric(horizontal: 16),
+      title: Text(
+        widget.juan.isEmpty ? '本卷' : widget.juan,
+        style: const TextStyle(color: Color(0xFF3A4B46)),
+      ),
+      children: [
+        for (var i = 0; i < shown.length; i++) ...[
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: _PassageResultTile(
+              passage: shown[i],
+              query: widget.query,
+              onTap: () => widget.onPassageTap(shown[i], widget.allPassages),
+            ),
+          ),
+          if (i != shown.length - 1 || remaining > 0)
+            const Divider(height: 1, indent: 16, endIndent: 16),
+        ],
+        if (remaining > 0)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                onPressed: () =>
+                    setState(() => _visiblePassages += _resultSectionPageSize),
+                child: Text('顯示更多命中（剩餘 $remaining 筆）'),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _PassageResultTile extends StatelessWidget {
+  const _PassageResultTile({
+    required this.passage,
+    required this.query,
+    required this.onTap,
+  });
+
+  final ScripturePassage passage;
+  final String query;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => InkWell(
+    onTap: onTap,
+    borderRadius: BorderRadius.circular(8),
+    child: Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (passage.reference.isNotEmpty)
+            Text(
+              passage.reference,
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: const Color(0xFF78847F)),
+            ),
+          const SizedBox(height: 4),
+          Text.rich(
+            _highlightedPassageText(passage.text, query),
+            style: Theme.of(context).textTheme.bodyLarge?.copyWith(height: 1.8),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
 class _SearchResultCard extends StatelessWidget {
   const _SearchResultCard({
     required this.result,
@@ -3109,31 +4735,10 @@ class _SearchResultCard extends StatelessWidget {
           ],
           for (final passage in result.passages) ...[
             const SizedBox(height: 10),
-            InkWell(
+            _PassageResultTile(
+              passage: passage,
+              query: query,
               onTap: () => onPassageTap(passage, result.passages),
-              borderRadius: BorderRadius.circular(8),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 4),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    if (passage.reference.isNotEmpty)
-                      Text(
-                        passage.reference,
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: const Color(0xFF78847F),
-                        ),
-                      ),
-                    const SizedBox(height: 4),
-                    Text.rich(
-                      _highlightedPassageText(passage.text, query),
-                      style: Theme.of(
-                        context,
-                      ).textTheme.bodyLarge?.copyWith(height: 1.8),
-                    ),
-                  ],
-                ),
-              ),
             ),
           ],
         ],
@@ -3141,6 +4746,8 @@ class _SearchResultCard extends StatelessWidget {
     ),
   );
 }
+
+const int _workPickerDictionaryTab = 1;
 
 class ScriptureReaderPage extends StatefulWidget {
   const ScriptureReaderPage({
@@ -4082,6 +5689,18 @@ class _SelectablePassageTextState extends State<_SelectablePassageText> {
     }
   }
 
+  Future<void> _lookupSelectionInDictionary(String selectedText) async {
+    final term = selectedText.trim();
+    if (term.isEmpty) return;
+    // 直接打开左侧栏词典页面，自动输入并搜索
+    if (!mounted) return;
+    _showWorkPicker(
+      context,
+      initialTab: _workPickerDictionaryTab,
+      initialDictionaryQuery: term,
+    );
+  }
+
   /// WidgetSpan（表格、圖片、偈頌間距）在純文字中會留下 U+FFFC，
   /// 複製與引文輸出時要移除。
   String _stripSelectionPlaceholders(String text) =>
@@ -4196,7 +5815,7 @@ class _SelectablePassageTextState extends State<_SelectablePassageText> {
           final headerChildren = <InlineSpan>[];
 
           for (final line in widget.headerLines) {
-            final isNight = settings.backgroundTheme == 'night';
+            final isNight = settings.isDark;
             final isVolumeTitle = line.role == ScriptureLineRole.volumeTitle;
             final lineStyle = _scriptureTextStyle(settings).copyWith(
               color: isNight
@@ -4318,6 +5937,13 @@ class _SelectablePassageTextState extends State<_SelectablePassageText> {
                   onPressed: () {
                     editableTextState.selectAll(SelectionChangedCause.toolbar);
                     editableTextState.hideToolbar();
+                  },
+                ),
+                ContextMenuButtonItem(
+                  label: '查詞典',
+                  onPressed: () {
+                    editableTextState.hideToolbar();
+                    _lookupSelectionInDictionary(selText);
                   },
                 ),
                 ContextMenuButtonItem(
@@ -5266,7 +6892,7 @@ TextSpan _interactivePassageText(
         TextSpan(
           style: TextStyle(
             fontSize: settings.fontSize * 0.72,
-            color: settings.backgroundTheme == 'night'
+            color: settings.isDark
                 ? const Color(0xFF8E8171)
                 : const Color(0xFF9A8B78),
           ),
@@ -5631,8 +7257,8 @@ Future<String?> _loadSectionTitle(
 }
 
 String _decodeCitationHtml(String value) => value
-    .replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '')
-    .replaceAll(RegExp(r'<[^>]*>'), '')
+    .replaceAll(_citationBrPattern, '')
+    .replaceAll(_htmlTagPattern, '')
     .replaceAll('&nbsp;', ' ')
     .replaceAll('&quot;', '"')
     .replaceAll('&#39;', "'")
@@ -5641,7 +7267,7 @@ String _decodeCitationHtml(String value) => value
     .replaceAll('&amp;', '&');
 
 String _normalizeCitationText(String text) =>
-    text.replaceAll(RegExp(r'\s+'), '');
+    text.replaceAll(_whitespacePattern, '');
 
 String formatSelectedPassageForCopy(
   ScripturePassage passage,
@@ -5674,7 +7300,7 @@ String _catalogResultWorkId(Map<String, dynamic> result) {
   final work = '${result['work'] ?? ''}'.trim();
   if (work.isNotEmpty) return work;
   final file = '${result['file'] ?? ''}';
-  final match = RegExp(r'^([A-Z]+)\d+n(\d+)').firstMatch(file);
+  final match = _fileWorkIdPattern.firstMatch(file);
   return match == null ? '' : '${match.group(1)}${match.group(2)}';
 }
 
@@ -5718,33 +7344,8 @@ List<Map<String, dynamic>> _tocJuanEntries(Map<String, dynamic>? toc) {
 String _searchResultWorkId(ScriptureSearchResult result) {
   final passageWork = result.passages.firstOrNull?.work;
   if (passageWork != null && passageWork.isNotEmpty) return passageWork;
-  final match = RegExp(r'^([A-Z]+\d+)').firstMatch(result.title);
+  final match = _workIdPattern.firstMatch(result.title);
   return match?.group(1) ?? '';
-}
-
-Future<List<Map<String, dynamic>>> _fetchCatalogSearchResults(
-  String query,
-) async {
-  final response = await http
-      .get(Uri.https('cbdata.dila.edu.tw', '/stable/search/toc', {'q': query}))
-      .timeout(const Duration(seconds: 20));
-  if (response.statusCode != 200) {
-    throw Exception('經目查詢 API 回傳 ${response.statusCode}');
-  }
-  final payload =
-      jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
-  if (payload['success'] == false) {
-    throw Exception('經目查詢失敗：${payload['error'] ?? '未知錯誤'}');
-  }
-  final seen = <String>{};
-  return (payload['results'] as List<dynamic>? ?? const [])
-      .whereType<Map<String, dynamic>>()
-      .where((row) => row['type'] == null || row['type'] == 'work')
-      .where((row) {
-        final work = _catalogResultWorkId(row);
-        return work.isNotEmpty && seen.add(work);
-      })
-      .toList();
 }
 
 Future<ScripturePassage> _resolveGotoPassage(String input) async {
@@ -5936,15 +7537,15 @@ IcuCollator? _creatorCollator;
 Future<void>? _icuInitialization;
 
 Future<void> _ensureCreatorCollator() async {
+  // 已初始化過就直接返回；避免重複 await 跨測試 zone 的快取 Future。
+  if (_creatorCollator != null) return;
   await (_icuInitialization ??= IcuKit.init(webEngine: WebEngine.browserIntl));
   _creatorCollator ??= IcuCollator(locale: 'zh-Hant');
 }
 
 ({String volume, String number, int page, String column, int line})?
 _citationLocation(String? linehead) {
-  final match = RegExp(
-    r'^([A-Z]\d+)n(\d+)_p(\d{4})([a-z])(\d+)$',
-  ).firstMatch(linehead ?? '');
+  final match = _citationLineheadPattern.firstMatch(linehead ?? '');
   if (match == null) return null;
   return (
     volume: match.group(1)!,
@@ -5962,8 +7563,6 @@ class _SearchBatch {
     required this.totalFound,
     required this.totalTermHits,
     this.hasMore = false,
-    this.scannedVolumes = 0,
-    this.totalVolumes = 0,
   });
 
   final List<ScriptureSearchResult> results;
@@ -5971,8 +7570,6 @@ class _SearchBatch {
   final int totalFound;
   final int totalTermHits;
   final bool hasMore;
-  final int scannedVolumes;
-  final int totalVolumes;
 }
 
 /// 判斷錯誤是否來自網路連線不可用，而非遠端服務回傳的錯誤。
@@ -5982,139 +7579,21 @@ bool _isNetworkFailure(Object error) =>
     error is http.ClientException ||
     error is HandshakeException;
 
-int _countOccurrences(String haystack, String needle) {
-  if (needle.isEmpty) return 0;
-  var count = 0;
-  var index = haystack.indexOf(needle);
-  while (index >= 0) {
-    count += 1;
-    index = haystack.indexOf(needle, index + needle.length);
-  }
-  return count;
-}
+/// 逾時只代表「伺服端還在算」,不代表沒有網路。搜尋結果頁要用這個判別,
+/// 才不會在第 20 秒把使用者悄悄丟進本地掃描。
+bool _isRequestTimeout(Object error) => error is TimeoutException;
 
-/// 分頁掃描本地已儲存的離線經卷，每卷只解析一次。
-///
-/// 每次 [nextPage] 最多掃描 [maxVolumesPerPage] 卷，找到足夠結果就提前返回；
-/// 使用者往下捲動載入下一頁時再繼續掃描，避免一次解析全部經卷造成卡頓。
-class _OfflineSearchSession {
-  _OfflineSearchSession(this.query, {int published = 0})
-    : _published = published;
-
-  static const int _volumesPerChunk = 8;
-  static const int maxVolumesPerPage = 60;
-
-  final String query;
-  List<ScriptureVolumeRef>? _refs;
-  Map<String, Set<int>> _workJuans = {};
-  int _nextVolume = 0;
-  int _published;
-  final List<ScriptureSearchResult> _results = [];
-  int _totalTermHits = 0;
-  bool _finished = false;
-
-  int get scannedVolumes => _nextVolume;
-  int get totalVolumes => _refs?.length ?? 0;
-
-  Future<void> _ensureRefs() async {
-    if (_refs != null) return;
-    final refs = await scriptureVolumeStore.listRefs();
-    refs.sort((left, right) {
-      final byWork = left.work.compareTo(right.work);
-      if (byWork != 0) return byWork;
-      return (int.tryParse(left.juan) ?? 0).compareTo(
-        int.tryParse(right.juan) ?? 0,
-      );
-    });
-    _workJuans = {};
-    for (final ref in refs) {
-      final juan = int.tryParse(ref.juan);
-      if (juan != null) {
-        _workJuans.putIfAbsent(ref.work, () => <int>{}).add(juan);
-      }
-    }
-    _refs = refs;
-  }
-
-  Future<_SearchBatch> nextPage({int pageSize = 20}) async {
-    await _ensureRefs();
-    final refs = _refs!;
-    final needle = query.trim().toLowerCase();
-    var scannedThisPage = 0;
-    while (!_finished &&
-        _results.length - _published < pageSize &&
-        scannedThisPage < maxVolumesPerPage) {
-      final start = _nextVolume;
-      final end = _nextVolume + _volumesPerChunk < refs.length
-          ? _nextVolume + _volumesPerChunk
-          : refs.length;
-      for (; _nextVolume < end; _nextVolume++) {
-        final volume = await scriptureVolumeStore.readRef(refs[_nextVolume]);
-        if (volume != null) _scanVolume(volume, needle);
-        await Future<void>.delayed(Duration.zero);
-      }
-      scannedThisPage += end - start;
-      if (_nextVolume >= refs.length) _finished = true;
-    }
-    final page = _results.skip(_published).take(pageSize).toList();
-    _published += page.length;
-    return _SearchBatch(
-      results: page,
-      nextStart: _published,
-      totalFound: _results.length,
-      totalTermHits: _totalTermHits,
-      hasMore: !_finished || _published < _results.length,
-      scannedVolumes: _nextVolume,
-      totalVolumes: refs.length,
-    );
-  }
-
-  void _scanVolume(CachedScriptureVolume volume, String needle) {
-    if (needle.isEmpty) return;
-    final List<ScriptureLine> lines;
-    try {
-      lines = parseScriptureHtml(volume.html);
-    } catch (_) {
-      return;
-    }
-    final title = _localWorkTitle(lines);
-    final juans = (_workJuans[volume.work]?.toList() ?? <int>[])..sort();
-    final passages = <ScripturePassage>[];
-    for (final line in lines) {
-      if (line.role == ScriptureLineRole.volumeTitle ||
-          line.role == ScriptureLineRole.byline) {
-        continue;
-      }
-      final text = line.text.replaceAll(RegExp(r'\s+'), ' ').trim();
-      if (text.isEmpty) continue;
-      final lower = text.toLowerCase();
-      if (!lower.contains(needle)) continue;
-      _totalTermHits += _countOccurrences(lower, needle);
-      final linehead = line.linehead;
-      final lineLabel = linehead == null ? '' : linehead.split('_p').last;
-      passages.add(
-        ScripturePassage(
-          title: title.isEmpty ? volume.work : title,
-          reference: [
-            '卷${volume.juan}',
-            if (lineLabel.isNotEmpty) lineLabel,
-          ].join(' · '),
-          text: text,
-          linehead: linehead,
-          juan: volume.juan,
-          work: volume.work,
-          availableJuans: juans,
-        ),
-      );
-    }
-    if (passages.isEmpty) return;
-    _results.add(
-      ScriptureSearchResult(
-        title: '${volume.work} ${title.isEmpty ? '（離線經文）' : title}'.trim(),
-        description: '離線經文 · 命中 ${passages.length} 處',
-        passages: passages,
-      ),
-    );
+/// 以 App 內建的完整經目 metadata 查詢,不發任何網路請求。
+Future<List<Map<String, dynamic>>> _searchLocalCatalog(String query) async {
+  final needle = query.trim();
+  if (needle.isEmpty) return const [];
+  try {
+    final catalog = CatalogCache.instance;
+    await catalog.load();
+    return catalog.searchWorks(needle, limit: _localCatalogResultLimit);
+  } catch (_) {
+    // 經目資產載入失敗時沒有可查的書名表,交由離線經卷那層兜底。
+    return const [];
   }
 }
 
@@ -6124,29 +7603,6 @@ List<ScriptureLine>? _tryParseLocalVolume(CachedScriptureVolume volume) {
   } catch (_) {
     return null;
   }
-}
-
-({String title, String byline}) _localVolumeInfo(List<ScriptureLine> lines) {
-  String pick(ScriptureLineRole role) => lines
-      .firstWhere(
-        (line) => line.role == role && line.text.trim().isNotEmpty,
-        orElse: () => const ScriptureLine(text: ''),
-      )
-      .text
-      .trim();
-  return (
-    title: pick(ScriptureLineRole.volumeTitle),
-    byline: pick(ScriptureLineRole.byline),
-  );
-}
-
-/// 去掉卷名尾端的「卷…」字樣，取得作品名稱。
-String _localWorkTitle(List<ScriptureLine> lines) {
-  final title = _localVolumeInfo(lines).title;
-  final stripped = title
-      .replaceFirst(RegExp(r'卷[第]?[〇零一二三四五六七八九十百千兩0-9]+$'), '')
-      .trim();
-  return stripped.isEmpty ? title : stripped;
 }
 
 List<int> _cachedJuansForRefs(List<ScriptureVolumeRef> refs, String work) =>
@@ -6176,7 +7632,7 @@ ScripturePassage _localPassage({
   required List<int> juans,
   String? linehead,
 }) {
-  final title = _localWorkTitle(lines);
+  final title = localWorkTitle(lines);
   return ScripturePassage(
     title: title.isEmpty ? work : title,
     reference: '卷 ${volume.juan}',
@@ -6289,10 +7745,10 @@ Future<List<Map<String, dynamic>>> _searchOfflineCatalog(String query) async {
     if (volume == null) continue;
     final lines = _tryParseLocalVolume(volume);
     if (lines == null) continue;
-    final info = _localVolumeInfo(lines);
-    final workTitle = _localWorkTitle(lines);
+    final info = localVolumeInfo(lines);
+    final workTitle = localWorkTitle(lines);
     final title = workTitle.isNotEmpty ? workTitle : entry.key;
-    final haystack = '$title ${info.byline} ${entry.key}'.toLowerCase();
+    final haystack = '$title ${entry.key}'.toLowerCase();
     if (!haystack.contains(lowerNeedle)) continue;
     results.add({
       'work': entry.key,
@@ -6313,6 +7769,8 @@ Future<List<Map<String, dynamic>>> _searchOfflineCatalog(String query) async {
 
 Future<_SearchBatch> _fetchSearchBatch(String query, {int start = 0}) async {
   const pageSize = 20;
+  // facet 會讓伺服器多做一輪彙總（實測慢 2～5 倍，單字查詢可差十幾秒），
+  // 而回傳的分面欄位並沒有人使用，因此不再請求。
   final response = await http
       .get(
         Uri.https('cbdata.dila.edu.tw', '/stable/search/all_in_one', {
@@ -6320,10 +7778,9 @@ Future<_SearchBatch> _fetchSearchBatch(String query, {int start = 0}) async {
           'start': '$start',
           'rows': '$pageSize',
           'around': '30',
-          'facet': '1',
         }),
       )
-      .timeout(const Duration(seconds: 20));
+      .timeout(_keywordSearchTimeout);
   if (response.statusCode != 200) {
     throw Exception('全文檢索 API 回傳 ${response.statusCode}');
   }
@@ -6401,7 +7858,7 @@ ScriptureSearchResult _parseSearchResult(Map<String, dynamic> row) {
 }
 
 String _stripSearchMarkup(String text) => text
-    .replaceAll(RegExp(r'<[^>]*>'), '')
+    .replaceAll(_htmlTagPattern, '')
     .replaceAll('&nbsp;', ' ')
     .replaceAll('&quot;', '"')
     .replaceAll('&#39;', "'")
@@ -6472,6 +7929,15 @@ const _readingHistoryKey = 'reading_history';
 const _initialRecentReadingsCount = 3;
 const _recentReadingsPageSize = 20;
 
+/// 結果區一次展開的列數上限。單幀內對整段命中列表做版式計算會直接
+/// 造成滑動卡頓,因此所有結果列表都以分頁方式增長。
+const _resultSectionPageSize = 20;
+
+/// 全文 API 對常用單字動輒二十幾秒（實測「來」26 秒／283 KB），原本的
+/// 20 秒上限都在伺服端算完之前就放弃了。
+const _keywordSearchTimeout = Duration(seconds: 45);
+const _localCatalogResultLimit = 200;
+
 Future<List<_ReaderBookmark>> _loadBookmarkRecords(String key) async {
   final preferences = await SharedPreferences.getInstance();
   final stored = preferences.getString(key);
@@ -6512,41 +7978,49 @@ Future<void> _recordRecentReading(ScripturePassage passage) async {
   if (!saved) throw StateError('無法儲存閱讀記錄');
 }
 
-Future<ScripturePassage?> _showWorkPicker(BuildContext context) =>
-    showGeneralDialog<ScripturePassage>(
-      context: context,
-      barrierDismissible: true,
-      barrierLabel: '關閉選擇佛經',
-      barrierColor: Colors.black54,
-      transitionDuration: const Duration(milliseconds: 180),
-      pageBuilder: (dialogContext, _, _) {
-        final screen = MediaQuery.sizeOf(dialogContext);
-        return SafeArea(
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: SizedBox(
-              width: (screen.width * 0.78).clamp(280, 460).toDouble(),
-              height: screen.height,
-              child: Material(
-                elevation: 16,
-                clipBehavior: Clip.antiAlias,
-                borderRadius: const BorderRadius.horizontal(
-                  right: Radius.circular(16),
-                ),
-                child: const _WorkPickerPage(),
-              ),
+Future<ScripturePassage?> _showWorkPicker(
+  BuildContext context, {
+  int initialTab = 0,
+  bool autoOpenDictionarySelection = false,
+  String? initialDictionaryQuery,
+}) => showGeneralDialog<ScripturePassage>(
+  context: context,
+  barrierDismissible: true,
+  barrierLabel: '關閉選擇佛經',
+  barrierColor: Colors.black54,
+  transitionDuration: const Duration(milliseconds: 180),
+  pageBuilder: (dialogContext, _, _) {
+    final screen = MediaQuery.sizeOf(dialogContext);
+    return SafeArea(
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: SizedBox(
+          width: (screen.width * 0.78).clamp(280, 460).toDouble(),
+          height: screen.height,
+          child: Material(
+            elevation: 16,
+            clipBehavior: Clip.antiAlias,
+            borderRadius: const BorderRadius.horizontal(
+              right: Radius.circular(16),
+            ),
+            child: _WorkPickerPage(
+              initialTab: initialTab,
+              autoOpenDictionarySelection: autoOpenDictionarySelection,
+              initialDictionaryQuery: initialDictionaryQuery,
             ),
           ),
-        );
-      },
-      transitionBuilder: (context, animation, _, child) => SlideTransition(
-        position: Tween<Offset>(
-          begin: const Offset(-1, 0),
-          end: Offset.zero,
-        ).animate(CurvedAnimation(parent: animation, curve: Curves.easeOut)),
-        child: child,
+        ),
       ),
     );
+  },
+  transitionBuilder: (context, animation, _, child) => SlideTransition(
+    position: Tween<Offset>(
+      begin: const Offset(-1, 0),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: animation, curve: Curves.easeOut)),
+    child: child,
+  ),
+);
 
 class _LocalSearchBar extends StatelessWidget {
   const _LocalSearchBar({
@@ -6639,7 +8113,6 @@ class _FullTextSearchCache {
   static final Map<String, _FullTextSearchSnapshot> _snapshots = {};
 
   static _FullTextSearchSnapshot? get(String query) => _snapshots[query];
-
   static void remember(
     String query, {
     required List<ScriptureSearchResult> results,
@@ -6656,7 +8129,13 @@ class _FullTextSearchCache {
       hasMore: hasMore,
     );
   }
+
+  static void debugReset() => _snapshots.clear();
 }
+
+/// 清空全文搜尋結果快取（僅供測試使用）。
+@visibleForTesting
+void resetFullTextSearchCache() => _FullTextSearchCache.debugReset();
 
 class _FullTextSearchPageState extends State<_FullTextSearchPage> {
   late final TextEditingController controller;
@@ -6673,7 +8152,7 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
   int totalTermHits = 0;
   int scannedVolumes = 0;
   int totalVolumes = 0;
-  _OfflineSearchSession? offlineSession;
+  OfflineScanSession? offlineSession;
 
   @override
   void initState() {
@@ -6760,15 +8239,15 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
 
   Future<void> _loadPage(String query, int start) async {
     try {
-      final session = offlineMode
-          ? (offlineSession ??= _OfflineSearchSession(
-              query,
-              published: results.length,
-            ))
-          : null;
-      final batch = offlineMode
-          ? await session!.nextPage()
-          : await _fetchSearchBatch(query, start: start);
+      if (offlineMode) {
+        final session = offlineSession ??= OfflineScanSession(query);
+        await session.prepare();
+        await session.scanChunk();
+        if (!mounted) return;
+        _applyOfflineScanPage(query, session.current);
+        return;
+      }
+      final batch = await _fetchSearchBatch(query, start: start);
       if (!mounted) return;
       setState(() {
         results = [...results, ...batch.results];
@@ -6776,10 +8255,6 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
         totalFound = batch.totalFound;
         totalTermHits = batch.totalTermHits;
         hasMore = batch.hasMore;
-        if (offlineMode) {
-          scannedVolumes = batch.scannedVolumes;
-          totalVolumes = batch.totalVolumes;
-        }
         loading = false;
         loadingMore = false;
         _FullTextSearchCache.remember(
@@ -6794,30 +8269,13 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
     } catch (exception) {
       if (!mounted) return;
       if (!offlineMode && _isNetworkFailure(exception)) {
-        final session = _OfflineSearchSession(query);
-        final batch = await session.nextPage();
+        final session = OfflineScanSession(query);
+        offlineSession = session;
+        await session.prepare();
+        await session.scanChunk();
         if (!mounted) return;
-        setState(() {
-          offlineMode = true;
-          offlineSession = session;
-          results = batch.results;
-          nextStart = batch.nextStart;
-          totalFound = batch.totalFound;
-          totalTermHits = batch.totalTermHits;
-          hasMore = batch.hasMore;
-          scannedVolumes = batch.scannedVolumes;
-          totalVolumes = batch.totalVolumes;
-          loading = false;
-          loadingMore = false;
-          _FullTextSearchCache.remember(
-            query,
-            results: results,
-            nextStart: nextStart,
-            totalFound: totalFound,
-            totalTermHits: totalTermHits,
-            hasMore: hasMore,
-          );
-        });
+        setState(() => offlineMode = true);
+        _applyOfflineScanPage(query, session.current);
         return;
       }
       setState(() {
@@ -6826,6 +8284,28 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
         loadingMore = false;
       });
     }
+  }
+
+  void _applyOfflineScanPage(String query, OfflineScanProgress progress) {
+    setState(() {
+      results = progress.results;
+      nextStart = progress.results.length;
+      totalFound = progress.results.length;
+      totalTermHits = progress.termHits;
+      hasMore = !progress.finished;
+      scannedVolumes = progress.scannedVolumes;
+      totalVolumes = progress.totalVolumes;
+      loading = false;
+      loadingMore = false;
+      _FullTextSearchCache.remember(
+        query,
+        results: results,
+        nextStart: nextStart,
+        totalFound: totalFound,
+        totalTermHits: totalTermHits,
+        hasMore: hasMore,
+      );
+    });
   }
 
   void _openPassage(ScripturePassage passage, List<ScripturePassage> hits) {
@@ -6843,6 +8323,7 @@ class _FullTextSearchPageState extends State<_FullTextSearchPage> {
 
   @override
   void dispose() {
+    offlineSession?.dispose();
     scrollController
       ..removeListener(_onScroll)
       ..dispose();
@@ -7157,10 +8638,12 @@ class _AiSearchPageState extends State<_AiSearchPage> {
         const SizedBox(height: 20),
         Row(
           children: [
-            const Icon(
+            Icon(
               Icons.menu_book_rounded,
               size: 18,
-              color: Color(0xFF176B67),
+              color: scriptureDisplaySettings.isDark
+                  ? const Color(0xFF6FBAB4)
+                  : const Color(0xFF176B67),
             ),
             const SizedBox(width: 6),
             Text(
@@ -7178,15 +8661,20 @@ class _AiSearchPageState extends State<_AiSearchPage> {
   }
 
   Widget _buildAnswerCard(BuildContext context) {
+    final settings = scriptureDisplaySettings;
     final text = answer.isEmpty
         ? (generating ? '正在生成回答…' : '正在檢索相關經文…')
         : answer;
     return Card(
       elevation: 0,
-      color: const Color(0xFFEAF3F1),
+      color: settings.isDark ? settings.surfaceColor : const Color(0xFFEAF3F1),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(12),
-        side: const BorderSide(color: Color(0xFFCBE0DC)),
+        side: BorderSide(
+          color: settings.isDark
+              ? const Color(0xFF3A4B46)
+              : const Color(0xFFCBE0DC),
+        ),
       ),
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -7195,17 +8683,21 @@ class _AiSearchPageState extends State<_AiSearchPage> {
           children: [
             Row(
               children: [
-                const Icon(
+                Icon(
                   Icons.auto_awesome_rounded,
                   size: 18,
-                  color: Color(0xFF176B67),
+                  color: settings.isDark
+                      ? const Color(0xFF6FBAB4)
+                      : const Color(0xFF176B67),
                 ),
                 const SizedBox(width: 6),
                 Text(
                   'AI 回答',
                   style: Theme.of(context).textTheme.titleSmall?.copyWith(
                     fontWeight: FontWeight.w700,
-                    color: const Color(0xFF145D54),
+                    color: settings.isDark
+                        ? const Color(0xFF8FD3CC)
+                        : const Color(0xFF145D54),
                   ),
                 ),
                 const Spacer(),
@@ -7221,7 +8713,7 @@ class _AiSearchPageState extends State<_AiSearchPage> {
               text,
               style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                 height: 1.8,
-                color: const Color(0xFF1F2E2B),
+                color: settings.textColor,
               ),
             ),
           ],
@@ -7235,7 +8727,11 @@ class _AiSearchPageState extends State<_AiSearchPage> {
     color: scriptureDisplaySettings.surfaceColor,
     shape: RoundedRectangleBorder(
       borderRadius: BorderRadius.circular(12),
-      side: const BorderSide(color: Color(0xFFE0D6C2)),
+      side: BorderSide(
+        color: scriptureDisplaySettings.isDark
+            ? const Color(0xFF3A4B46)
+            : const Color(0xFFE0D6C2),
+      ),
     ),
     child: Padding(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
@@ -7280,7 +8776,11 @@ class _AiSearchPageState extends State<_AiSearchPage> {
       color: scriptureDisplaySettings.surfaceColor,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(12),
-        side: const BorderSide(color: Color(0xFFE0D6C2)),
+        side: BorderSide(
+          color: scriptureDisplaySettings.isDark
+              ? const Color(0xFF3A4B46)
+              : const Color(0xFFE0D6C2),
+        ),
       ),
       child: InkWell(
         onTap: () => _openChunk(chunk),
@@ -7293,7 +8793,9 @@ class _AiSearchPageState extends State<_AiSearchPage> {
               Text(
                 chunk.title.isEmpty ? chunk.work : chunk.title,
                 style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  color: const Color(0xFF176B67),
+                  color: scriptureDisplaySettings.isDark
+                      ? const Color(0xFF6FBAB4)
+                      : const Color(0xFF176B67),
                   fontWeight: FontWeight.w700,
                 ),
               ),
@@ -7341,7 +8843,14 @@ class _AiSearchPageState extends State<_AiSearchPage> {
 }
 
 class _WorkPickerPage extends StatefulWidget {
-  const _WorkPickerPage();
+  const _WorkPickerPage({
+    this.initialTab = 0,
+    this.autoOpenDictionarySelection = false,
+    this.initialDictionaryQuery,
+  });
+  final int initialTab;
+  final bool autoOpenDictionarySelection;
+  final String? initialDictionaryQuery;
   @override
   State<_WorkPickerPage> createState() => _WorkPickerPageState();
 }
@@ -7378,17 +8887,30 @@ Future<Map<String, dynamic>> _cachedPickerJson(
   }
 }
 
-class _WorkPickerPageState extends State<_WorkPickerPage> {
-  static const _tabs = ['部類', '冊別', '作譯者', '年代', '經目查詢', 'Goto 查詢', '詞典查詢'];
+class _WorkPickerPageState extends State<_WorkPickerPage>
+    with SingleTickerProviderStateMixin {
+  static const _tabs = ['部類', '詞典', '冊別', '作譯者', '年代', '經目查詢', 'Goto 查詢'];
+  static const _tabBuLei = 0;
+  static const _tabDict = 1;
+  static const _tabCeBie = 2;
+  static const _tabCreator = 3;
+  static const _tabDynasty = 4;
+  static const _tabJingMu = 5;
+  static const _tabGoto = 6;
 
   final Map<int, List<({String q, String label})>> catalogLevels = {
-    0: [],
-    1: [],
+    _tabBuLei: [],
+    _tabCeBie: [],
   };
-  final Map<int, List<Map<String, dynamic>>> catalogEntries = {0: [], 1: []};
+  final Map<int, List<Map<String, dynamic>>> catalogEntries = {
+    _tabBuLei: [],
+    _tabCeBie: [],
+  };
   final TextEditingController creatorController = TextEditingController();
   final TextEditingController tocController = TextEditingController();
   final TextEditingController gotoController = TextEditingController();
+  SearchSelection? _tocPendingSelection;
+  SearchSelection? _dictionaryPendingSelection;
   List<MapEntry<String, CreatorEntry>> creators = [];
   List<DynastyEntry> dynasties = [];
   List<Map<String, dynamic>> listedWorks = [];
@@ -7397,23 +8919,438 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   bool loading = false;
   bool loadingCreators = false;
   bool loadingDynasties = false;
+  Future<void>? _creatorsLoadingFuture;
+  Future<void>? _dynastiesLoadingFuture;
   bool showingWorks = false;
   String creatorQuery = '';
   String? error;
   String? resultMessage;
   bool downloadMode = false;
   final Set<String> selectedDownloadWorks = {};
+  final TextEditingController dictionaryController = TextEditingController();
+  final FodictService _fodictService = FodictService();
+  List<FodictEntry> dictionaryResults = [];
+  List<FodictInfo> availableDictionaries = [];
+  Set<String> selectedDictionaries = {};
+  bool loadingDictionaries = true;
+  bool loadingDictionaryResults = false;
+  bool dictionarySelectionExpanded = false;
+  String? dictionaryError;
+  String? dictionaryResultMessage;
+  String? _fodictBaseDir;
+  String? _pendingDictionaryQuery;
+  final Set<String> _expandedDictionaryIds = {};
+  final Set<String> _expandedEntryKeys = {};
+  int _lastFodictInstallRevision = 0;
+  List<FodictRemoteDictionary> _remoteDictionaries = const [];
+  bool _loadingRemoteDictionaries = false;
+  String? _remoteDictionariesError;
+  bool _collapseAfterFodictDownloads = false;
+  late final TabController _tabController;
+  final Map<int, ScrollController> _scrollControllers = {};
+  final Map<int, double> _savedScrollOffsets = {};
+  final Map<int, double> _pendingScrollOffsets = {};
+  final Set<String> _restoredDictionaryExpandedIds = {};
+  final Set<String> _restoredDictionaryExpandedEntryKeys = {};
 
   @override
   void initState() {
     super.initState();
-    _initLocalCatalog();
+    selectedTab = widget.initialTab;
+    _tabController = TabController(
+      length: _tabs.length,
+      vsync: this,
+      initialIndex: selectedTab.clamp(0, _tabs.length - 1),
+    );
+    _lastFodictInstallRevision = fodictDownloadManager.installRevision;
+    fodictDownloadManager.addListener(_onFodictDownloadManagerChanged);
+    CatalogCache.instance.addListener(_onCatalogReloaded);
+    if (widget.initialDictionaryQuery != null &&
+        widget.initialDictionaryQuery!.isNotEmpty) {
+      final term = widget.initialDictionaryQuery!.trim();
+      dictionaryController.text = term;
+      _pendingDictionaryQuery = term;
+    }
+    unawaited(_boot());
+    if (widget.autoOpenDictionarySelection) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _openFodictDownloadPanel();
+      });
+    }
+  }
+
+  Future<void> _boot() async {
+    final snapshot = await loadWorkPickerSnapshot();
+    if (!mounted) return;
+    if (snapshot != null) {
+      setState(() => _applySnapshot(snapshot));
+    }
+    final tabData = switch (selectedTab) {
+      _tabCreator => _loadCreators(),
+      _tabDynasty => _loadDynasties(),
+      _ => Future<void>.value(),
+    };
+    await Future.wait([_initLocalCatalog(), _initDictionaries(), tabData]);
+    if (!mounted) return;
+    _scheduleApplyScroll(selectedTab);
+  }
+
+  void _applySnapshot(WorkPickerSnapshot snapshot) {
+    final hasExplicitQuery =
+        widget.initialDictionaryQuery?.trim().isNotEmpty ?? false;
+    // 由閱讀頁「查詞典」開啟時，永遠以當下選取的詞語為準。
+    if (hasExplicitQuery || widget.initialTab != 0) return;
+
+    selectedTab = snapshot.tab.clamp(0, _tabs.length - 1);
+    if (_tabController.index != selectedTab) {
+      _tabController.index = selectedTab;
+    }
+    if (selectedTab == _tabBuLei || selectedTab == _tabCeBie) {
+      activeCatalogTab = selectedTab;
+    }
+    _savedScrollOffsets
+      ..clear()
+      ..addAll(snapshot.scrollOffsets);
+    _pendingScrollOffsets.clear();
+    final restoredOffset = snapshot.scrollOffsets[selectedTab];
+    if (restoredOffset != null) {
+      _pendingScrollOffsets[selectedTab] = restoredOffset;
+    }
+    final restoredLevels = snapshot.catalogLevels[selectedTab];
+    if (restoredLevels != null && restoredLevels.isNotEmpty) {
+      catalogLevels[selectedTab] = [
+        for (final level in restoredLevels) (q: level.q, label: level.label),
+      ];
+    }
+    creatorController.text = snapshot.creatorQuery;
+    creatorQuery = SimplifiedTraditionalConverter.convertPreferred(
+      snapshot.creatorQuery.trim(),
+    );
+    tocController.text = snapshot.tocQuery;
+    gotoController.text = snapshot.gotoQuery;
+    dictionaryController.text = snapshot.dictionaryQuery;
+    _pendingDictionaryQuery = snapshot.dictionaryQuery.trim().isEmpty
+        ? null
+        : snapshot.dictionaryQuery.trim();
+    _restoredDictionaryExpandedIds
+      ..clear()
+      ..addAll(snapshot.dictionaryExpandedIds);
+    _restoredDictionaryExpandedEntryKeys
+      ..clear()
+      ..addAll(snapshot.dictionaryExpandedEntryKeys);
+    resultMessage = snapshot.resultMessage;
+    final restoresWorksView =
+        selectedTab == _tabCreator ||
+        selectedTab == _tabDynasty ||
+        selectedTab == _tabJingMu;
+    if (snapshot.showingWorks && restoresWorksView) {
+      showingWorks = true;
+      listedWorks = snapshot.listedWorks;
+    }
+  }
+
+  ScrollController _scrollControllerFor(int tab) {
+    return _scrollControllers.putIfAbsent(tab, () {
+      final controller = ScrollController();
+      controller.addListener(() {
+        if (controller.hasClients) {
+          _savedScrollOffsets[tab] = controller.offset;
+        }
+      });
+      return controller;
+    });
+  }
+
+  void _scheduleApplyScroll(int tab) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _applyPendingScroll(tab);
+    });
+  }
+
+  void _applyPendingScroll(int tab) {
+    final offset = _pendingScrollOffsets.remove(tab);
+    if (offset == null) return;
+    final controller = _scrollControllers[tab];
+    if (controller == null || !controller.hasClients) return;
+    controller.jumpTo(offset.clamp(0.0, controller.position.maxScrollExtent));
+  }
+
+  void _restoreSavedScroll(int tab) {
+    final saved = _savedScrollOffsets[tab];
+    if (saved == null) return;
+    _pendingScrollOffsets[tab] = saved;
+    _scheduleApplyScroll(tab);
+  }
+
+  void _resetScrollToTop(int tab) {
+    _pendingScrollOffsets.remove(tab);
+    _savedScrollOffsets[tab] = 0;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final controller = _scrollControllers[tab];
+      if (controller != null &&
+          controller.hasClients &&
+          controller.offset != 0) {
+        controller.jumpTo(0);
+      }
+    });
+  }
+
+  void _onFodictDownloadManagerChanged() {
+    if (!mounted) return;
+    final manager = fodictDownloadManager;
+    if (manager.installRevision != _lastFodictInstallRevision) {
+      _lastFodictInstallRevision = manager.installRevision;
+      unawaited(_refreshDictionaries());
+    }
+    if (_collapseAfterFodictDownloads &&
+        dictionarySelectionExpanded &&
+        manager.queue.isEmpty &&
+        !manager.isDownloading) {
+      _collapseAfterFodictDownloads = false;
+      setState(() => dictionarySelectionExpanded = false);
+      return;
+    }
+    if (dictionarySelectionExpanded) setState(() {});
+  }
+
+  void _onCatalogReloaded() {
+    if (!mounted) return;
+    unawaited(_reloadCatalogAfterUpdate());
+  }
+
+  Future<void> _reloadCatalogAfterUpdate() async {
+    if (!mounted) return;
+    _creatorsLoadingFuture = null;
+    _dynastiesLoadingFuture = null;
+    setState(() {
+      for (final tab in catalogLevels.keys) {
+        catalogLevels[tab] = [];
+        catalogEntries[tab] = [];
+      }
+      creators = [];
+      dynasties = [];
+      listedWorks = [];
+      showingWorks = false;
+      creatorQuery = '';
+      error = null;
+      resultMessage = null;
+    });
+    await _initLocalCatalog();
+    if (!mounted) return;
+    if (selectedTab == _tabCreator) await _loadCreators();
+    if (selectedTab == _tabDynasty) await _loadDynasties();
+  }
+
+  void _toggleDictionarySelection() {
+    final expanding = !dictionarySelectionExpanded;
+    setState(() {
+      dictionarySelectionExpanded = expanding;
+      if (expanding) {
+        _collapseAfterFodictDownloads = fodictDownloadManager.hasQueuedItems;
+      }
+    });
+    if (expanding) unawaited(_loadRemoteDictionaries());
+  }
+
+  Future<void> _openFodictDownloadPanel() async {
+    if (!dictionarySelectionExpanded) {
+      setState(() {
+        dictionarySelectionExpanded = true;
+        _collapseAfterFodictDownloads = fodictDownloadManager.hasQueuedItems;
+      });
+    }
+    await _loadRemoteDictionaries();
+    if (!mounted) return;
+
+    final allIds = <String>{
+      ...availableDictionaries.map((dict) => dict.id),
+      ..._remoteDictionaries.map((dict) => dict.id),
+    };
+    setState(() => selectedDictionaries = allIds);
+
+    final downloadable = _remoteDictionaries
+        .where(
+          (dict) =>
+              dict.available &&
+              !fodictDownloadManager.isBundled(dict.id) &&
+              !fodictDownloadManager.isInstalled(dict.id),
+        )
+        .toList();
+
+    if (downloadable.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_displayText('全部詞典均已下載', context))),
+      );
+      return;
+    }
+
+    final confirmed = await _confirmDownloadAllDictionaries(downloadable);
+    if (confirmed != true || !mounted) return;
+    _collapseAfterFodictDownloads = true;
+    for (final dict in downloadable) {
+      fodictDownloadManager.enqueue(dict);
+    }
+  }
+
+  Future<bool?> _confirmDownloadAllDictionaries(
+    List<FodictRemoteDictionary> dictionaries,
+  ) {
+    final totalBytes = dictionaries.fold<int>(
+      0,
+      (sum, dict) => sum + dict.zipSize,
+    );
+    return showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(_displayText('下載詞典', dialogContext)),
+        content: Text(
+          _displayText(
+            '將下載 ${dictionaries.length} 部詞典（約 ${_formatDownloadBytes(totalBytes)}），是否繼續？',
+            dialogContext,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(_displayText('取消', dialogContext)),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(_displayText('下載', dialogContext)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _loadRemoteDictionaries() async {
+    if (_loadingRemoteDictionaries) return;
+    setState(() {
+      _loadingRemoteDictionaries = true;
+      _remoteDictionariesError = null;
+    });
+    try {
+      final remote = await FodictCatalogService.instance.load(refresh: true);
+      if (!mounted) return;
+      setState(() {
+        _remoteDictionaries = remote;
+        _loadingRemoteDictionaries = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _remoteDictionariesError = '$error';
+        _loadingRemoteDictionaries = false;
+      });
+    }
+  }
+
+  void _startFodictDownload(FodictRemoteDictionary dictionary) {
+    _collapseAfterFodictDownloads = true;
+    fodictDownloadManager.enqueue(dictionary);
+  }
+
+  Future<void> _confirmDeleteFodict(String id, String name) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(_displayText('刪除詞典', context)),
+        content: Text(_displayText('確定刪除「$name」的本地文件？', context)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text(_displayText('取消', context)),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text(_displayText('刪除', context)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await fodictDownloadManager.deleteInstalled(id);
+    }
+  }
+
+  void _collapseDictionarySelectionForInput() {
+    if (!dictionarySelectionExpanded) return;
+    setState(() => dictionarySelectionExpanded = false);
+  }
+
+  Future<void> _initDictionaries() async {
+    var baseDir = '';
+    try {
+      baseDir = await FodictService.defaultBaseDir();
+    } catch (_) {
+      // 沒有文件目錄時仍可使用內建字典。
+    }
+    if (!mounted) return;
+    setState(() => _fodictBaseDir = baseDir);
+    await _refreshDictionaries();
+    final pending = _pendingDictionaryQuery;
+    if (pending != null && pending.isNotEmpty && mounted) {
+      _pendingDictionaryQuery = null;
+      await _executeDictionarySearch(pending, allowFallback: true);
+      if (mounted &&
+          (_restoredDictionaryExpandedIds.isNotEmpty ||
+              _restoredDictionaryExpandedEntryKeys.isNotEmpty)) {
+        setState(() {
+          _expandedDictionaryIds.addAll(_restoredDictionaryExpandedIds);
+          _expandedEntryKeys.addAll(_restoredDictionaryExpandedEntryKeys);
+        });
+      }
+    }
+    _restoredDictionaryExpandedIds.clear();
+    _restoredDictionaryExpandedEntryKeys.clear();
+  }
+
+  Future<void> _refreshDictionaries() async {
+    final baseDir = _fodictBaseDir;
+    if (baseDir == null) return;
+    try {
+      _fodictService.clearCache();
+      final dicts = await _fodictService.getDictionaries(baseDir);
+      if (!mounted) return;
+      final ids = dicts.map((dictionary) => dictionary.id).toSet();
+      final oldIds = availableDictionaries
+          .map((dictionary) => dictionary.id)
+          .toSet();
+      setState(() {
+        availableDictionaries = dicts;
+        selectedDictionaries = {
+          ...selectedDictionaries.where(ids.contains),
+          ...ids.difference(oldIds),
+        };
+        loadingDictionaries = false;
+        dictionaryError = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        dictionaryError = '載入字典列表失敗：$e';
+        loadingDictionaries = false;
+      });
+    }
   }
 
   Future<void> _initLocalCatalog() async {
     await CatalogCache.instance.load();
     if (!mounted) return;
-    _loadCatalog(0, 'CBETA');
+    if (selectedTab == _tabBuLei || selectedTab == _tabCeBie) {
+      activeCatalogTab = selectedTab;
+      final levels = catalogLevels[selectedTab]!;
+      if (levels.isNotEmpty) {
+        await _loadCatalog(selectedTab, levels.last.q, resetScroll: false);
+        return;
+      }
+      await _loadCatalog(
+        selectedTab,
+        selectedTab == _tabCeBie ? 'orig' : 'CBETA',
+      );
+    }
   }
 
   Future<Map<String, dynamic>> _getJson(
@@ -7428,8 +9365,10 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     int tab,
     String query, {
     int? breadcrumbIndex,
+    bool resetScroll = true,
   }) async {
     activeCatalogTab = tab;
+    if (resetScroll) _resetScrollToTop(tab);
     setState(() {
       loading = true;
       error = null;
@@ -7467,6 +9406,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   }
 
   Future<void> _selectTab(int tab) async {
+    if (_tabController.index != tab) _tabController.index = tab;
     setState(() {
       selectedTab = tab;
       error = null;
@@ -7477,19 +9417,26 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
         selectedDownloadWorks.clear();
       }
     });
-    if (tab == 0 && catalogLevels[0]!.isEmpty) {
-      await _loadCatalog(0, 'CBETA');
-    } else if (tab == 1 && catalogLevels[1]!.isEmpty) {
-      await _loadCatalog(1, 'orig');
-    } else if (tab == 2 && creators.isEmpty) {
+    if (tab == _tabBuLei && catalogLevels[_tabBuLei]!.isEmpty) {
+      await _loadCatalog(_tabBuLei, 'CBETA');
+    } else if (tab == _tabCeBie && catalogLevels[_tabCeBie]!.isEmpty) {
+      await _loadCatalog(_tabCeBie, 'orig');
+    } else if (tab == _tabCreator && creators.isEmpty) {
       await _loadCreators();
-    } else if (tab == 3 && dynasties.isEmpty) {
+    } else if (tab == _tabDynasty && dynasties.isEmpty) {
       await _loadDynasties();
     }
     _autoSelectCurrentView();
+    _restoreSavedScroll(tab);
   }
 
-  Future<void> _loadCreators() async {
+  Future<void> _loadCreators() {
+    return _creatorsLoadingFuture ??= _loadCreatorsOnce().whenComplete(() {
+      _creatorsLoadingFuture = null;
+    });
+  }
+
+  Future<void> _loadCreatorsOnce() async {
     setState(() {
       loadingCreators = true;
       error = null;
@@ -7512,7 +9459,13 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     }
   }
 
-  Future<void> _loadDynasties() async {
+  Future<void> _loadDynasties() {
+    return _dynastiesLoadingFuture ??= _loadDynastiesOnce().whenComplete(() {
+      _dynastiesLoadingFuture = null;
+    });
+  }
+
+  Future<void> _loadDynastiesOnce() async {
     setState(() {
       loadingDynasties = true;
       error = null;
@@ -7538,6 +9491,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     Map<String, String> parameters, {
     required String description,
   }) async {
+    _resetScrollToTop(selectedTab);
     setState(() {
       loading = true;
       error = null;
@@ -7580,6 +9534,12 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   Future<void> _searchToc() async {
     final raw = tocController.text.trim();
     if (raw.isEmpty) return;
+    final pending = _tocPendingSelection;
+    _tocPendingSelection = null;
+    if (pending != null && (raw == pending.rawInput || raw == pending.query)) {
+      await _runTocSearch(pending.rawInput, pending.query);
+      return;
+    }
     final query = await preferredQueryForInput(raw);
     await _runTocSearch(raw, query);
   }
@@ -7587,11 +9547,13 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   Future<void> _onTocSelection(SearchSelection selection) async {
     final raw = selection.rawInput.trim();
     if (raw.isEmpty) return;
+    _tocPendingSelection = null;
     await _runTocSearch(raw, selection.query);
   }
 
   Future<void> _runTocSearch(String raw, String query) async {
     if (raw.isEmpty || query.isEmpty) return;
+    _resetScrollToTop(_tabJingMu);
     try {
       await recordSearchSelection(raw, query);
     } catch (_) {
@@ -7807,7 +9769,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
 
   Iterable<String> _currentViewWorkIds() sync* {
     final cache = CatalogCache.instance;
-    if (selectedTab == 0 || selectedTab == 1) {
+    if (selectedTab == _tabBuLei || selectedTab == _tabCeBie) {
       final levels = catalogLevels[selectedTab]!;
       if (levels.isNotEmpty) {
         final node = cache.findNode(levels.last.q);
@@ -7815,7 +9777,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       }
       return;
     }
-    if (selectedTab == 2) {
+    if (selectedTab == _tabCreator) {
       if (showingWorks) {
         for (final item in listedWorks) {
           yield* _workIdsForItem(item);
@@ -7829,7 +9791,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
       }
       return;
     }
-    if (selectedTab == 3 && !showingWorks) {
+    if (selectedTab == _tabDynasty && !showingWorks) {
       for (final dynasty in dynasties) {
         for (final work in dynasty.works) {
           yield work.work;
@@ -7955,6 +9917,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     List<Map<String, dynamic>> items, {
     required ValueChanged<Map<String, dynamic>> onTap,
   }) => ListView.builder(
+    controller: _scrollControllerFor(selectedTab),
     itemCount: items.length,
     itemBuilder: (context, index) {
       final item = items[index];
@@ -8034,6 +9997,13 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
         child: SearchInput(
           controller: creatorController,
           onSearch: _onCreatorSelection,
+          onSelectionChanged: (selection) {
+            if (selection == null) return;
+            setState(() {
+              showingWorks = false;
+              creatorQuery = selection.query;
+            });
+          },
           textBuilder: (text) => _displayText(text, context),
           displayListenable: scriptureDisplaySettings,
           onChanged: (value) => setState(() {
@@ -8066,6 +10036,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
                 builder: (context) {
                   final rows = visibleCreatorRows;
                   return ListView.builder(
+                    controller: _scrollControllerFor(_tabCreator),
                     itemCount: rows.length,
                     itemBuilder: (context, index) {
                       final row = rows[index];
@@ -8148,6 +10119,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     required String buttonText,
     required VoidCallback onSearch,
     ValueChanged<SearchSelection>? onSelection,
+    ValueChanged<SearchSelection?>? onSelectionChanged,
     TextStyle? hintStyle,
   }) => Column(
     children: [
@@ -8171,6 +10143,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
                   : SearchInput(
                       controller: controller,
                       onSearch: onSelection,
+                      onSelectionChanged: onSelectionChanged,
                       textBuilder: (text) => _displayText(text, context),
                       displayListenable: scriptureDisplaySettings,
                       decoration: InputDecoration(
@@ -8197,104 +10170,113 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   );
 
   @override
-  Widget build(BuildContext context) => DefaultTabController(
-    length: _tabs.length,
-    initialIndex: selectedTab,
-    child: Scaffold(
-      backgroundColor: scriptureDisplaySettings.backgroundColor,
-      appBar: AppBar(
-        title: const Text('選擇佛經'),
-        backgroundColor: scriptureDisplaySettings.surfaceColor,
-        leading: IconButton(
-          tooltip: _displayText('返回', context),
-          onPressed: () {
-            final levels = catalogLevels[activeCatalogTab]!;
-            if ((selectedTab == 0 || selectedTab == 1) &&
-                !showingWorks &&
-                levels.length > 1) {
-              final parentIndex = levels.length - 2;
-              final parent = levels[parentIndex];
-              _loadCatalog(
-                activeCatalogTab,
-                parent.q,
-                breadcrumbIndex: parentIndex,
-              );
-            } else if ((selectedTab == 2 || selectedTab == 3) && showingWorks) {
-              setState(() => showingWorks = false);
-            } else {
-              Navigator.of(context).pop();
-            }
-          },
-          icon: const Icon(Icons.arrow_back_rounded),
-        ),
-        actions: [
-          AnimatedBuilder(
-            animation: downloadManager,
-            builder: (context, _) => _DownloadInfoButton(
-              onPressed: () => _showDownloadStatusPanel(context),
-            ),
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: scriptureDisplaySettings.backgroundColor,
+    appBar: AppBar(
+      title: const Text('選擇佛經'),
+      backgroundColor: scriptureDisplaySettings.surfaceColor,
+      leading: IconButton(
+        tooltip: _displayText('返回', context),
+        onPressed: () {
+          final levels = catalogLevels[activeCatalogTab]!;
+          if ((selectedTab == _tabBuLei || selectedTab == _tabCeBie) &&
+              !showingWorks &&
+              levels.length > 1) {
+            final parentIndex = levels.length - 2;
+            final parent = levels[parentIndex];
+            _loadCatalog(
+              activeCatalogTab,
+              parent.q,
+              breadcrumbIndex: parentIndex,
+            );
+          } else if ((selectedTab == _tabCreator ||
+                  selectedTab == _tabDynasty) &&
+              showingWorks) {
+            setState(() => showingWorks = false);
+          } else {
+            Navigator.of(context).pop();
+          }
+        },
+        icon: const Icon(Icons.arrow_back_rounded),
+      ),
+      actions: [
+        AnimatedBuilder(
+          animation: downloadManager,
+          builder: (context, _) => _DownloadInfoButton(
+            onPressed: () => _showDownloadStatusPanel(context),
           ),
+        ),
+        if (selectedTab == _tabDict)
+          IconButton(
+            tooltip: _displayText('下載全部詞典', context),
+            onPressed: _openFodictDownloadPanel,
+            icon: const Icon(Icons.download_rounded),
+          )
+        else
           IconButton(
             tooltip: _displayText(downloadMode ? '取消下載模式' : '下載', context),
             onPressed: _toggleDownloadMode,
             icon: Icon(downloadMode ? Icons.close : Icons.download_rounded),
           ),
-        ],
-      ),
-      body: Column(
-        children: [
-          TabBar(
-            isScrollable: true,
-            onTap: _selectTab,
-            tabs: [
-              for (final tab in _tabs) Tab(text: _displayText(tab, context)),
-            ],
-          ),
-          if (resultMessage != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text(resultMessage!),
-              ),
+      ],
+    ),
+    body: Column(
+      children: [
+        TabBar(
+          controller: _tabController,
+          isScrollable: true,
+          onTap: _selectTab,
+          tabs: [
+            for (final tab in _tabs) Tab(text: _displayText(tab, context)),
+          ],
+        ),
+        if (resultMessage != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(resultMessage!),
             ),
-          if (loading) const LinearProgressIndicator(),
-          if (error != null)
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text(error!, textAlign: TextAlign.center),
-            ),
-          Expanded(
-            child: switch (selectedTab) {
-              0 => _buildCatalog(0),
-              1 => _buildCatalog(1),
-              2 =>
-                loadingCreators && creators.isEmpty
-                    ? const Center(child: CircularProgressIndicator())
-                    : _buildCreatorTab(),
-              3 =>
-                loadingDynasties && dynasties.isEmpty
-                    ? const Center(child: CircularProgressIndicator())
-                    : _buildDynastyTab(),
-              4 => _buildSearchTab(
-                controller: tocController,
-                hint: '輸入經典名稱…',
-                buttonText: '搜尋',
-                onSearch: _searchToc,
-                onSelection: _onTocSelection,
-              ),
-              5 => _buildSearchTab(
-                controller: gotoController,
-                hint: '輸入行號或完整引文，如 CBETA 2026.R2, B22, no. 117, p. 5a1',
-                buttonText: '到該行',
-                onSearch: _gotoLine,
-              ),
-              _ => _buildDictionaryTab(),
-            },
           ),
-          if (downloadMode) _buildDownloadBottomBar(),
-        ],
-      ),
+        if (loading) const LinearProgressIndicator(),
+        if (error != null)
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Text(error!, textAlign: TextAlign.center),
+          ),
+        Expanded(
+          child: switch (selectedTab) {
+            _tabBuLei => _buildCatalog(_tabBuLei),
+            _tabDict => _buildDictionaryTab(),
+            _tabCeBie => _buildCatalog(_tabCeBie),
+            _tabCreator =>
+              loadingCreators && creators.isEmpty
+                  ? const Center(child: CircularProgressIndicator())
+                  : _buildCreatorTab(),
+            _tabDynasty =>
+              loadingDynasties && dynasties.isEmpty
+                  ? const Center(child: CircularProgressIndicator())
+                  : _buildDynastyTab(),
+            _tabJingMu => _buildSearchTab(
+              controller: tocController,
+              hint: '輸入經典名稱…',
+              buttonText: '搜尋',
+              onSearch: _searchToc,
+              onSelection: _onTocSelection,
+              onSelectionChanged: (selection) =>
+                  _tocPendingSelection = selection,
+            ),
+            _tabGoto => _buildSearchTab(
+              controller: gotoController,
+              hint: '輸入行號或完整引文，如 CBETA 2026.R2, B22, no. 117, p. 5a1',
+              buttonText: '到該行',
+              onSearch: _gotoLine,
+            ),
+            _ => const SizedBox.shrink(),
+          },
+        ),
+        if (downloadMode) _buildDownloadBottomBar(),
+      ],
     ),
   );
 
@@ -8357,6 +10339,12 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
   }
 
   Future<void> _confirmDownload(BuildContext context) async {
+    if (updateManager.isUpdating) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_displayText('更新進行中，完成後再下載經文', context))),
+      );
+      return;
+    }
     final grouped = <String, List<DownloadItem>>{};
     for (final workId in selectedDownloadWorks) {
       if (downloadManager.isWorkDownloaded(workId)) continue;
@@ -8401,70 +10389,1167 @@ class _WorkPickerPageState extends State<_WorkPickerPage> {
     );
   }
 
-  Future<String> _getFodictBaseDir() async {
-    final dir = await getApplicationDocumentsDirectory();
-    return '${dir.path}/fodict';
+  String get _dictionaryCountScope => _fodictBaseDir ?? '';
+
+  Future<Map<String, int>> _dictionaryKeyMatchCounter(
+    List<String> candidates,
+  ) async {
+    final baseDir = _fodictBaseDir;
+    if (baseDir == null) {
+      return {for (final candidate in candidates) candidate: 0};
+    }
+    try {
+      return await _fodictService.countKeyMatches(baseDir, candidates);
+    } catch (_) {
+      return {for (final candidate in candidates) candidate: 0};
+    }
+  }
+
+  Future<void> _searchDictionary() async {
+    final raw = dictionaryController.text.trim();
+    if (raw.isEmpty || _fodictBaseDir == null) return;
+    final pending = _dictionaryPendingSelection;
+    _dictionaryPendingSelection = null;
+    if (pending != null && (raw == pending.rawInput || raw == pending.query)) {
+      await _executeDictionarySelection(
+        pending.rawInput,
+        pending.query,
+        allowFallback: !pending.isExplicit,
+      );
+      return;
+    }
+    await _executeDictionarySelection(raw, null);
+  }
+
+  Future<void> _onDictionarySelection(SearchSelection selection) async {
+    _dictionaryPendingSelection = null;
+    await _executeDictionarySelection(
+      selection.rawInput,
+      selection.query,
+      allowFallback: !selection.isExplicit,
+    );
+  }
+
+  Future<void> _executeDictionarySelection(
+    String rawInput,
+    String? selectedQuery, {
+    bool allowFallback = true,
+  }) async {
+    final raw = rawInput.trim();
+    if (raw.isEmpty || _fodictBaseDir == null) return;
+    if (dictionarySelectionExpanded) {
+      setState(() => dictionarySelectionExpanded = false);
+    }
+    var query = selectedQuery?.trim() ?? '';
+    if (query.isEmpty) {
+      Map<String, String> selections = const {};
+      try {
+        selections = await loadSearchSelections();
+      } catch (_) {
+        // 歷史記錄損壞時仍可查詢。
+      }
+      query = await resolveSearchQuery(
+        raw,
+        selections: selections,
+        keyMatchCounter: _dictionaryKeyMatchCounter,
+      );
+    }
+    if (query.isEmpty || !mounted) return;
+    FocusScope.of(context).unfocus();
+    final actualQuery = await _executeDictionarySearch(
+      query,
+      allowFallback: allowFallback,
+    );
+    try {
+      await recordSearchQuery(raw);
+      await recordSearchSelection(raw, actualQuery);
+    } catch (_) {
+      // 記錄失敗不影響查詢。
+    }
+    if (!mounted) return;
+    dictionaryController.value = TextEditingValue(
+      text: actualQuery,
+      selection: TextSelection.collapsed(offset: actualQuery.length),
+    );
+  }
+
+  /// 依序嘗試原字串、繁體與簡體形式，回傳第一個有結果的查詢。
+  Future<({String query, List<FodictEntry> results})> _searchDictionaryKeys(
+    String query, {
+    bool allowFallback = true,
+  }) async {
+    final variants = <String>[];
+    void add(String value) {
+      final text = value.trim();
+      if (text.isEmpty || variants.contains(text)) return;
+      variants.add(text);
+    }
+
+    add(query);
+    if (allowFallback) {
+      add(SimplifiedTraditionalConverter.toSimplified(query));
+      add(SimplifiedTraditionalConverter.toTraditionalDisplay(query));
+    }
+
+    bool isSelected(FodictEntry entry) =>
+        selectedDictionaries.length == availableDictionaries.length ||
+        selectedDictionaries.contains(entry.dictionaryId);
+
+    for (final variant in variants) {
+      final results = await _fodictService.searchByKey(
+        _fodictBaseDir!,
+        variant,
+        maxResults: 200,
+      );
+      final filtered = results.where(isSelected).toList();
+      if (filtered.isEmpty) continue;
+      return (query: variant, results: filtered);
+    }
+    return (query: query, results: const <FodictEntry>[]);
+  }
+
+  Future<String> _executeDictionarySearch(
+    String query, {
+    bool allowFallback = true,
+  }) async {
+    if (_fodictBaseDir == null) return query;
+    if (!_pendingScrollOffsets.containsKey(_tabDict)) {
+      _resetScrollToTop(_tabDict);
+    }
+    setState(() {
+      loadingDictionaryResults = true;
+      dictionaryError = null;
+      dictionaryResultMessage = null;
+      dictionaryResults = [];
+      _expandedDictionaryIds.clear();
+      _expandedEntryKeys.clear();
+    });
+    try {
+      final match = await _searchDictionaryKeys(
+        query,
+        allowFallback: allowFallback,
+      );
+      final filtered = match.results;
+      if (!mounted) return match.query;
+      setState(() {
+        dictionaryResults = filtered;
+        loadingDictionaryResults = false;
+        dictionaryResultMessage = match.query == query
+            ? '找到 ${filtered.length} 筆結果'
+            : '找到 ${filtered.length} 筆結果（已用「${_displayText(match.query, context)}」查詢）';
+      });
+      return match.query;
+    } catch (e) {
+      if (!mounted) return query;
+      setState(() {
+        dictionaryError = '查詢失敗：$e';
+        loadingDictionaryResults = false;
+      });
+      return query;
+    }
+  }
+
+  Map<String, List<FodictEntry>> get _dictionaryGroupedResults {
+    final groups = <String, List<FodictEntry>>{};
+    for (final entry in dictionaryResults) {
+      groups.putIfAbsent(entry.dictionaryId, () => []).add(entry);
+    }
+    return groups;
   }
 
   Widget _buildDictionaryTab() {
-    return FutureBuilder<String>(
-      future: _getFodictBaseDir(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState != ConnectionState.done) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        if (snapshot.hasError) {
-          return Center(child: Text('無法載入詞典路徑：${snapshot.error}'));
-        }
-        final baseDir = snapshot.data!;
-        return Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  Icons.menu_book_outlined,
-                  size: 64,
-                  color: Theme.of(context).colorScheme.primary,
+    if (loadingDictionaries) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final selecting = dictionarySelectionExpanded;
+    return Column(
+      children: [
+        if (selecting)
+          Expanded(child: _buildDictionarySelectionPanel())
+        else
+          _buildDictionarySelectionPanel(),
+        _buildDictionarySearchRow(),
+        if (!selecting) ...[
+          if (dictionaryResultMessage != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  dictionaryResultMessage!,
+                  style: Theme.of(context).textTheme.bodySmall,
                 ),
-                const SizedBox(height: 16),
-                Text(
-                  _displayText('佛學詞典查詢', context),
-                  style: Theme.of(context).textTheme.headlineSmall,
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  _displayText('收錄 28 部佛學詞典，支援關鍵詞搜尋', context),
-                  style: Theme.of(context).textTheme.bodyMedium,
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 24),
-                FilledButton.icon(
-                  onPressed: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (context) =>
-                            DictionarySearchPage(fodictBaseDir: baseDir),
+              ),
+            ),
+          if (loadingDictionaryResults) const LinearProgressIndicator(),
+          if (dictionaryError != null)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(dictionaryError!, textAlign: TextAlign.center),
+            ),
+          Expanded(
+            child: dictionaryResults.isEmpty && !loadingDictionaryResults
+                ? Center(
+                    child: Text(
+                      _displayText('輸入關鍵詞查詢佛學詞典', context),
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
-                    );
-                  },
-                  icon: const Icon(Icons.search_rounded),
-                  label: Text(_displayText('開啟詞典查詢', context)),
+                    ),
+                  )
+                : _buildDictionaryGroupedResults(),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildDictionarySearchRow() {
+    return Padding(
+      padding: const EdgeInsets.all(12),
+      child: Row(
+        children: [
+          Expanded(
+            child: SearchInput(
+              controller: dictionaryController,
+              onSearch: _onDictionarySelection,
+              onSelectionChanged: (selection) =>
+                  _dictionaryPendingSelection = selection,
+              onFieldTap: _collapseDictionarySelectionForInput,
+              keyMatchCounter: _dictionaryKeyMatchCounter,
+              countScope: _dictionaryCountScope,
+              textBuilder: (text) => _displayText(text, context),
+              displayListenable: scriptureDisplaySettings,
+              decoration: InputDecoration(
+                prefixIcon: const Icon(Icons.search_rounded),
+                hintText: _displayText('輸入關鍵詞…', context),
+                border: const OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          FilledButton(
+            onPressed: loadingDictionaryResults || availableDictionaries.isEmpty
+                ? null
+                : _searchDictionary,
+            child: Text(_displayText('搜尋', context)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDictionaryGroupedResults() {
+    final groups = _dictionaryGroupedResults;
+    final dictIds = groups.keys.toList()..sort((a, b) => a.compareTo(b));
+
+    return CustomScrollView(
+      controller: _scrollControllerFor(_tabDict),
+      slivers: [
+        for (final dictId in dictIds)
+          _DictionaryStickyHeader(
+            dictId: dictId,
+            entries: groups[dictId]!,
+            dictName:
+                availableDictionaries
+                    .where((d) => d.id == dictId)
+                    .firstOrNull
+                    ?.name ??
+                dictId,
+            isExpanded: _expandedDictionaryIds.contains(dictId),
+            onExpansionChanged: (expanded) {
+              setState(() {
+                if (expanded) {
+                  _expandedDictionaryIds.add(dictId);
+                } else {
+                  _expandedDictionaryIds.remove(dictId);
+                }
+              });
+            },
+            buildEntryTile: (entry) => _buildDictionaryKeywordTile(entry),
+            context: context,
+          ),
+      ],
+    );
+  }
+
+  Future<void> _lookupDictionarySelection(String text) async {
+    final term = text.trim();
+    if (term.isEmpty) return;
+    _dictionaryPendingSelection = null;
+    dictionaryController.value = TextEditingValue(
+      text: term,
+      selection: TextSelection.collapsed(offset: term.length),
+    );
+    // 直接以选中的文字执行查询，等同按下「搜尋」按钮。
+    await _executeDictionarySelection(term, term);
+  }
+
+  Widget _buildDictionaryKeywordTile(FodictEntry entry) {
+    final entryKey = '${entry.dictionaryId}:${entry.keyword}';
+    final isEntryExpanded = _expandedEntryKeys.contains(entryKey);
+    final bodyStyle = _scriptureTextStyle(scriptureDisplaySettings);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Divider(height: 1),
+        InkWell(
+          onTap: () => setState(() {
+            if (isEntryExpanded) {
+              _expandedEntryKeys.remove(entryKey);
+            } else {
+              _expandedEntryKeys.add(entryKey);
+            }
+          }),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 10, 12, 10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _displayText(entry.keyword, context),
+                    style: bodyStyle.copyWith(fontWeight: FontWeight.w600),
+                  ),
+                ),
+                Icon(
+                  isEntryExpanded ? Icons.expand_less : Icons.expand_more,
+                  size: 20,
                 ),
               ],
             ),
           ),
-        );
+        ),
+        if (isEntryExpanded)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 16, 12),
+            child: SelectableText(
+              _displayText(_cleanFodictDefinition(entry.definition), context),
+              style: bodyStyle,
+              contextMenuBuilder: (context, editableTextState) {
+                final value = editableTextState.textEditingValue;
+                final selection = value.selection;
+                final selected = selection.isValid && !selection.isCollapsed
+                    ? selection.textInside(value.text).trim()
+                    : '';
+                return AdaptiveTextSelectionToolbar.buttonItems(
+                  anchors: editableTextState.contextMenuAnchors,
+                  buttonItems: [
+                    ContextMenuButtonItem(
+                      label: '全選',
+                      onPressed: () {
+                        editableTextState.selectAll(
+                          SelectionChangedCause.toolbar,
+                        );
+                        editableTextState.hideToolbar();
+                      },
+                    ),
+                    if (selected.isNotEmpty)
+                      ContextMenuButtonItem(
+                        label: '查詞典',
+                        onPressed: () {
+                          editableTextState.hideToolbar();
+                          _lookupDictionarySelection(selected);
+                        },
+                      ),
+                    if (selected.isNotEmpty)
+                      ContextMenuButtonItem(
+                        label: '複製',
+                        onPressed: () async {
+                          await Clipboard.setData(
+                            ClipboardData(text: selected),
+                          );
+                          editableTextState.hideToolbar();
+                        },
+                      ),
+                  ],
+                );
+              },
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildDictionarySelectionPanel() {
+    final expanded = dictionarySelectionExpanded;
+    return Column(
+      children: [
+        InkWell(
+          onTap: _toggleDictionarySelection,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
+              children: [
+                const Icon(Icons.menu_book_outlined, size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _displayText(
+                      '字典選擇（${selectedDictionaries.length}/${availableDictionaries.length}）',
+                      context,
+                    ),
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                ),
+                Icon(expanded ? Icons.expand_less : Icons.expand_more),
+              ],
+            ),
+          ),
+        ),
+        if (expanded) ...[
+          const Divider(height: 1),
+          _buildDictionarySelectionToolbar(),
+          if (_loadingRemoteDictionaries) const LinearProgressIndicator(),
+          if (_remoteDictionariesError != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 8, 0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _remoteDictionariesError!,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _loadRemoteDictionaries,
+                    child: Text(_displayText('重試', context)),
+                  ),
+                ],
+              ),
+            ),
+          if (fodictDownloadManager.error != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: Text(
+                fodictDownloadManager.error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+          Expanded(child: _buildDictionaryPickerList()),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildDictionarySelectionToolbar() {
+    final manager = fodictDownloadManager;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Row(
+        children: [
+          TextButton(
+            onPressed: availableDictionaries.isEmpty
+                ? null
+                : () => setState(() {
+                    if (selectedDictionaries.length ==
+                        availableDictionaries.length) {
+                      selectedDictionaries.clear();
+                    } else {
+                      selectedDictionaries = availableDictionaries
+                          .map((dict) => dict.id)
+                          .toSet();
+                    }
+                  }),
+            child: Text(
+              selectedDictionaries.length == availableDictionaries.length
+                  ? _displayText('全不選', context)
+                  : _displayText('全選', context),
+            ),
+          ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: manager.hasQueuedItems
+                ? Text(
+                    _displayText(
+                      manager.currentTask == null
+                          ? '${manager.queue.length} 個任務等待下載'
+                          : '下載中 ${(manager.progress * 100).toStringAsFixed(0)}%',
+                      context,
+                    ),
+                    style: Theme.of(context).textTheme.bodySmall,
+                  )
+                : const SizedBox.shrink(),
+          ),
+          if (manager.isDownloading)
+            IconButton(
+              tooltip: _displayText('暫停下載', context),
+              onPressed: manager.pauseDownload,
+              icon: const Icon(Icons.pause_rounded, size: 20),
+            )
+          else if (manager.canResume)
+            IconButton(
+              tooltip: _displayText('繼續下載', context),
+              onPressed: manager.resumeDownload,
+              icon: const Icon(Icons.play_arrow_rounded, size: 20),
+            ),
+          IconButton(
+            tooltip: _displayText('重新整理詞典清單', context),
+            onPressed: _loadingRemoteDictionaries
+                ? null
+                : _loadRemoteDictionaries,
+            icon: const Icon(Icons.refresh_rounded, size: 20),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDictionaryPickerList() {
+    final localById = {for (final dict in availableDictionaries) dict.id: dict};
+    final remoteById = {for (final dict in _remoteDictionaries) dict.id: dict};
+    final ids = <String>{...localById.keys, ...remoteById.keys}.toList()
+      ..sort();
+    if (ids.isEmpty) {
+      return Center(
+        child: Text(
+          _displayText(
+            _loadingRemoteDictionaries ? '正在取得詞典清單…' : '沒有可用詞典',
+            context,
+          ),
+        ),
+      );
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.only(bottom: 8),
+      itemCount: ids.length,
+      itemBuilder: (context, index) {
+        final id = ids[index];
+        return _buildDictionaryPickerTile(id, localById[id], remoteById[id]);
       },
     );
   }
 
+  Widget _buildDictionaryPickerTile(
+    String id,
+    FodictInfo? local,
+    FodictRemoteDictionary? remote,
+  ) {
+    final manager = fodictDownloadManager;
+    final installed = local != null || manager.isInstalled(id);
+    final bundled = manager.isBundled(id);
+    final update = remote != null && manager.hasUpdate(remote);
+    final current = manager.currentTask?.id == id;
+    final selected = selectedDictionaries.contains(id);
+    final name = local?.name ?? remote?.name ?? id;
+    FodictDownloadTask? task;
+    for (final item in manager.queue) {
+      if (item.id == id) {
+        task = item;
+        break;
+      }
+    }
+
+    final subtitle = StringBuffer(id);
+    final size = local?.datSize ?? remote?.zipSize ?? 0;
+    if (size > 0) subtitle.write(' · ${_formatDictSize(size)}');
+    if (remote != null && remote.entries > 0) {
+      subtitle.write(' · ${remote.entries} ${_displayText('條', context)}');
+    }
+    if (bundled) {
+      subtitle.write(' · ${_displayText('內建', context)}');
+    } else if (installed) {
+      subtitle.write(' · ${_displayText('已安裝', context)}');
+      if (update) subtitle.write(' · ${_displayText('有新版本', context)}');
+    } else if (remote != null && !remote.available) {
+      subtitle.write(' · ${_displayText('尚未上傳', context)}');
+    }
+
+    final subtitleStyle = Theme.of(context).textTheme.bodySmall;
+    final actions = _buildDictionaryPickerActions(
+      id: id,
+      name: name,
+      remote: remote,
+      installed: installed,
+      bundled: bundled,
+      update: update,
+      task: task,
+      current: current,
+    );
+    final subtitleWidget = current
+        ? _buildDictionaryTaskProgress(subtitleStyle)
+        : Text(subtitle.toString(), style: subtitleStyle);
+
+    if (installed) {
+      return CheckboxListTile(
+        value: selected,
+        onChanged: (value) => setState(() {
+          if (value == true) {
+            selectedDictionaries.add(id);
+          } else {
+            selectedDictionaries.remove(id);
+          }
+        }),
+        title: Text(_displayText(name, context)),
+        subtitle: subtitleWidget,
+        isThreeLine: current,
+        secondary: actions,
+        dense: true,
+        controlAffinity: ListTileControlAffinity.leading,
+      );
+    }
+    return ListTile(
+      leading: Icon(
+        bundled ? Icons.menu_book_rounded : Icons.book_outlined,
+        size: 20,
+      ),
+      title: Text(_displayText(name, context)),
+      subtitle: subtitleWidget,
+      isThreeLine: current,
+      trailing: actions,
+      dense: true,
+    );
+  }
+
+  Widget _buildDictionaryPickerActions({
+    required String id,
+    required String name,
+    required FodictRemoteDictionary? remote,
+    required bool installed,
+    required bool bundled,
+    required bool update,
+    required FodictDownloadTask? task,
+    required bool current,
+  }) {
+    final manager = fodictDownloadManager;
+    if (task != null) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (current)
+            SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                value: manager.progress,
+              ),
+            )
+          else
+            const Icon(Icons.schedule_rounded, size: 20),
+          IconButton(
+            tooltip: _displayText('移除此下載任務', context),
+            visualDensity: VisualDensity.compact,
+            onPressed: () => manager.removeTask(id),
+            icon: const Icon(Icons.close_rounded, size: 20),
+          ),
+        ],
+      );
+    }
+    if (bundled) {
+      return Text(
+        _displayText('內建', context),
+        style: TextStyle(color: Theme.of(context).colorScheme.primary),
+      );
+    }
+    if (update && remote != null) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            tooltip: _displayText('刪除本地詞典', context),
+            visualDensity: VisualDensity.compact,
+            onPressed: () => _confirmDeleteFodict(id, name),
+            icon: const Icon(Icons.delete_outline, size: 20),
+          ),
+          TextButton(
+            onPressed: () => _startFodictDownload(remote),
+            child: Text(_displayText('更新', context)),
+          ),
+        ],
+      );
+    }
+    if (installed) {
+      return IconButton(
+        tooltip: _displayText('刪除本地詞典', context),
+        visualDensity: VisualDensity.compact,
+        onPressed: () => _confirmDeleteFodict(id, name),
+        icon: const Icon(Icons.delete_outline, size: 20),
+      );
+    }
+    if (remote != null && remote.available) {
+      return FilledButton.tonal(
+        onPressed: () => _startFodictDownload(remote),
+        child: Text(_displayText('下載', context)),
+      );
+    }
+    return const Icon(Icons.cloud_off_outlined, size: 20);
+  }
+
+  Widget _buildDictionaryTaskProgress(TextStyle? style) {
+    final manager = fodictDownloadManager;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 4),
+        LinearProgressIndicator(value: manager.progress),
+        const SizedBox(height: 2),
+        Text(
+          '${_formatDownloadBytes(manager.receivedBytes)} / '
+          '${_formatDownloadBytes(manager.totalBytes)} · '
+          '${formatDownloadSpeed(manager.downloadSpeedBytesPerSecond)}',
+          style: style,
+        ),
+      ],
+    );
+  }
+
+  String _formatDictSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
   @override
   void dispose() {
+    for (final entry in _scrollControllers.entries) {
+      if (entry.value.hasClients) {
+        _savedScrollOffsets[entry.key] = entry.value.offset;
+      }
+      entry.value.dispose();
+    }
+    unawaited(_saveSnapshot());
+    _tabController.dispose();
+    fodictDownloadManager.removeListener(_onFodictDownloadManagerChanged);
+    CatalogCache.instance.removeListener(_onCatalogReloaded);
     creatorController.dispose();
     tocController.dispose();
     gotoController.dispose();
+    dictionaryController.dispose();
     super.dispose();
+  }
+
+  Future<void> _saveSnapshot() {
+    final levels = <int, List<PickerCatalogLevel>>{};
+    for (final entry in catalogLevels.entries) {
+      if (entry.value.isEmpty) continue;
+      levels[entry.key] = [
+        for (final level in entry.value)
+          PickerCatalogLevel(q: level.q, label: level.label),
+      ];
+    }
+    final restoresWorksView =
+        selectedTab == _tabCreator ||
+        selectedTab == _tabDynasty ||
+        selectedTab == _tabJingMu;
+    return saveWorkPickerSnapshot(
+      WorkPickerSnapshot(
+        tab: selectedTab,
+        scrollOffsets: Map.of(_savedScrollOffsets),
+        dictionaryQuery: dictionaryController.text.trim(),
+        dictionaryExpandedIds: Set.of(_expandedDictionaryIds),
+        dictionaryExpandedEntryKeys: Set.of(_expandedEntryKeys),
+        catalogLevels: levels,
+        creatorQuery: creatorController.text,
+        tocQuery: tocController.text,
+        gotoQuery: gotoController.text,
+        showingWorks: restoresWorksView && showingWorks,
+        listedWorks: restoresWorksView && showingWorks
+            ? List.of(listedWorks)
+            : const [],
+        resultMessage: resultMessage,
+      ),
+    );
+  }
+}
+
+class _DictionaryStickyHeader extends StatefulWidget {
+  const _DictionaryStickyHeader({
+    required this.dictId,
+    required this.entries,
+    required this.dictName,
+    required this.isExpanded,
+    required this.onExpansionChanged,
+    required this.buildEntryTile,
+    required this.context,
+  });
+
+  final String dictId;
+  final List<FodictEntry> entries;
+  final String dictName;
+  final bool isExpanded;
+  final ValueChanged<bool> onExpansionChanged;
+  final Widget Function(FodictEntry) buildEntryTile;
+  final BuildContext context;
+
+  @override
+  State<_DictionaryStickyHeader> createState() =>
+      _DictionaryStickyHeaderState();
+}
+
+class _DictionaryStickyHeaderState extends State<_DictionaryStickyHeader>
+    with AutomaticKeepAliveClientMixin {
+  bool _childrenBuilt = false;
+  final _headerKey = GlobalKey();
+
+  @override
+  bool get wantKeepAlive => widget.isExpanded;
+
+  @override
+  void didUpdateWidget(_DictionaryStickyHeader oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isExpanded && !_childrenBuilt) {
+      setState(() => _childrenBuilt = true);
+    }
+    // 当从展开变为折叠时，滚动到 header 位置
+    if (oldWidget.isExpanded && !widget.isExpanded) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scrollToHeader();
+      });
+    }
+  }
+
+  void _scrollToHeader() {
+    final context = _headerKey.currentContext;
+    if (context != null) {
+      Scrollable.ensureVisible(
+        context,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeInOut,
+        alignment: 0.0,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+
+    return SliverMainAxisGroup(
+      slivers: [
+        SliverPersistentHeader(
+          pinned: true,
+          delegate: _DictionaryHeaderDelegate(
+            headerKey: _headerKey,
+            dictName: widget.dictName,
+            entryCount: widget.entries.length,
+            isExpanded: widget.isExpanded,
+            onToggle: () {
+              final newExpanded = !widget.isExpanded;
+              widget.onExpansionChanged(newExpanded);
+              if (newExpanded && !_childrenBuilt) {
+                setState(() => _childrenBuilt = true);
+              }
+            },
+            context: widget.context,
+          ),
+        ),
+        if (widget.isExpanded && _childrenBuilt)
+          SliverPadding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            sliver: SliverToBoxAdapter(
+              child: Card(
+                margin: const EdgeInsets.symmetric(vertical: 4),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    for (final entry in widget.entries)
+                      widget.buildEntryTile(entry),
+                  ],
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _DictionaryHeaderDelegate extends SliverPersistentHeaderDelegate {
+  _DictionaryHeaderDelegate({
+    required this.headerKey,
+    required this.dictName,
+    required this.entryCount,
+    required this.isExpanded,
+    required this.onToggle,
+    required this.context,
+  });
+
+  final GlobalKey headerKey;
+  final String dictName;
+  final int entryCount;
+  final bool isExpanded;
+  final VoidCallback onToggle;
+  final BuildContext context;
+
+  @override
+  double get minExtent => 56;
+
+  @override
+  double get maxExtent => 80;
+
+  @override
+  Widget build(
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
+    final theme = Theme.of(context);
+    final elevation = isExpanded && shrinkOffset > 0 ? 4.0 : 0.0;
+
+    return Material(
+      key: headerKey,
+      color: theme.colorScheme.surface,
+      elevation: elevation,
+      child: InkWell(
+        onTap: onToggle,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '${_displayText(dictName, context)}（$entryCount）',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Icon(isExpanded ? Icons.expand_less : Icons.expand_more),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  bool shouldRebuild(covariant _DictionaryHeaderDelegate oldDelegate) {
+    return dictName != oldDelegate.dictName ||
+        entryCount != oldDelegate.entryCount ||
+        isExpanded != oldDelegate.isExpanded;
+  }
+}
+
+class _HomepageDictionaryStickyHeader extends StatefulWidget {
+  const _HomepageDictionaryStickyHeader({
+    required this.dictId,
+    required this.entries,
+    required this.dictName,
+    required this.isExpanded,
+    required this.onExpansionChanged,
+    required this.onEntryTap,
+    required this.expandedEntryKeys,
+    required this.context,
+  });
+
+  final String dictId;
+  final List<FodictEntry> entries;
+  final String dictName;
+  final bool isExpanded;
+  final ValueChanged<bool> onExpansionChanged;
+  final ValueChanged<FodictEntry> onEntryTap;
+  final Set<String> expandedEntryKeys;
+  final BuildContext context;
+
+  @override
+  State<_HomepageDictionaryStickyHeader> createState() =>
+      _HomepageDictionaryStickyHeaderState();
+}
+
+class _HomepageDictionaryStickyHeaderState
+    extends State<_HomepageDictionaryStickyHeader>
+    with AutomaticKeepAliveClientMixin {
+  bool _childrenBuilt = false;
+  final _headerKey = GlobalKey();
+
+  @override
+  bool get wantKeepAlive => widget.isExpanded;
+
+  @override
+  void didUpdateWidget(_HomepageDictionaryStickyHeader oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isExpanded && !_childrenBuilt) {
+      setState(() => _childrenBuilt = true);
+    }
+    if (oldWidget.isExpanded && !widget.isExpanded) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scrollToHeader();
+      });
+    }
+  }
+
+  void _scrollToHeader() {
+    final context = _headerKey.currentContext;
+    if (context != null) {
+      Scrollable.ensureVisible(
+        context,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeInOut,
+        alignment: 0.0,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+
+    return SliverMainAxisGroup(
+      slivers: [
+        SliverPersistentHeader(
+          pinned: true,
+          delegate: _HomepageDictionaryHeaderDelegate(
+            headerKey: _headerKey,
+            dictName: widget.dictName,
+            entryCount: widget.entries.length,
+            isExpanded: widget.isExpanded,
+            onToggle: () {
+              final newExpanded = !widget.isExpanded;
+              widget.onExpansionChanged(newExpanded);
+              if (newExpanded && !_childrenBuilt) {
+                setState(() => _childrenBuilt = true);
+              }
+            },
+            context: widget.context,
+          ),
+        ),
+        if (widget.isExpanded && _childrenBuilt)
+          SliverPadding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            sliver: SliverToBoxAdapter(
+              child: Card(
+                margin: const EdgeInsets.symmetric(vertical: 4),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    for (final entry in widget.entries)
+                      _buildHomepageDictionaryEntryTile(entry),
+                  ],
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildHomepageDictionaryEntryTile(FodictEntry entry) {
+    final entryKey = '${entry.dictionaryId}:${entry.keyword}';
+    final isEntryExpanded = widget.expandedEntryKeys.contains(entryKey);
+    final snippet = _fodictDefinitionSnippet(entry.definition);
+    final bodyStyle = _scriptureTextStyle(scriptureDisplaySettings);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Divider(height: 1),
+        InkWell(
+          onTap: () => widget.onEntryTap(entry),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 10, 12, 10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _displayText(entry.keyword, widget.context),
+                        style: bodyStyle.copyWith(fontWeight: FontWeight.w600),
+                      ),
+                      if (!isEntryExpanded && snippet.isNotEmpty)
+                        Text(
+                          snippet,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: bodyStyle.copyWith(
+                            color: const Color(0xFF78847F),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                Icon(
+                  isEntryExpanded
+                      ? Icons.expand_less_rounded
+                      : Icons.expand_more_rounded,
+                  size: 20,
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (isEntryExpanded)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 16, 12),
+            child: SelectableText(
+              _displayText(
+                _cleanFodictDefinition(entry.definition),
+                widget.context,
+              ),
+              style: bodyStyle,
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _HomepageDictionaryHeaderDelegate extends SliverPersistentHeaderDelegate {
+  _HomepageDictionaryHeaderDelegate({
+    required this.headerKey,
+    required this.dictName,
+    required this.entryCount,
+    required this.isExpanded,
+    required this.onToggle,
+    required this.context,
+  });
+
+  final GlobalKey headerKey;
+  final String dictName;
+  final int entryCount;
+  final bool isExpanded;
+  final VoidCallback onToggle;
+  final BuildContext context;
+
+  @override
+  double get minExtent => 56;
+
+  @override
+  double get maxExtent => 80;
+
+  @override
+  Widget build(
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
+    final theme = Theme.of(context);
+    final elevation = isExpanded && shrinkOffset > 0 ? 4.0 : 0.0;
+
+    return Material(
+      key: headerKey,
+      color: theme.colorScheme.surface,
+      elevation: elevation,
+      child: InkWell(
+        onTap: onToggle,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '${_displayText(dictName, context)}（$entryCount）',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Icon(isExpanded ? Icons.expand_less : Icons.expand_more),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  bool shouldRebuild(covariant _HomepageDictionaryHeaderDelegate oldDelegate) {
+    return dictName != oldDelegate.dictName ||
+        entryCount != oldDelegate.entryCount ||
+        isExpanded != oldDelegate.isExpanded;
   }
 }

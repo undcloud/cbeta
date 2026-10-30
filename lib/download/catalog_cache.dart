@@ -207,10 +207,14 @@ class _WorkMeta {
   int? juan;
 }
 
-class CatalogCache {
+class CatalogCache extends ChangeNotifier {
   CatalogCache._();
 
   static final CatalogCache instance = CatalogCache._();
+
+  /// 經目更新後，下載檔案會放在應用程式支援目錄；由 App 啟動時注入讀取器。
+  /// 測試未注入時一律使用安裝包內的資產。
+  Future<Uint8List?> Function(String fileName)? localFileLoader;
 
   CatalogNode? _cbetaTree;
   CatalogNode? _origTree;
@@ -238,20 +242,27 @@ class CatalogCache {
     }
   }
 
+  /// 重新讀取經目檔（可能已被更新服務覆寫），並通知側邊欄重建目錄。
+  Future<void> reload() async {
+    final loading = _loading;
+    if (loading != null) {
+      try {
+        await loading;
+      } catch (_) {}
+    }
+    _resetState();
+    await load();
+    notifyListeners();
+  }
+
   Future<void> _load() async {
-    final categoryRaw = await _loadJsonArray(
-      'assets/cbeta_catalog/category.json',
+    final categoryRaw = await _loadCatalogJson('category.json');
+    final volumeRaw = await _loadCatalogJson('vol.json');
+    final creatorsRaw = await _loadCatalogJson(
+      'creators-by-strokes-with-works.json',
     );
-    final volumeRaw = await _loadJsonArray('assets/cbeta_catalog/vol.json');
-    final creatorsRaw = await _loadJsonArray(
-      'assets/cbeta_catalog/creators-by-strokes-with-works.json',
-    );
-    final dynastiesRaw = await _loadJsonArray(
-      'assets/cbeta_catalog/dynasty-works.json',
-    );
-    final workFilesRaw = await _loadJsonArray(
-      'assets/cbeta_catalog/work_files.json',
-    );
+    final dynastiesRaw = await _loadCatalogJson('dynasty-works.json');
+    final workFilesRaw = await _loadCatalogJson('work_files.json');
     _workFiles = {
       if (workFilesRaw.isNotEmpty)
         for (final entry in workFilesRaw.first.entries)
@@ -311,10 +322,8 @@ class CatalogCache {
     for (final entry in works.values) {
       final workId = entry.work.toLowerCase();
       final title = entry.title.toLowerCase();
-      final creators = entry.creators.toLowerCase();
-      if (!workId.contains(query) &&
-          !title.contains(query) &&
-          !creators.contains(query)) {
+      // 經目查詢只按編號與書名匹配；作譯者／朝代有獨立的分頁入口。
+      if (!workId.contains(query) && !title.contains(query)) {
         continue;
       }
       var rank = 3;
@@ -322,8 +331,6 @@ class CatalogCache {
         rank = 0;
       } else if (title.startsWith(query) || workId.startsWith(query)) {
         rank = 1;
-      } else if (creators.contains(query)) {
-        rank = 2;
       }
       matches.add((rank, entry));
     }
@@ -390,17 +397,41 @@ class CatalogCache {
     return items;
   }
 
-  static Future<List<Map<String, dynamic>>> _loadJsonArray(String path) async {
+  Future<List<Map<String, dynamic>>> _loadCatalogJson(String fileName) async {
+    final loader = localFileLoader;
+    if (loader != null) {
+      try {
+        final local = await loader(fileName);
+        if (local != null) {
+          final decoded = jsonDecode(utf8.decode(local));
+          final list = _normalizeJsonRoot(decoded);
+          if (list != null && list.isNotEmpty) return list;
+        }
+      } catch (_) {
+        // 下載檔損壞時退回安裝包內的經目，避免整個側邊欄無法使用。
+      }
+    }
+    return _loadAssetJsonArray('assets/cbeta_catalog/$fileName');
+  }
+
+  static Future<List<Map<String, dynamic>>> _loadAssetJsonArray(
+    String path,
+  ) async {
     final data = await rootBundle.load(path);
     final decoded = jsonDecode(
       utf8.decode(
         data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
       ),
     );
+    return _normalizeJsonRoot(decoded) ?? const [];
+  }
+
+  static List<Map<String, dynamic>>? _normalizeJsonRoot(Object? decoded) {
     if (decoded is Map<String, dynamic>) return [decoded];
-    return (decoded as List<dynamic>)
-        .whereType<Map<String, dynamic>>()
-        .toList();
+    if (decoded is List) {
+      return decoded.whereType<Map<String, dynamic>>().toList();
+    }
+    return null;
   }
 
   static String _titleOf(Map<String, dynamic> node) =>
@@ -666,6 +697,10 @@ class CatalogCache {
 
   @visibleForTesting
   void debugReset() {
+    _resetState();
+  }
+
+  void _resetState() {
     _cbetaTree = null;
     _origTree = null;
     _allWorks = null;

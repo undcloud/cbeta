@@ -127,13 +127,73 @@ double _textSimilarity(String left, String right) {
   return 1 - distance / math.max(left.length, right.length);
 }
 
+typedef KeyMatchCounter =
+    Future<Map<String, int>> Function(List<String> candidates);
+
+/// 依「選中候選 → 歷史選擇 → 首選候選＋字典命中數」決定實際查詢詞。
+Future<String> resolveSearchQuery(
+  String rawInput, {
+  String? selectedQuery,
+  Map<String, String>? selections,
+  KeyMatchCounter? keyMatchCounter,
+}) async {
+  final raw = rawInput.trim();
+  if (raw.isEmpty) return '';
+  final selected = selectedQuery?.trim() ?? '';
+  if (selected.isNotEmpty) return selected;
+
+  var savedSelections = selections ?? const <String, String>{};
+  if (selections == null) {
+    try {
+      savedSelections = await loadSearchSelections();
+    } catch (_) {
+      // 歷史記錄損壞時仍可搜尋。
+    }
+  }
+  final historical = matchHistoricalSelection(raw, savedSelections);
+  if (historical != null && historical.isNotEmpty) return historical;
+
+  final conversion = SimplifiedTraditionalConverter.convertCandidates(raw);
+  if (conversion.candidates.isEmpty) return raw;
+  final preferred = conversion.candidates.first;
+  if (keyMatchCounter == null || conversion.candidates.length <= 1) {
+    return preferred;
+  }
+
+  Map<String, int> counts;
+  try {
+    counts = await keyMatchCounter(conversion.candidates);
+  } catch (_) {
+    return preferred;
+  }
+  var best = preferred;
+  var bestTraditional = SimplifiedTraditionalConverter.ranksAsTraditional(
+    preferred,
+  );
+  var bestCount = counts[preferred] ?? 0;
+  for (final candidate in conversion.candidates) {
+    final count = counts[candidate] ?? 0;
+    final isTraditional = SimplifiedTraditionalConverter.ranksAsTraditional(
+      candidate,
+    );
+    final betterGroup = isTraditional && !bestTraditional;
+    final sameGroupCount =
+        isTraditional == bestTraditional && count > bestCount;
+    if (betterGroup || sameGroupCount) {
+      best = candidate;
+      bestTraditional = isTraditional;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
 String preferredQueryFor(String rawInput, Map<String, String> selections) {
   final raw = rawInput.trim();
   if (raw.isEmpty) return '';
-  final conversion = SimplifiedTraditionalConverter.convertCandidates(
-    raw,
-    historicalQuery: matchHistoricalSelection(raw, selections),
-  );
+  final historical = matchHistoricalSelection(raw, selections);
+  if (historical != null && historical.isNotEmpty) return historical;
+  final conversion = SimplifiedTraditionalConverter.convertCandidates(raw);
   return conversion.candidates.isEmpty ? raw : conversion.candidates.first;
 }
 

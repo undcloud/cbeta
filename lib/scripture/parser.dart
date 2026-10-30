@@ -3,6 +3,16 @@ import 'package:html/parser.dart' show parseFragment;
 
 import 'models.dart';
 
+/// 逐行解析用到的正則只構造一次:離線搜尋會一次解析數萬行經文,
+/// 每行構造數個 `RegExp` 會把掃描變成不可中斷的長任務。
+final _whitespacePattern = RegExp(r'\s+');
+final _leadingSpacePattern = RegExp(r'^[ \t]+');
+final _trailingSpacePattern = RegExp(r'[ \t]+$');
+final _anchorPrefixPattern = RegExp(r'^#');
+final _noteNumberPattern = RegExp(r'n\d+(\d{3})$');
+final _trailingDigitsPattern = RegExp(r'(\d+)$');
+final _bracketNumberPattern = RegExp(r'\[\d+\]');
+
 String visibleScriptureLine(
   ScriptureLine line, {
   required bool showLineBeginnings,
@@ -38,7 +48,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
   final footnoteContent = {
     for (final note in fragment.querySelectorAll('#back .footnote'))
       if (note.id.isNotEmpty)
-        note.id: note.text.trim().replaceAll(RegExp(r'\s+'), ' '),
+        note.id: note.text.trim().replaceAll(_whitespacePattern, ' '),
   };
   final lines = <ScriptureLine>[];
   String? linehead;
@@ -58,11 +68,13 @@ List<ScriptureLine> parseScriptureHtml(String source) {
         images.isNotEmpty ||
         tableRows.isNotEmpty) {
       final rawText = text.toString();
-      final trimmedText = rawText
-          .replaceFirst(RegExp(r'^[ \t]+'), '')
-          .replaceFirst(RegExp(r'[ \t]+$'), '');
-      final leadingWhitespace =
-          rawText.length - rawText.replaceFirst(RegExp(r'^[ \t]+'), '').length;
+      final leadingMatch = _leadingSpacePattern.firstMatch(rawText);
+      final leadingWhitespace = leadingMatch?.end ?? 0;
+      final trailingMatch = _trailingSpacePattern.firstMatch(rawText);
+      final trimmedText = rawText.substring(
+        leadingWhitespace,
+        trailingMatch?.start ?? rawText.length,
+      );
       lines.add(
         ScriptureLine(
           text: trimmedText,
@@ -169,7 +181,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
             final columnSpan =
                 int.tryParse(cell.attributes['colspan'] ?? '') ?? 1;
             return ScriptureTableCell(
-              text: cellText.replaceAll(RegExp(r'\s+'), ' '),
+              text: cellText.replaceAll(_whitespacePattern, ' '),
               columnSpan: columnSpan.clamp(1, 12),
             );
           })
@@ -188,11 +200,11 @@ List<ScriptureLine> parseScriptureHtml(String source) {
         node.localName == 'a' &&
         node.classes.contains('noteAnchor')) {
       final href = node.attributes['href'] ?? '';
-      final clue = href.replaceFirst(RegExp(r'^#'), '');
+      final clue = href.replaceFirst(_anchorPrefixPattern, '');
       final addNote = node.classes.contains('add');
-      final noteNumber = RegExp(r'n\d+(\d{3})$').firstMatch(href)?.group(1);
+      final noteNumber = _noteNumberPattern.firstMatch(href)?.group(1);
       final label = addNote
-          ? 'A${RegExp(r'(\d+)$').firstMatch(clue)?.group(1) ?? ''}'
+          ? 'A${_trailingDigitsPattern.firstMatch(clue)?.group(1) ?? ''}'
           : noteNumber == null
           ? null
           : int.tryParse(noteNumber)?.toString();
@@ -282,8 +294,8 @@ List<ScriptureLine> parseScriptureHtml(String source) {
   return lines.map((line) {
     if (line.role != ScriptureLineRole.volumeTitle) return line;
     final normalizedTitle = line.text
-        .replaceAll(RegExp(r'\s+'), '')
-        .replaceAll(RegExp(r'\[\d+\]'), '');
+        .replaceAll(_whitespacePattern, '')
+        .replaceAll(_bracketNumberPattern, '');
     if (seenVolumeTitles.add(normalizedTitle)) return line;
     // 重複出現的卷名（通常是卷末的經題）仍保留文字，
     // 讓搜尋命中可以定位與高亮，只是不再顯示行首標記。

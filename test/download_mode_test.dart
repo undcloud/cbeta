@@ -192,6 +192,35 @@ void main() {
     expect(find.text('已清除所有下载任务'), findsWidgets);
   });
 
+  testWidgets('download panel offers an update action with confirmation', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(backgroundTheme: 'default');
+
+    await tester.pumpWidget(const CbetaSearchApp());
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('選擇佛經'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('下載管理'));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('已下載'), findsOneWidget);
+    final updateButton = find.widgetWithText(TextButton, '更新');
+    expect(updateButton, findsOneWidget);
+
+    await tester.tap(updateButton);
+    await tester.pumpAndSettle();
+
+    expect(find.text('更新經目與經文'), findsOneWidget);
+    expect(find.textContaining('只有遠端有變更時才會下載'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(TextButton, '取消'));
+    await tester.pumpAndSettle();
+    expect(find.text('更新經目與經文'), findsNothing);
+  });
+
   testWidgets('download panel uses the home background color', (
     WidgetTester tester,
   ) async {

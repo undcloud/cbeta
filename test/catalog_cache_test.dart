@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:xuefo/download/catalog_cache.dart';
 
@@ -6,6 +9,7 @@ void main() {
 
   setUp(() {
     CatalogCache.instance.debugReset();
+    CatalogCache.instance.localFileLoader = null;
   });
 
   test('loads the four scope selector catalogs', () async {
@@ -66,7 +70,7 @@ void main() {
     expect(firstDynasty.works, isNotEmpty);
   });
 
-  test('searches the local catalog by work id, title and creator', () async {
+  test('searches the local catalog by work id and title only', () async {
     final cache = CatalogCache.instance;
     await cache.load();
 
@@ -78,8 +82,9 @@ void main() {
     final byTitle = cache.searchWorks('長阿含');
     expect(byTitle.any((item) => item['work'] == 'T0001'), isTrue);
 
-    final byCreator = cache.searchWorks('佛陀耶舍');
-    expect(byCreator.any((item) => item['work'] == 'T0001'), isTrue);
+    // 作譯者不再参与經目匹配,結果裡仍保留 byline 供顯示。
+    expect(cache.searchWorks('佛陀耶舍'), isEmpty);
+    expect(byTitle.first['byline'], isNotEmpty);
 
     expect(cache.lookupWorkFile('T0001'), 'T01n0001');
     expect(cache.lookupWorkFile('A1057'), 'A091n1057');
@@ -88,6 +93,50 @@ void main() {
     expect(cache.searchWorks('  '), isEmpty);
     expect(cache.searchWorks('T0001', limit: 1), hasLength(1));
   });
+
+  test('prefers downloaded catalog files and picks up reloads', () async {
+    final cache = CatalogCache.instance;
+    final files = <String, Uint8List>{
+      'category.json': _categoryJson('T0001', '長阿含經', '佛陀耶舍'),
+      'vol.json': _emptyRootJson('orig'),
+      'creators-by-strokes-with-works.json': _emptyRootJson('作譯者'),
+      'dynasty-works.json': _emptyRootJson('朝代'),
+    };
+    cache.localFileLoader = (name) async => files[name];
+    var notifications = 0;
+    cache.addListener(() => notifications++);
+    addTearDown(() => cache.localFileLoader = null);
+
+    await cache.load();
+
+    expect(cache.lookupWork('T0001')?.title, '長阿含經');
+    expect(cache.departmentForWork('T0001'), '01 阿含部類');
+    expect(cache.creators, isEmpty);
+
+    files['category.json'] = _categoryJson('X9999', '本地下載經', '本地作者');
+    await cache.reload();
+
+    expect(notifications, 1);
+    expect(cache.lookupWork('X9999')?.title, '本地下載經');
+    expect(cache.lookupWork('T0001'), isNull);
+    expect(cache.departmentForWork('X9999'), '01 阿含部類');
+  });
+
+  test(
+    'falls back to bundled assets when downloaded files are corrupt',
+    () async {
+      final cache = CatalogCache.instance;
+      cache.localFileLoader = (name) async => name == 'category.json'
+          ? Uint8List.fromList(utf8.encode('{broken'))
+          : null;
+      addTearDown(() => cache.localFileLoader = null);
+
+      await cache.load();
+
+      expect(cache.lookupWork('T0001'), isNotNull);
+      expect(cache.cbetaTree?.children, isNotEmpty);
+    },
+  );
 
   test('every catalog work resolves to metadata', () async {
     final cache = CatalogCache.instance;
@@ -109,4 +158,24 @@ void main() {
       }
     }
   });
+}
+
+Uint8List _categoryJson(String work, String title, String creators) {
+  final root = {
+    'title': 'CBETA',
+    'children': [
+      {
+        'title': '01 阿含部類',
+        'children': [
+          {'key': work, 'title': '$work $title (2 卷)【$creators】'},
+        ],
+      },
+    ],
+  };
+  return Uint8List.fromList(utf8.encode(jsonEncode(root)));
+}
+
+Uint8List _emptyRootJson(String title) {
+  final root = {'title': title, 'children': <Object>[]};
+  return Uint8List.fromList(utf8.encode(jsonEncode(root)));
 }

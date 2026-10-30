@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import 'candidates.dart';
+import 'conversion.dart';
 import 'history.dart';
 
 class SearchInput extends StatefulWidget {
@@ -17,6 +18,10 @@ class SearchInput extends StatefulWidget {
     this.recentSearches,
     this.showCandidates = true,
     this.onChanged,
+    this.onSelectionChanged,
+    this.onFieldTap,
+    this.keyMatchCounter,
+    this.countScope,
     this.textInputAction = TextInputAction.search,
     this.style,
     this.textBuilder,
@@ -35,6 +40,18 @@ class SearchInput extends StatefulWidget {
   final List<String>? recentSearches;
   final bool showCandidates;
   final ValueChanged<String>? onChanged;
+
+  /// 選中候選／歷史後回報待搜尋內容；使用者再次輸入時回報 null。
+  final ValueChanged<SearchSelection?>? onSelectionChanged;
+
+  /// 使用者點擊輸入框時回報。
+  final VoidCallback? onFieldTap;
+
+  /// 查詢每個候選在字典 key 中的命中次數；null 時不顯示次數。
+  final KeyMatchCounter? keyMatchCounter;
+
+  /// 字典範圍（例如已選詞典）變更時，重新統計命中次數。
+  final String? countScope;
   final TextInputAction textInputAction;
   final TextStyle? style;
   final String Function(String text)? textBuilder;
@@ -57,12 +74,19 @@ class _SearchInputState extends State<SearchInput> {
   int _loadToken = 0;
   bool _suppress = false;
   String? _selectedText;
+  String _lastText = '';
+  SearchSelection? _pendingSelection;
+  final Map<String, int> _hitCounts = {};
+  final Set<String> _countingCandidates = {};
+  Timer? _countDebounce;
+  int _scopeToken = 0;
 
   @override
   void initState() {
     super.initState();
     _focusNode = widget.focusNode ?? FocusNode();
     _focusNode.addListener(_handleFocusChanged);
+    _lastText = widget.controller.text;
     widget.controller.addListener(_handleControllerChanged);
     widget.displayListenable?.addListener(_handleDisplayChanged);
     if (widget.recentSearches != null) {
@@ -76,6 +100,7 @@ class _SearchInputState extends State<SearchInput> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeListener(_handleControllerChanged);
+      _lastText = widget.controller.text;
       widget.controller.addListener(_handleControllerChanged);
     }
     if (oldWidget.focusNode != widget.focusNode) {
@@ -96,6 +121,14 @@ class _SearchInputState extends State<SearchInput> {
     if (widget.recentSearches != null) {
       _history = widget.recentSearches!;
     }
+    if (oldWidget.countScope != widget.countScope ||
+        (oldWidget.keyMatchCounter == null) !=
+            (widget.keyMatchCounter == null)) {
+      _scopeToken++;
+      _countDebounce?.cancel();
+      _hitCounts.clear();
+      _countingCandidates.clear();
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _refreshOverlay();
     });
@@ -103,6 +136,8 @@ class _SearchInputState extends State<SearchInput> {
 
   @override
   void dispose() {
+    _scopeToken++;
+    _countDebounce?.cancel();
     _hideOverlay();
     _focusNode.removeListener(_handleFocusChanged);
     if (widget.focusNode == null) _focusNode.dispose();
@@ -147,6 +182,16 @@ class _SearchInputState extends State<SearchInput> {
 
   void _handleControllerChanged() {
     if (_suppress) return;
+    final text = widget.controller.text;
+    if (text == _lastText) {
+      _refreshOverlay();
+      return;
+    }
+    _lastText = text;
+    if (_pendingSelection != null) {
+      _pendingSelection = null;
+      widget.onSelectionChanged?.call(null);
+    }
     _selectedText = null;
     _refreshOverlay();
   }
@@ -159,6 +204,10 @@ class _SearchInputState extends State<SearchInput> {
 
   String _text(String text) => widget.textBuilder?.call(text) ?? text;
 
+  /// 繁體（含混排）候選排在簡體／中性候選之前。
+  int _traditionalGroup(String query) =>
+      SimplifiedTraditionalConverter.ranksAsTraditional(query) ? 0 : 1;
+
   List<SearchChoice> _currentChoices() {
     final raw = widget.controller.text.trim();
     if (raw.isEmpty) {
@@ -168,10 +217,78 @@ class _SearchInputState extends State<SearchInput> {
       ).take(widget.maxHistoryEntries).toList();
     }
     if (!widget.showCandidates) return const [];
-    return buildSearchChoices(
-      raw,
-      _selections,
-    ).take(widget.maxChoiceRows).toList();
+    final choices = buildSearchChoices(raw, _selections);
+    return _applyHitCounts(choices).take(widget.maxChoiceRows).toList();
+  }
+
+  List<SearchChoice> _applyHitCounts(List<SearchChoice> choices) {
+    if (_hitCounts.isEmpty || widget.controller.text.trim().isEmpty) {
+      return choices;
+    }
+    final entries = <({SearchChoice choice, int index})>[];
+    for (var index = 0; index < choices.length; index++) {
+      entries.add((
+        choice: choices[index].withHitCount(_hitCounts[choices[index].query]),
+        index: index,
+      ));
+    }
+    final pinned = entries.where((entry) => entry.choice.isPinned).toList();
+    final others = entries.where((entry) => !entry.choice.isPinned).toList();
+    if (others.any((entry) => entry.choice.hitCount == null)) {
+      return [for (final entry in entries) entry.choice];
+    }
+    others.sort((left, right) {
+      final group = _traditionalGroup(
+        left.choice.query,
+      ).compareTo(_traditionalGroup(right.choice.query));
+      if (group != 0) return group;
+      final difference = (right.choice.hitCount ?? 0).compareTo(
+        (left.choice.hitCount ?? 0),
+      );
+      if (difference != 0) return difference;
+      return left.index.compareTo(right.index);
+    });
+    return [
+      for (final entry in [...pinned, ...others]) entry.choice,
+    ];
+  }
+
+  void _scheduleHitCounts(List<SearchChoice> choices) {
+    final counter = widget.keyMatchCounter;
+    if (counter == null) return;
+    if (widget.controller.text.trim().isEmpty) return;
+    final missing = <String>{};
+    for (final choice in choices) {
+      if (_hitCounts.containsKey(choice.query)) continue;
+      if (_countingCandidates.contains(choice.query)) continue;
+      missing.add(choice.query);
+    }
+    if (missing.isEmpty) return;
+
+    _countDebounce?.cancel();
+    _countDebounce = Timer(const Duration(milliseconds: 180), () async {
+      final scopeToken = _scopeToken;
+      _countingCandidates.addAll(missing);
+      var succeeded = true;
+      var counts = const <String, int>{};
+      try {
+        counts = await counter(missing.toList());
+      } catch (_) {
+        succeeded = false;
+      }
+      if (!mounted || scopeToken != _scopeToken) {
+        _countingCandidates.removeAll(missing);
+        return;
+      }
+      _countingCandidates.removeAll(missing);
+      if (!succeeded) return;
+      final merged = <String, int>{...counts};
+      for (final candidate in missing) {
+        merged.putIfAbsent(candidate, () => 0);
+      }
+      _hitCounts.addAll(merged);
+      _overlay?.markNeedsBuild();
+    });
   }
 
   void _refreshOverlay() {
@@ -180,10 +297,12 @@ class _SearchInputState extends State<SearchInput> {
       _hideOverlay();
       return;
     }
-    if (_currentChoices().isEmpty) {
+    final choices = _currentChoices();
+    if (choices.isEmpty) {
       _hideOverlay();
       return;
     }
+    _scheduleHitCounts(choices);
     if (_overlay == null) {
       _overlay = OverlayEntry(builder: _buildOverlay);
       Overlay.of(context, rootOverlay: true).insert(_overlay!);
@@ -198,24 +317,43 @@ class _SearchInputState extends State<SearchInput> {
     _selectedText = null;
   }
 
-  void _submit(String value) {
+  Future<void> _submit(String value) async {
     final raw = value.trim();
     if (raw.isEmpty) {
       _hideOverlay();
       widget.onSearch(const SearchSelection(rawInput: '', query: ''));
       return;
     }
-    final choices = buildSearchChoices(raw, _selections);
-    final query = choices.isNotEmpty
-        ? choices.first.query
-        : preferredQueryFor(raw, _selections);
+    final pending = _pendingSelection;
+    if (pending != null && (raw == pending.rawInput || raw == pending.query)) {
+      _pendingSelection = null;
+      _hideOverlay();
+      widget.onSearch(pending);
+      return;
+    }
+    final query = await resolveSearchQuery(
+      raw,
+      selections: _selections,
+      keyMatchCounter: widget.keyMatchCounter,
+    );
+    if (!mounted) return;
+    _pendingSelection = null;
     _hideOverlay();
     widget.onSearch(SearchSelection(rawInput: raw, query: query));
   }
 
   void _choose(SearchChoice choice) {
-    final raw = choice.isHistory ? choice.text : widget.controller.text.trim();
-    final text = choice.isHistory ? choice.text : choice.query;
+    final original = choice.rawInput.isNotEmpty
+        ? choice.rawInput
+        : widget.controller.text.trim();
+    final selection = SearchSelection(
+      rawInput: original,
+      query: choice.query,
+      isExplicit: true,
+    );
+    _pendingSelection = selection;
+    widget.onSelectionChanged?.call(selection);
+    final text = choice.text;
     setState(() => _selectedText = text);
     _overlay?.markNeedsBuild();
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -225,17 +363,20 @@ class _SearchInputState extends State<SearchInput> {
         text: text,
         selection: TextSelection.collapsed(offset: text.length),
       );
+      _lastText = text;
       _suppress = false;
       _hideOverlay();
-      widget.onSearch(SearchSelection(rawInput: raw, query: choice.query));
+      _focusNode.unfocus();
     });
   }
 
   Widget _buildChoiceTile(SearchChoice choice) {
     final labels = <String>[
       if (choice.isHistory) _text('歷史'),
+      if (choice.isSimplified) _text('簡體'),
       if (choice.isOriginal) _text('原始輸入'),
       if (choice.query != choice.text) '${_text('實際搜尋')}：${choice.query}',
+      if (choice.hitCount != null) '${_text('字典')} ${choice.hitCount}',
     ];
     final selected = _selectedText == choice.text;
     return ListTile(
@@ -343,7 +484,10 @@ class _SearchInputState extends State<SearchInput> {
           widget.onChanged?.call(value);
         },
         onSubmitted: _submit,
-        onTap: _refreshOverlay,
+        onTap: () {
+          _refreshOverlay();
+          widget.onFieldTap?.call();
+        },
         onTapOutside: (_) => _focusNode.unfocus(),
       ),
     );

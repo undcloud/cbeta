@@ -69,7 +69,9 @@ class _DictionarySearchPageState extends State<DictionarySearchPage> {
 
       final filtered = _selectedDicts.length == _dictionaries.length
           ? allResults
-          : allResults.where((r) => _selectedDicts.contains(r.dictionaryId)).toList();
+          : allResults
+                .where((r) => _selectedDicts.contains(r.dictionaryId))
+                .toList();
 
       if (!mounted) return;
       setState(() {
@@ -95,6 +97,7 @@ class _DictionarySearchPageState extends State<DictionarySearchPage> {
   @override
   Widget build(BuildContext context) {
     String displayText(String text) {
+      if (scriptureDisplaySettings.showOriginalText) return text;
       return scriptureDisplaySettings.showSimplifiedText
           ? SimplifiedTraditionalConverter.toSimplified(text)
           : SimplifiedTraditionalConverter.toTraditionalDisplay(text);
@@ -187,8 +190,8 @@ class _DictionarySearchPageState extends State<DictionarySearchPage> {
                     child: Text(
                       displayText('輸入關鍵詞查詢佛學詞典'),
                       style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                            color: Theme.of(context).colorScheme.onSurfaceVariant,
-                          ),
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
                     ),
                   )
                 : ListView.builder(
@@ -239,17 +242,17 @@ class _DictionarySearchPageState extends State<DictionarySearchPage> {
                 ),
                 child: SelectableText(
                   widget.fodictBaseDir,
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        fontFamily: 'monospace',
-                      ),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
                 ),
               ),
               const SizedBox(height: 16),
               Text(
                 displayText('字典文件結構：'),
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
+                style: Theme.of(
+                  context,
+                ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 8),
@@ -267,17 +270,19 @@ class _DictionarySearchPageState extends State<DictionarySearchPage> {
                   '  │   └── fodict.ini\n'
                   '  ├── 002.cyx-j/\n'
                   '  └── ...',
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        fontFamily: 'monospace',
-                      ),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
                 ),
               ),
               const SizedBox(height: 16),
               Text(
-                displayText('可通過以下方式複製文件：\n'
-                    '1. 使用 adb push 命令\n'
-                    '2. 使用文件管理器複製\n'
-                    '3. 從雲端下載'),
+                displayText(
+                  '可通過以下方式複製文件：\n'
+                  '1. 使用 adb push 命令\n'
+                  '2. 使用文件管理器複製\n'
+                  '3. 從雲端下載',
+                ),
                 style: Theme.of(context).textTheme.bodySmall,
                 textAlign: TextAlign.center,
               ),
@@ -285,8 +290,8 @@ class _DictionarySearchPageState extends State<DictionarySearchPage> {
               Text(
                 displayText('當前目錄：${widget.fodictBaseDir}'),
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
+                  color: Theme.of(context).colorScheme.primary,
+                ),
                 textAlign: TextAlign.center,
               ),
             ],
@@ -296,19 +301,22 @@ class _DictionarySearchPageState extends State<DictionarySearchPage> {
     );
   }
 
-  Widget _buildEntryCard(FodictEntry entry, String Function(String) displayText) {
+  Widget _buildEntryCard(
+    FodictEntry entry,
+    String Function(String) displayText,
+  ) {
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 4),
       child: ExpansionTile(
         title: Text(
-          entry.keyword,
+          displayText(entry.keyword),
           style: const TextStyle(fontWeight: FontWeight.bold),
         ),
         subtitle: Text(
-          entry.dictionaryName,
+          displayText(entry.dictionaryName),
           style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: Theme.of(context).colorScheme.primary,
-              ),
+            color: Theme.of(context).colorScheme.primary,
+          ),
         ),
         children: [
           Padding(
@@ -316,7 +324,7 @@ class _DictionarySearchPageState extends State<DictionarySearchPage> {
             child: Align(
               alignment: Alignment.centerLeft,
               child: SelectableText(
-                _cleanDefinition(entry.definition),
+                displayText(_cleanDefinition(entry.definition)),
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
             ),
@@ -347,7 +355,9 @@ class _DictionarySearchPageState extends State<DictionarySearchPage> {
             children: [
               Expanded(
                 child: Text(
-                  displayText('選擇要查詢的字典（${_selectedDicts.length}/${_dictionaries.length}）'),
+                  displayText(
+                    '選擇要查詢的字典（${_selectedDicts.length}/${_dictionaries.length}）',
+                  ),
                   style: Theme.of(context).textTheme.titleSmall,
                 ),
               ),
@@ -387,7 +397,7 @@ class _DictionarySearchPageState extends State<DictionarySearchPage> {
                     }
                   });
                 },
-                title: Text(dict.name),
+                title: Text(displayText(dict.name)),
                 subtitle: Text(
                   '${dict.id} · ${_formatSize(dict.datSize)}',
                   style: Theme.of(context).textTheme.bodySmall,

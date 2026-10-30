@@ -84,19 +84,32 @@ class LocalVersion {
     required this.juan,
     required this.ver,
     required this.savedAt,
+    this.release,
   });
 
   final String work;
   final String juan;
   final String ver;
+
+  /// 本地內容對應的修訂版號；更新時取自 changes，初次下載取自經目發佈版號。
+  final String? release;
   final DateTime savedAt;
 
   String get key => '$work:$juan';
+
+  LocalVersion copyWith({String? ver, String? release}) => LocalVersion(
+    work: work,
+    juan: juan,
+    ver: ver ?? this.ver,
+    release: release ?? this.release,
+    savedAt: savedAt,
+  );
 
   Map<String, Object?> toJson() => {
     'work': work,
     'juan': juan,
     'ver': ver,
+    if (release != null && release!.isNotEmpty) 'release': release,
     'savedAt': savedAt.toIso8601String(),
   };
 
@@ -104,6 +117,7 @@ class LocalVersion {
     work: json['work'] as String,
     juan: json['juan'] as String,
     ver: json['ver'] as String,
+    release: json['release'] is String ? json['release'] as String : null,
     savedAt: DateTime.parse(json['savedAt'] as String),
   );
 }

@@ -8,9 +8,14 @@ import 'catalog_cache.dart';
 import 'download_models.dart';
 import 'download_notifications.dart';
 import 'download_store.dart';
+import 'scripture_update_service.dart';
 import 'work_archive.dart';
 
 class DownloadManager extends ChangeNotifier {
+  DownloadManager({Future<String?> Function(String work)? releaseVersionLoader})
+    : _releaseVersionLoader = releaseVersionLoader ?? _loadWorkChangesRelease;
+
+  final Future<String?> Function(String work) _releaseVersionLoader;
   final List<DownloadGroup> _queue = [];
   final Map<String, LocalVersion> _versions = {};
   DownloadStatus _status = DownloadStatus.pending;
@@ -33,9 +38,14 @@ class DownloadManager extends ChangeNotifier {
   bool get hasQueuedItems =>
       _queue.any((group) => group.items.any((item) => !_isItemComplete(item)));
   bool get canResume => !isDownloading && hasQueuedItems;
-  int get downloadedWorkCount =>
-      _versions.keys.map((key) => key.split(':').first).toSet().length;
+  int get downloadedWorkCount => downloadedWorkIds.length;
   int get downloadedJuanCount => _versions.length;
+
+  Set<String> get downloadedWorkIds =>
+      _versions.keys.map((key) => key.split(':').first).toSet();
+
+  List<LocalVersion> versionsForWork(String work) =>
+      _versions.values.where((version) => version.work == work).toList();
   int get pendingWorkCount => _queue
       .expand((group) => group.items)
       .where((item) => !_isItemComplete(item))
@@ -346,6 +356,9 @@ class DownloadManager extends ChangeNotifier {
       return;
     }
     var failed = false;
+    final existingVersions = versionsForWork(item.work);
+    final release = await _resolveInitialRelease(item.work, existingVersions);
+    if (_cancelled) return;
 
     _progress = _buildProgress(currentWork: item.work);
     _updateNotification();
@@ -374,7 +387,9 @@ class DownloadManager extends ChangeNotifier {
         if (_cancelled) return;
         final volume = byJuan[juan];
         if (volume == null) continue;
-        if (!await _storeVolume(item.work, volume)) failed = true;
+        if (!await _storeVolume(item.work, volume, release: release)) {
+          failed = true;
+        }
       }
     }
 
@@ -396,7 +411,9 @@ class DownloadManager extends ChangeNotifier {
             onBytesReceived: _handleBytesReceived,
           ),
         );
-        if (!await _storeVolume(item.work, volume)) failed = true;
+        if (!await _storeVolume(item.work, volume, release: release)) {
+          failed = true;
+        }
       } catch (e) {
         debugPrint('Download failed $key: $e');
         failed = true;
@@ -416,13 +433,18 @@ class DownloadManager extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<bool> _storeVolume(String work, CachedScriptureVolume volume) async {
+  Future<bool> _storeVolume(
+    String work,
+    CachedScriptureVolume volume, {
+    String? release,
+  }) async {
     try {
       await scriptureVolumeStore.write(volume);
       _versions['$work:${volume.juan}'] = LocalVersion(
         work: work,
         juan: volume.juan,
         ver: volume.contentVersion ?? 'unknown',
+        release: release,
         savedAt: DateTime.now().toUtc(),
       );
       await _saveVersions();
@@ -435,6 +457,71 @@ class DownloadManager extends ChangeNotifier {
       debugPrint('Failed to store $work:${volume.juan}: $e');
       return false;
     }
+  }
+
+  /// 以更新的內容覆寫已下載的經卷；未下載的卷不會被新增。
+  Future<int> replaceDownloadedVolumes(
+    String work,
+    Iterable<CachedScriptureVolume> volumes, {
+    String? release,
+  }) async {
+    final existing = versionsForWork(
+      work,
+    ).map((version) => version.juan).toSet();
+    if (existing.isEmpty) return 0;
+    var replaced = 0;
+    for (final volume in volumes) {
+      if (!existing.contains(volume.juan)) continue;
+      try {
+        await scriptureVolumeStore.write(volume);
+        _versions['$work:${volume.juan}'] = LocalVersion(
+          work: work,
+          juan: volume.juan,
+          ver: volume.contentVersion ?? 'unknown',
+          release: release ?? _versions['$work:${volume.juan}']?.release,
+          savedAt: DateTime.now().toUtc(),
+        );
+        replaced++;
+      } catch (e) {
+        debugPrint('Failed to update $work:${volume.juan}: $e');
+      }
+    }
+    if (replaced > 0) {
+      await _saveVersions();
+      notifyListeners();
+    }
+    return replaced;
+  }
+
+  /// 初次下載時查詢 changes 取得 release；部分下載時沿用既有的共用 release。
+  Future<String?> _resolveInitialRelease(
+    String work,
+    List<LocalVersion> existingVersions,
+  ) async {
+    if (existingVersions.isEmpty) {
+      try {
+        return await _releaseVersionLoader(work);
+      } catch (error) {
+        debugPrint('Changes lookup failed for $work: $error');
+        return null;
+      }
+    }
+    return _sharedRelease(existingVersions);
+  }
+
+  /// 取所有經卷共用的 release；只要有一卷沒有記錄或版本不一致就回傳 null。
+  static String? _sharedRelease(Iterable<LocalVersion> versions) {
+    String? shared;
+    for (final version in versions) {
+      final value = version.release?.trim();
+      if (value == null || value.isEmpty) return null;
+      if (shared == null) {
+        shared = value;
+      } else if (shared != value) {
+        return null;
+      }
+    }
+    return shared;
   }
 
   void cancelDownload() {
@@ -452,6 +539,16 @@ class DownloadManager extends ChangeNotifier {
 
   Future<void> _saveQueue() => downloadStore.saveQueue(_queue);
   Future<void> _saveVersions() => downloadStore.saveVersions(_versions);
+}
+
+/// 初次下載時以該作品的 changes 版號作為 release。
+Future<String?> _loadWorkChangesRelease(String work) async {
+  try {
+    return await ScriptureUpdateService().latestChangesVersion(work);
+  } catch (error) {
+    debugPrint('Changes lookup failed for $work: $error');
+    return null;
+  }
 }
 
 final downloadManager = DownloadManager();
