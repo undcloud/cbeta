@@ -71,12 +71,7 @@ List<SearchChoice> buildHistoryChoices(
     if (raw.isEmpty || !seen.add(raw)) continue;
     final query = selections[raw] ?? raw;
     choices.add(
-      SearchChoice(
-        text: query,
-        query: query,
-        rawInput: raw,
-        isHistory: true,
-      ),
+      SearchChoice(text: query, query: query, rawInput: raw, isHistory: true),
     );
   }
   return choices;

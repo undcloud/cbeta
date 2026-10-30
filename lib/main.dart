@@ -1586,11 +1586,11 @@ String _displayText(String text, [BuildContext? context]) {
 final _whitespacePattern = RegExp(r'\s+');
 final _leadingParentheticalPattern = RegExp(r'^\s*（[^）]*）\s*');
 final _workIdPattern = RegExp(r'^([A-Z]+\d+)');
-final _fileWorkIdPattern = RegExp(r'^([A-Z]+)\d+n(\d+)');
+final _fileWorkIdPattern = RegExp(r'^([A-Z]+)\d+n(\d+[A-Z]?)');
 final _citationBrPattern = RegExp(r'<br\s*/?>', caseSensitive: false);
 final _htmlTagPattern = RegExp(r'<[^>]*>');
 final _citationLineheadPattern = RegExp(
-  r'^([A-Z]\d+)n(\d+)_p(\d{4})([a-z])(\d+)$',
+  r'^([A-Z]\d+)n(\d+[A-Z]?)_p(\d{4})([a-z])(\d+)$',
 );
 
 String _cleanFodictDefinition(String definition) {
@@ -5113,7 +5113,7 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
   Future<List<ScriptureLine>> _cachedJuan(ScripturePassage passage) {
     final linehead = passage.linehead;
     final workMatch = RegExp(
-      r'^([A-Z]+)\d+n(\d+)_p',
+      r'^([A-Z]+)\d+n(\d+[A-Z]?)_p',
     ).firstMatch(linehead ?? '');
     final work =
         passage.work ??
@@ -5135,7 +5135,7 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
   Future<List<ScriptureLine>> _loadJuan(ScripturePassage passage) async {
     final linehead = passage.linehead;
     final workMatch = RegExp(
-      r'^([A-Z]+)\d+n(\d+)_p',
+      r'^([A-Z]+)\d+n(\d+[A-Z]?)_p',
     ).firstMatch(linehead ?? '');
     final work =
         passage.work ??
@@ -7236,7 +7236,7 @@ Future<String?> _loadSectionTitle(
   String? selectedStartLinehead,
 ) async {
   final work = RegExp(
-    r'^([A-Z]+)\d+n(\d+)',
+    r'^([A-Z]+)\d+n(\d+[A-Z]?)',
   ).firstMatch(selectedStartLinehead ?? '');
   if (work == null || selectedStartLinehead == null) return null;
   final workId = '${work.group(1)}${work.group(2)}';
@@ -7638,7 +7638,7 @@ void _sortRefsByJuan(List<ScriptureVolumeRef> refs) {
 }
 
 String _lineheadWorkId(String linehead) {
-  final match = RegExp(r'^([A-Z]+)\d+n(\d+)_p').firstMatch(linehead);
+  final match = RegExp(r'^([A-Z]+)\d+n(\d+[A-Z]?)_p').firstMatch(linehead);
   return match == null ? '' : '${match.group(1)}${match.group(2)}';
 }
 

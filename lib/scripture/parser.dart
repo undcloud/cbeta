@@ -13,6 +13,11 @@ final _noteNumberPattern = RegExp(r'n\d+(\d{3})$');
 final _trailingDigitsPattern = RegExp(r'(\d+)$');
 final _bracketNumberPattern = RegExp(r'\[\d+\]');
 
+/// 部分經典的行號在經號與 p 之間沒有底線（例如梵語千字文
+/// `T54n2133Ap1190a13`），解析時統一補成 `_p` 格式，
+/// 與搜尋 API／Goto 拼出的行號一致，下游引用與跳轉才可比對。
+final _joinedLineheadPattern = RegExp(r'^([A-Z]+\d+n\d+[A-Z]?)p(?=\d)');
+
 String visibleScriptureLine(
   ScriptureLine line, {
   required bool showLineBeginnings,
@@ -61,8 +66,24 @@ List<ScriptureLine> parseScriptureHtml(String source) {
   List<List<ScriptureTableCell>> tableRows = [];
   var footnotes = <ScriptureFootnote>[];
   var inlineNotes = <ScriptureInlineNote>[];
+  final activeInlineNotes = <int>[];
 
   void flushLine() {
+    // 夾注跨行(lb 在 small 內)時：本行末補上右括號並記錄本段的樣式範圍，
+    // 下一行以左括號續接，使每行括號成對、小字範圍不錯位。
+    final continuesInlineNotes = activeInlineNotes.isNotEmpty;
+    if (continuesInlineNotes) {
+      if (text.toString() == '（') {
+        text.clear();
+      } else if (text.isNotEmpty) {
+        text.write('）');
+        for (final start in activeInlineNotes) {
+          inlineNotes.add(
+            ScriptureInlineNote(offset: start, length: text.length - start),
+          );
+        }
+      }
+    }
     if (linehead != null ||
         text.isNotEmpty ||
         images.isNotEmpty ||
@@ -122,6 +143,13 @@ List<ScriptureLine> parseScriptureHtml(String source) {
     inlineNotes = [];
     headingLevel = 0;
     lineRole = ScriptureLineRole.regular;
+    if (continuesInlineNotes) {
+      text.write('（');
+      activeCell?.write('（');
+      for (var i = 0; i < activeInlineNotes.length; i++) {
+        activeInlineNotes[i] = 0;
+      }
+    }
   }
 
   void appendText(String value) {
@@ -145,7 +173,11 @@ List<ScriptureLine> parseScriptureHtml(String source) {
   void visit(html_dom.Node node) {
     if (node is html_dom.Element && node.classes.contains('lb')) {
       flushLine();
-      linehead = node.attributes['id'];
+      final anchorId = node.attributes['id'];
+      linehead = anchorId?.replaceFirstMapped(
+        _joinedLineheadPattern,
+        (match) => '${match.group(1)}_p',
+      );
       return;
     }
     if (node is html_dom.Element && node.localName == 'img') {
@@ -231,12 +263,13 @@ List<ScriptureLine> parseScriptureHtml(String source) {
     if (node is html_dom.Element &&
         (node.classes.contains('inline-note') ||
             node.classes.contains('doube-line-note'))) {
-      final start = text.length;
+      activeInlineNotes.add(text.length);
       appendText('（');
       for (final child in node.nodes) {
         visit(child);
       }
       appendText('）');
+      final start = activeInlineNotes.removeLast();
       inlineNotes.add(
         ScriptureInlineNote(offset: start, length: text.length - start),
       );
@@ -291,21 +324,33 @@ List<ScriptureLine> parseScriptureHtml(String source) {
   }
   flushLine();
   final seenVolumeTitles = <String>{};
+  var enteredBody = false;
   return lines.map((line) {
-    if (line.role != ScriptureLineRole.volumeTitle) return line;
+    if (line.role != ScriptureLineRole.volumeTitle) {
+      // 卷首標題前的經號等行（如「No. 1135」）不算正文，
+      // 否則真正的卷首標題會被誤判成尾題。
+      if (seenVolumeTitles.isNotEmpty &&
+          line.role != ScriptureLineRole.byline &&
+          line.text.trim().isNotEmpty) {
+        enteredBody = true;
+      }
+      return line;
+    }
     final normalizedTitle = line.text
         .replaceAll(_whitespacePattern, '')
         .replaceAll(_bracketNumberPattern, '');
-    if (seenVolumeTitles.add(normalizedTitle)) return line;
-    // 重複出現的卷名（通常是卷末的經題）仍保留文字，
-    // 讓搜尋命中可以定位與高亮，只是不再顯示行首標記。
-    return ScriptureLine(
-      text: line.text,
-      linehead: line.linehead,
-      footnotes: line.footnotes,
-      inlineNotes: line.inlineNotes,
-      headingLevel: line.headingLevel,
-      role: ScriptureLineRole.navigationAnchor,
-    );
+    // 正文开始后再出现的卷名是卷末尾题：按网页模式留在原位显示，
+    // 不再上移到标题区（否则其校勘标号会排到卷首标号之前）。
+    if (enteredBody || !seenVolumeTitles.add(normalizedTitle)) {
+      return ScriptureLine(
+        text: line.text,
+        linehead: line.linehead,
+        footnotes: line.footnotes,
+        inlineNotes: line.inlineNotes,
+        headingLevel: line.headingLevel,
+        role: ScriptureLineRole.navigationAnchor,
+      );
+    }
+    return line;
   }).toList();
 }
