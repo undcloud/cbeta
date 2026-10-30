@@ -35,6 +35,9 @@ CBETA 的悉曇（梵書）与兰札字符并非独立 Unicode 编码，而是�
 - Ranjana.ttf（兰札体，约 0.4MB）
 - CBETASupplement.ttf（补充字体，约 10MB，兼作生僻汉字兜底）
 
+以上字体由 CBETA 官方提供下载（CBETA 经文里的异体字/生僻字、悉曇/兰札字）：
+https://cbeta.org/downloads
+
 已知限制：
 
 - 偈颂（经文中以表格格子里呈现的 verse 块）走独立渲染路径，若悉曇／兰札字符出现在偈颂格子内，暂不换用专用字体，只显示 fallback 汉字；
