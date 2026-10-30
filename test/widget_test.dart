@@ -1369,10 +1369,9 @@ void main() {
     );
 
     expect(find.text('專案介紹'), findsOneWidget);
-    expect(find.text('資料來源'), findsOneWidget);
-    expect(find.text('開發資訊'), findsOneWidget);
-    expect(find.text('聯絡我們'), findsOneWidget);
-    expect(find.text('資料版本'), findsOneWidget);
+    expect(find.text('功能特色'), findsOneWidget);
+    expect(find.text('隱私與授權'), findsOneWidget);
+    expect(find.text('下載與聯絡'), findsOneWidget);
     expect(find.textContaining('非 CBETA Online 官方開發或維護之應用程式'), findsOneWidget);
     expect(find.textContaining('https://cbdata.dila.edu.tw/'), findsOneWidget);
     expect(

@@ -403,70 +403,54 @@ Future<void> _showAbout(BuildContext context) {
                 children: [
                   Text(
                     _displayText(
-                      '本 App 是一款基於 CBETA 提供的 API 開發的佛典閱讀與檢索應用程式，旨在為使用者提供便利的佛教經典瀏覽與查詢體驗。',
-                      context,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _displayText(
-                      '本專案為獨立開發的開源專案，非 CBETA Online 官方開發或維護之應用程式。',
+                      '本 App 是一款基於 CBETA 提供的 API 開發的免費開源佛典閱讀與檢索應用程式，支援將經卷與 41 部佛學字典下載至本地，離線單機即可完整使用。本專案為獨立開發，非 CBETA Online 官方開發或維護之應用程式。',
                       context,
                     ),
                   ),
                 ],
               ),
               _AboutSection(
-                title: '開發資訊',
+                title: '功能特色',
                 children: [
-                  _AboutLabelText(label: '開發者：', value: 'undcloud'),
+                  Text(
+                    _displayText(
+                      '全文搜尋與 AI 語意搜尋，簡體輸入自動轉繁\n'
+                      '部類、冊別、作譯者、年代、經目查詢多種瀏覽\n'
+                      'Goto 行號／引文直接定位\n'
+                      '經卷與字典一鍵下載，完全離線可用\n'
+                      '書籤、閱讀位置記憶、字體與簡繁顯示設定',
+                      context,
+                    ),
+                  ),
+                ],
+              ),
+              _AboutSection(
+                title: '隱私與授權',
+                children: [
+                  Text(
+                    _displayText(
+                      '無需註冊，無廣告，不搜集任何個人隱私資訊；網絡請求僅用於搜尋、經文更新與字典下載。本專案以 GPL-3.0 免費開源，原始碼公開。',
+                      context,
+                    ),
+                  ),
+                ],
+              ),
+              _AboutSection(
+                title: '下載與聯絡',
+                children: [
+                  _AboutLink(
+                    label: _latestApkDownloadUrl,
+                    url: _latestApkDownloadUrl,
+                  ),
                   const SizedBox(height: 8),
                   _AboutLink(
                     label: '開源專案：https://gitee.com/undclouds/cbeta',
                     url: 'https://gitee.com/undclouds/cbeta',
                   ),
                   const SizedBox(height: 8),
-                  Text(_displayText('歡迎前往 GitHub 查看原始碼、提出問題或提供改進建議。', context)),
-                ],
-              ),
-              _AboutSection(
-                title: '聯絡我們',
-                children: [
-                  Text(
-                    _displayText('如果您在使用過程中遇到問題，或有任何建議，歡迎透過微信聯絡我。', context),
-                  ),
-                  const SizedBox(height: 8),
+                  _AboutLabelText(label: '開發者：', value: 'undcloud'),
+                  const SizedBox(height: 4),
                   _AboutLabelText(label: '微信聯絡：', value: 'undcloud'),
-                ],
-              ),
-              _AboutSection(
-                title: '下載最新版本',
-                children: [
-                  Text(
-                    _displayText('以下固定連結永遠指向最新版本的 APK（arm64-v8a）：', context),
-                  ),
-                  const SizedBox(height: 8),
-                  _AboutLink(
-                    label: _latestApkDownloadUrl,
-                    url: _latestApkDownloadUrl,
-                  ),
-                ],
-              ),
-              _AboutSection(
-                title: '資料版本',
-                children: [
-                  Text(
-                    _displayText('CBETA 資料版本：請以實際使用的 API 所提供之資料版本為準。', context),
-                  ),
-                ],
-              ),
-              _AboutSection(
-                title: '資料來源',
-                children: [
-                  _AboutLabelText(
-                    label: '經文與檢索資料來源：',
-                    value: '中華電子佛典協會（CBETA）相關資料服務及 API',
-                  ),
                   const SizedBox(height: 8),
                   _AboutLink(
                     label: '資料服務：https://cbdata.dila.edu.tw/',
@@ -475,7 +459,7 @@ Future<void> _showAbout(BuildContext context) {
                   const SizedBox(height: 8),
                   Text(
                     _displayText(
-                      '本 App 使用上述資料服務提供的 API，經文內容及相關資料的權利與使用規範，依原資料提供方的相關規定辦理。',
+                      '經文與檢索資料來自中華電子佛典協會（CBETA），資料權利與使用規範依原資料提供方的相關規定辦理。',
                       context,
                     ),
                   ),
@@ -511,15 +495,21 @@ Future<void> _showAbout(BuildContext context) {
 String _aboutIntroductionText() => [
   'CBETA 經典全文搜尋 Flutter App',
   '',
-  '本 App 是一款基於 CBETA 提供的 API 開發的佛典閱讀與檢索應用程式，旨在為使用者提供便利的佛教經典瀏覽與查詢體驗。',
-  '本專案為獨立開發的開源專案，非 CBETA Online 官方開發或維護之應用程式。',
+  '本 App 是一款基於 CBETA 提供的 API 開發的免費開源佛典閱讀與檢索應用程式，',
+  '支援將經卷與 41 部佛學字典下載至本地，離線單機即可完整使用。',
+  '本專案為獨立開發，非 CBETA Online 官方開發或維護之應用程式。',
   '',
-  '開發者：undcloud',
+  '功能特色：全文搜尋與 AI 語意搜尋、多種經目瀏覽、Goto 定位、',
+  '經卷與字典離線下載、書籤與閱讀位置、簡繁顯示設定。',
+  '',
+  '隱私與授權：無需註冊，無廣告，不搜集任何個人隱私資訊；',
+  '網絡請求僅用於搜尋、經文更新與字典下載。本專案以 GPL-3.0 免費開源。',
+  '',
+  '開發者：undcloud（微信：undcloud）',
   '開源專案：https://gitee.com/undclouds/cbeta',
-  '微信聯絡：undcloud',
-  '',
   '下載最新版本：',
   _latestApkDownloadUrl,
+  '資料來源：中華電子佛典協會（CBETA），https://cbdata.dila.edu.tw/',
 ].join('\n');
 
 class _AboutSection extends StatelessWidget {
