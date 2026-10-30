@@ -310,7 +310,6 @@ Future<String> preferredQueryForInput(String rawInput);
 
 界面实际显示的标签（`_buildChoiceTile`）：
 
-- `歷史`：来自历史记录/历史匹配；
 - `簡體`：全简体候选；
 - `原始輸入`：用户原始输入；
 - `實際搜尋：<query>`：历史行的实际搜索词与显示文字不同时附加；
@@ -432,7 +431,7 @@ Future<String> preferredQueryForInput(String rawInput);
 
 历史匹配只用于两处：
 
-- `buildSearchChoices` 把历史查询词追加到候选面板（标记为「歷史」）；
+- `buildSearchChoices` 把历史查询词追加到候选面板（不再显示「歷史」标签）；
 - `resolveSearchQuery` / `preferredQueryFor` 在没有用户选中候选时决定实际查询词。
 
 历史查询词**不再**由 `convertCandidates` 置顶；候选的固定顺序只由「首选 + 原始输入」决定。
@@ -483,7 +482,7 @@ Future<String> resolveSearchQuery(
 补充：
 
 - 首页搜索同时发起全文关键字、经目检索与字典 key 检索；三个来源由 `_runKeywordSearch` 以 `unawaited(...)` **并行、异步各自落地**（各自维护 `isKeywordSearchPending`／`isCatalogSearchPending`／`isDictionarySearchPending` 与 `setState`），任一方先完成就先显示，不必等其它方；结果页仍在首页，不存在独立的「全文搜索页」入口；实测服务端与 Dart 客户端都能并行处理这些请求（同一批三个查询并行约 2 秒、串行约 5.5 秒），慢的原因不是并发冲突；
-- 首页搜索结果显示为三个可折叠分区：經目搜尋結果、字典搜尋結果、正文搜尋結果；经目与字典分区初始各只显示 1 条，可分别展开全部；正文分区按「作品（一级）→ 卷（二级）」分组：先由 `_groupResultsByWork` 把**同一部作品（work）跨卷的多笔结果合并成一筆**（结果以 passages 的 work 为分组键），因此一级只展示去重后的作品目录；一级 `ExpansionTile`（`_WorkResultGroup`）**默认折叠且懒惰渲染**（只在该作品第一次展开时才构建二级与命中片段，避免正文结果一次性渲染卡顿），二级卷分组在展开后默认展开并列出该卷命中片段；
+- 首页搜索结果显示为三个可折叠分区：經目搜尋結果、字典搜尋結果、正文搜尋結果；每个分区标题下的内容整体向右缩进（经目内容左内边距 24；字典/正文分组标题与卡片左右内边距 40/40，宽度与经目内容范围一致，不占满屏幕宽度），首页「上次閱讀位置／最近閱讀／我的書籤」列表内容同样左缩进 24，以形成层次；经目与字典分区初始各只显示 1 条，可分别展开全部；正文分区按「作品（一级）→ 卷（二级）」分组：先由 `_groupResultsByWork` 把**同一部作品（work）跨卷的多笔结果合并成一筆**（结果以 passages 的 work 为分组键），因此一级只展示去重后的作品目录；一级 `ExpansionTile`（`_WorkResultGroup`）**默认折叠且懒惰渲染**（只在该作品第一次展开时才构建二级与命中片段，避免正文结果一次性渲染卡顿），二级卷分组在展开后默认展开并列出该卷命中片段；
 - 字典分区使用 `FodictService.searchByKey` 依次尝试提交词、全简体、全繁体的第一个有结果写法，命中后点击条目在**当前结果列表中就地展开/收起完整释义**（不再弹窗）；词条名、摘要与展开后的释义都使用 `_scriptureTextStyle(scriptureDisplaySettings)`，跟随显示设置的字号、字体与行高，展开前后字号一致；字典检索失败只影响该分区，不阻止关键字与经目结果；
 - 首页经目分区**完全由本机回答**：先查 App 内建的完整经目（`CatalogCache.searchWorks`，只匹配书名与编号），没命中再看本地已储存经卷的经名，全程不发请求；「選擇佛經 → 經目查詢」分页才是「本地先铺 + 远端 `/search/toc` 合并」。两者都不搜正文（细节与理由见 11.6）；
 - 作译者查询只过滤作译者元数据；
@@ -542,7 +541,7 @@ return scriptureDisplaySettings.showSimplifiedText
 当前它主要用于：
 
 - 首页、阅读器顶部标题、按钮、提示等界面文字（`main.dart` 内自定义 `Text`/`_DisplaySelectableText` 会经过 `_displayText`）；
-- 候选面板的「歷史 / 簡體 / 原始輸入 / 實際搜尋 / 字典」标签；
+- 候选面板的「簡體 / 原始輸入 / 實際搜尋 / 字典」标签；
 - 词典页面与词典查询结果的词条 key、词典名与释义 value（词典内容本身是简体，切到繁体时经 `toTraditionalDisplay` 转繁，切到原样时直接显示简体原文）。
 
 **经卷正文不在转换范围内。** 阅读器的正文、卷题/作译者行和检索高亮都直接使用 CBETA 原文；切换简繁显示不会重新生成整卷简体正文。也就是说：
@@ -762,7 +761,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - `/stable/search/toc` 只有 `q` 参数，**完全忽略 `rows`／`start`／`limit`／`top`／`facet`**：实测一个常见单字回传 1177 笔、769 KB、耗时 56～79 秒，等它分页没有意义；
 - `_searchLocalCatalog(query)` 直接用 `lib/download/catalog_cache.dart` 的 `CatalogCache.instance`（内建全量 work/title/creators/juans metadata，解析 5 份 JSON 约 4.4 MB）做 `searchWorks(needle, limit: 200)`，**零流量、即时**；`initState` 里 `unawaited(CatalogCache.instance.load())` 先暖好，第一次搜索才不用等解析；
 - `searchWorks` **只按 `work`（編號）與 `title`（書名）匹配**，不再匹配 `creators`：目錄的 `creators` 是 `【…】` 裡的「朝代 + 譯者」（如「姚秦 佛陀耶舍 共 竺佛念 譯」），拿它参与匹配會讓人名與朝代變成經目結果裡的命中項（行尾顯示為「經目匹配 · 姚秦 佛陀耶舍譯」）；找翻譯者本來就有側欄的「作譯者」分頁（走 `CatalogCache.creators`），朝代有「年代」分頁，所以經目查詢不需要重複這件事。排序只剩完全同名（rank 0）與前綴（rank 1）；返回行仍保留 `byline`／`creators` 欄位供顯示與詳情使用；離線經目回退 `_searchOfflineCatalog` 的本地經卷匹配的也只是「書名 + work 編號」，同樣不含 byline；
-- `_loadCatalogSearchResults` 已经**完全不发网络请求**：`_searchLocalCatalog`（内建全量目录）没命中时，再看本地已储存经卷的 `_searchOfflineCatalog`，两步都是本机的；分区标题固定是「經目搜尋結果（本地經目）」，没有命中就显示「本地經目沒有書名含『X』的作品」；`_fetchCatalogSearchResults`、`_catalogSearchTimeout` 与 `catalogSearchIsLocal` 标记都已删除；
+- `_loadCatalogSearchResults` 已经**完全不发网络请求**：`_searchLocalCatalog`（内建全量目录）没命中时，再看本地已储存经卷的 `_searchOfflineCatalog`，两步都是本机的；分区标题固定是「經目搜尋結果」，没有命中就显示「本地經目沒有書名含『X』的作品」；`_fetchCatalogSearchResults`、`_catalogSearchTimeout` 与 `catalogSearchIsLocal` 标记都已删除；
 - **本地查完也必须走完 `finally`**：整段包在外层 `try/finally` 里清 `isCatalogSearchPending`，因为 `_updateCombinedSearchError()` 与 `isLoading` 要等两个 pending 都结束才更新，卡在 `true` 会让全文逾时的提示信息完全不被显示（这是先前本地经目抢答后错误信息消失的原因）；
 - `/stable/search/toc` 只剩「選擇佛經 → 經目查詢」分页的 `_runTocSearch` 还在用：它先本地 `searchWorks` 铺满，再合并远端 `type == 'work'` 的行（远端优先、按 work 去重），请求失败时保留本地结果。要按人名／朝代查，用侧栏的「作譯者」「年代」分页，而不是首页搜索框。
 
@@ -794,7 +793,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - `catalog section is answered locally without toc request`：经目分区由内建目录直接回答，统计 `/stable/search/toc` 请求数为 0；
 - `homepage searches keyword and catalog concurrently and prioritizes catalog matches`：用 `CatalogCache.debugLoad` 造 11 部测试经目，全文请求还被 `Completer` 挡住时经目分区已经出结果且 `toc` 请求数为 0；全文回来后断言「经目命中的作品」排在只有全文命中的作品前面，以及展开后的分页行数；
 - `keyword search timeout keeps results instead of going offline`：`all_in_one` 抛 `TimeoutException` 时只显示「全文搜尋逾時」，不出现「找不到…」／离线扫描提示，经目分区仍由本地回答；
-- `offline search shows local catalog matches separately`：离线经目命中显示「經目搜尋結果（本地經目）」并可展开更多；
+- `offline search shows local catalog matches separately`：离线经目命中显示「經目搜尋結果」并可展开更多；
 - `online search keeps loading batches while scrolling`：线上第一批全部渲染、没有「顯示更多作品」按钮，卷到底自动发 `start=2` 的下一批并渲染新一部作品；
 - `scrolling reveals the next offline result groups`：离线扫描先只渲染 20 部（第 25 部看不到），卷到底自动放行第二页并出现「收合多顯示的作品」；
 - `test/offline_scan_test.dart`：`OfflineScanSession` 的分块扫描、自行连续推进到全部卷、暂停后不再排下一块、恢复后从中断处继续、没有本地经卷时立即结束，以及 `runOfflineScan` 的 KWIC 片段；
@@ -826,7 +825,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - 用户明确点选的词典候选不再做简繁字体回退；
 - 离线正文连续扫描（isolate 分块、300 ms 合并发布、暂停/恢复、路由转场期间抑制重建）与离线模式下才生效的作品卡片上限（见 11.4）；
 - 线上全文的 `facet` 移除、stale-while-revalidate 快照顶屏，以及「逾时 ≠ 离线故障」的分支与 45 秒上限（见 11.5、11.6）；
-- 首页经目分区改成纯本地回答：内建全量目录 + 本地已储存经卷，全程不发请求，标题固定为「經目搜尋結果（本地經目）」（见 11.6）；
+- 首页经目分区改成纯本地回答：内建全量目录 + 本地已储存经卷，全程不发请求，标题固定为「經目搜尋結果」（见 11.6）；
 - 阅读器关键字高亮与卷内搜索锚点；
 - 词表检查脚本与 `厂`/`云` 顺序说明。
 

@@ -1784,7 +1784,7 @@ void main() {
       expect(find.textContaining('離線模式'), findsWidgets);
       // 經目改由內建全量目錄回答:第一筆不一定是本地已下載的卷,
       // 展開後才看到 T0001。
-      expect(find.text('經目搜尋結果（本地經目）'), findsOneWidget);
+      expect(find.text('經目搜尋結果'), findsOneWidget);
       expect(find.text('T0013 長阿含十報法經'), findsOneWidget);
       await tester.tap(find.text('顯示更多'));
       await tester.pumpAndSettle();
@@ -1845,7 +1845,7 @@ void main() {
 
       // toc 端點不吃分頁,常見字彙要回傳上千筆、一分鐘以上;
       // 本地經目已經能回答,就不該再打它。
-      expect(find.text('經目搜尋結果（本地經目）'), findsOneWidget);
+      expect(find.text('經目搜尋結果'), findsOneWidget);
       expect(find.text('T0013 長阿含十報法經'), findsOneWidget);
       expect(find.textContaining('經目查詢'), findsNothing);
       expect(tocRequests, 0);
@@ -1880,7 +1880,7 @@ void main() {
       expect(find.textContaining('找不到'), findsNothing);
       expect(find.textContaining('離線模式'), findsNothing);
       expect(find.textContaining('離線搜尋'), findsNothing);
-      expect(find.text('經目搜尋結果（本地經目）'), findsOneWidget);
+      expect(find.text('經目搜尋結果'), findsOneWidget);
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pumpAndSettle();
@@ -2048,7 +2048,7 @@ void main() {
 
         // 全文請求還沒回來,經目分区已經由本地目錄回答完畢,且完全不打 toc。
         expect(tocRequests, 0);
-        expect(find.text('經目搜尋結果（本地經目）'), findsOneWidget);
+        expect(find.text('經目搜尋結果'), findsOneWidget);
         expect(find.text('T0002 經目匹配02'), findsOneWidget);
 
         keywordResponse.complete(

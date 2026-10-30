@@ -3334,7 +3334,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
               ),
             _buildResultSection(
               context,
-              title: '經目搜尋結果（本地經目）',
+              title: '經目搜尋結果',
               count: catalogSearchResults.length,
               expanded: catalogSectionExpanded,
               onToggle: () => setState(() {
@@ -3373,13 +3373,13 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
     final theme = Theme.of(context);
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
-      child: Card(
-        margin: EdgeInsets.zero,
-        clipBehavior: Clip.antiAlias,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            InkWell(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Card(
+            margin: EdgeInsets.zero,
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
               onTap: onToggle,
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
@@ -3409,15 +3409,13 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
                 ),
               ),
             ),
-            if (expanded) ...[
-              const Divider(height: 1),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
-                child: content,
-              ),
-            ],
-          ],
-        ),
+          ),
+          if (expanded)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: content,
+            ),
+        ],
       ),
     );
   }
@@ -3557,7 +3555,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       slivers.add(
         SliverToBoxAdapter(
           child: Padding(
-            padding: const EdgeInsets.all(24),
+            padding: const EdgeInsets.fromLTRB(40, 24, 24, 24),
             child: _buildSectionMessage(_displayText('字典搜尋中…', context)),
           ),
         ),
@@ -3569,7 +3567,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       slivers.add(
         SliverToBoxAdapter(
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+            padding: const EdgeInsets.fromLTRB(40, 12, 40, 0),
             child: Card(
               margin: EdgeInsets.zero,
               child: Padding(
@@ -3753,7 +3751,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
       slivers.add(
         SliverToBoxAdapter(
           child: Padding(
-            padding: const EdgeInsets.all(24),
+            padding: const EdgeInsets.fromLTRB(40, 24, 24, 24),
             child: _buildSectionMessage(_displayText('關鍵字搜尋中…', context)),
           ),
         ),
@@ -3766,7 +3764,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
         slivers.add(
           SliverToBoxAdapter(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+              padding: const EdgeInsets.fromLTRB(40, 12, 40, 0),
               child: Card(
                 margin: EdgeInsets.zero,
                 child: Padding(
@@ -3789,7 +3787,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
         slivers.add(
           SliverToBoxAdapter(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+              padding: const EdgeInsets.fromLTRB(40, 12, 24, 0),
               child: _buildOfflineScanControls(),
             ),
           ),
@@ -3802,7 +3800,7 @@ class _ScriptureSearchPageState extends State<ScriptureSearchPage>
     slivers.add(
       SliverToBoxAdapter(
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+          padding: const EdgeInsets.fromLTRB(40, 12, 24, 0),
           child: Text(
             offlineSearchActive && hasMore
                 ? '「$submittedQuery」離線搜尋：已找到 $totalFound 筆，'
@@ -4023,29 +4021,37 @@ class _HomeHistorySection extends StatelessWidget {
               ),
           ],
         ),
-        for (final item in items)
-          ListTile(
-            dense: true,
-            contentPadding: EdgeInsets.zero,
-            title: Text(_displayText(item.title, context)),
-            subtitle: Text(
-              _displayText(
-                '${item.work}　卷 ${item.juan}'
-                '${item.linehead == null ? '' : ' · ${item.linehead!.split('_p').last}'}',
-                context,
-              ),
-            ),
-            trailing: const Icon(Icons.chevron_right_rounded),
-            onTap: () => onTap(item),
+        Padding(
+          padding: const EdgeInsets.only(left: 24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (final item in items)
+                ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(_displayText(item.title, context)),
+                  subtitle: Text(
+                    _displayText(
+                      '${item.work}　卷 ${item.juan}'
+                      '${item.linehead == null ? '' : ' · ${item.linehead!.split('_p').last}'}',
+                      context,
+                    ),
+                  ),
+                  trailing: const Icon(Icons.chevron_right_rounded),
+                  onTap: () => onTap(item),
+                ),
+              if (onMore != null)
+                Align(
+                  alignment: Alignment.center,
+                  child: TextButton(
+                    onPressed: onMore,
+                    child: Text(_displayText(moreLabel ?? '顯示全部', context)),
+                  ),
+                ),
+            ],
           ),
-        if (onMore != null)
-          Align(
-            alignment: Alignment.center,
-            child: TextButton(
-              onPressed: onMore,
-              child: Text(_displayText(moreLabel ?? '顯示全部', context)),
-            ),
-          ),
+        ),
       ],
     ),
   );
@@ -4331,14 +4337,25 @@ class _CatalogSearchMatch extends StatelessWidget {
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
       child: ListTile(
-        leading: const Icon(Icons.menu_book_outlined),
-        title: Text(label.trim()),
+        leading: const Icon(Icons.menu_book_outlined, color: Color(0xFF176B67)),
+        title: Text(
+          label.trim(),
+          style: const TextStyle(
+            color: Color(0xFF176B67),
+            fontWeight: FontWeight.w600,
+            fontSize: 15,
+          ),
+        ),
         subtitle: Text(
           byline.isEmpty ? '經目匹配 · 點擊開啟' : '經目匹配 · $byline',
           maxLines: 2,
           overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: Color(0xFF687671), fontSize: 12),
         ),
-        trailing: const Icon(Icons.chevron_right_rounded),
+        trailing: const Icon(
+          Icons.chevron_right_rounded,
+          color: Color(0xFF687671),
+        ),
         onTap: onTap,
       ),
     );
@@ -4467,7 +4484,7 @@ class _WorkStickyHeaderState extends State<_WorkStickyHeader>
         if (widget.isExpanded && _childrenBuilt)
           SliverToBoxAdapter(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+              padding: const EdgeInsets.fromLTRB(40, 0, 40, 8),
               child: Card(
                 margin: EdgeInsets.zero,
                 child: Column(
@@ -4535,49 +4552,57 @@ class _WorkStickyHeaderDelegate extends SliverPersistentHeaderDelegate {
     final theme = Theme.of(context);
     final elevation = isExpanded && shrinkOffset > 0 ? 4.0 : 0.0;
 
-    return Material(
-      key: headerKey,
-      color: theme.colorScheme.surface,
-      elevation: elevation,
-      child: InkWell(
-        onTap: onToggle,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          child: Row(
-            children: [
-              Icon(
-                isExpanded
-                    ? Icons.expand_less_rounded
-                    : Icons.expand_more_rounded,
-                color: const Color(0xFF176B67),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      title,
-                      style: const TextStyle(
-                        color: Color(0xFF176B67),
-                        fontWeight: FontWeight.w700,
-                        fontSize: 16,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    if (description.isNotEmpty)
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 40),
+      child: Material(
+        key: headerKey,
+        color: theme.cardColor,
+        elevation: elevation,
+        borderRadius: BorderRadius.circular(12),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onToggle,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+            child: Row(
+              children: [
+                Icon(
+                  isExpanded
+                      ? Icons.expand_less_rounded
+                      : Icons.expand_more_rounded,
+                  color: const Color(0xFF176B67),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
                       Text(
-                        description,
-                        style: const TextStyle(color: Color(0xFF78847F)),
+                        title,
+                        style: const TextStyle(
+                          color: Color(0xFF176B67),
+                          fontWeight: FontWeight.w700,
+                          fontSize: 16,
+                        ),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
-                  ],
+                      if (description.isNotEmpty)
+                        Text(
+                          description,
+                          style: const TextStyle(
+                            color: Color(0xFF687671),
+                            fontSize: 12,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                    ],
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -4627,7 +4652,11 @@ class _JuanResultGroupState extends State<_JuanResultGroup> {
       tilePadding: const EdgeInsets.symmetric(horizontal: 16),
       title: Text(
         widget.juan.isEmpty ? '本卷' : widget.juan,
-        style: const TextStyle(color: Color(0xFF3A4B46)),
+        style: const TextStyle(
+          color: Color(0xFF3A4B46),
+          fontWeight: FontWeight.w600,
+          fontSize: 14,
+        ),
       ),
       children: [
         for (var i = 0; i < shown.length; i++) ...[
@@ -4682,9 +4711,7 @@ class _PassageResultTile extends StatelessWidget {
           if (passage.reference.isNotEmpty)
             Text(
               passage.reference,
-              style: Theme.of(
-                context,
-              ).textTheme.bodySmall?.copyWith(color: const Color(0xFF78847F)),
+              style: const TextStyle(color: Color(0xFF687671), fontSize: 12),
             ),
           const SizedBox(height: 4),
           Text.rich(
@@ -11409,7 +11436,7 @@ class _HomepageDictionaryStickyHeaderState
         ),
         if (widget.isExpanded && _childrenBuilt)
           SliverPadding(
-            padding: const EdgeInsets.symmetric(horizontal: 24),
+            padding: const EdgeInsets.fromLTRB(40, 0, 40, 8),
             sliver: SliverToBoxAdapter(
               child: Card(
                 margin: const EdgeInsets.symmetric(vertical: 4),
@@ -11431,7 +11458,6 @@ class _HomepageDictionaryStickyHeaderState
     final entryKey = '${entry.dictionaryId}:${entry.keyword}';
     final isEntryExpanded = widget.expandedEntryKeys.contains(entryKey);
     final snippet = _fodictDefinitionSnippet(entry.definition);
-    final bodyStyle = _scriptureTextStyle(scriptureDisplaySettings);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -11448,15 +11474,21 @@ class _HomepageDictionaryStickyHeaderState
                     children: [
                       Text(
                         _displayText(entry.keyword, widget.context),
-                        style: bodyStyle.copyWith(fontWeight: FontWeight.w600),
+                        style: const TextStyle(
+                          color: Color(0xFF176B67),
+                          fontWeight: FontWeight.w600,
+                          fontSize: 15,
+                        ),
                       ),
                       if (!isEntryExpanded && snippet.isNotEmpty)
                         Text(
                           snippet,
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
-                          style: bodyStyle.copyWith(
-                            color: const Color(0xFF78847F),
+                          style: const TextStyle(
+                            color: Color(0xFF687671),
+                            fontSize: 14,
+                            height: 1.6,
                           ),
                         ),
                     ],
@@ -11480,7 +11512,7 @@ class _HomepageDictionaryStickyHeaderState
                 _cleanFodictDefinition(entry.definition),
                 widget.context,
               ),
-              style: bodyStyle,
+              style: const TextStyle(fontSize: 16, height: 1.8),
             ),
           ),
       ],
@@ -11520,26 +11552,38 @@ class _HomepageDictionaryHeaderDelegate extends SliverPersistentHeaderDelegate {
     final theme = Theme.of(context);
     final elevation = isExpanded && shrinkOffset > 0 ? 4.0 : 0.0;
 
-    return Material(
-      key: headerKey,
-      color: theme.colorScheme.surface,
-      elevation: elevation,
-      child: InkWell(
-        onTap: onToggle,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  '${_displayText(dictName, context)}（$entryCount）',
-                  style: const TextStyle(fontWeight: FontWeight.bold),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 40),
+      child: Material(
+        key: headerKey,
+        color: theme.cardColor,
+        elevation: elevation,
+        borderRadius: BorderRadius.circular(12),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onToggle,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '${_displayText(dictName, context)}（$entryCount）',
+                    style: const TextStyle(
+                      color: Color(0xFF176B67),
+                      fontWeight: FontWeight.w700,
+                      fontSize: 16,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
                 ),
-              ),
-              Icon(isExpanded ? Icons.expand_less : Icons.expand_more),
-            ],
+                Icon(
+                  isExpanded ? Icons.expand_less : Icons.expand_more,
+                  color: const Color(0xFF176B67),
+                ),
+              ],
+            ),
           ),
         ),
       ),

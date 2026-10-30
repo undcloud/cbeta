@@ -372,7 +372,6 @@ class _SearchInputState extends State<SearchInput> {
 
   Widget _buildChoiceTile(SearchChoice choice) {
     final labels = <String>[
-      if (choice.isHistory) _text('歷史'),
       if (choice.isSimplified) _text('簡體'),
       if (choice.isOriginal) _text('原始輸入'),
       if (choice.query != choice.text) '${_text('實際搜尋')}：${choice.query}',
