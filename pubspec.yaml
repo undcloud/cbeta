@@ -33,6 +33,12 @@ flutter:
     - family: CBETA Supplement
       fonts:
         - asset: assets/fonts/CBETASupplement.ttf
+    - family: CBETA Siddam
+      fonts:
+        - asset: assets/fonts/Siddam.ttf
+    - family: CBETA Ranjana
+      fonts:
+        - asset: assets/fonts/Ranjana.ttf
   assets:
     - assets/cbetaonline.png
     - assets/hanzi_simplified_to_traditional.json

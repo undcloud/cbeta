@@ -66,6 +66,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
   List<List<ScriptureTableCell>> tableRows = [];
   var footnotes = <ScriptureFootnote>[];
   var inlineNotes = <ScriptureInlineNote>[];
+  final scriptRuns = <ScriptureScriptRun>[];
   final activeInlineNotes = <int>[];
 
   void flushLine() {
@@ -124,6 +125,18 @@ List<ScriptureLine> parseScriptureHtml(String source) {
                 ),
               )
               .toList(),
+          scriptRuns: List.unmodifiable(
+            scriptRuns.map(
+              (run) => ScriptureScriptRun(
+                offset: (run.offset - leadingWhitespace).clamp(
+                  0,
+                  trimmedText.length,
+                ),
+                length: run.length,
+                family: run.family,
+              ),
+            ),
+          ),
           verseCells: verseCells,
           images: List.unmodifiable(images),
           tableRows: List.unmodifiable(
@@ -141,6 +154,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
     tableRows = [];
     footnotes = [];
     inlineNotes = [];
+    scriptRuns.clear();
     headingLevel = 0;
     lineRole = ScriptureLineRole.regular;
     if (continuesInlineNotes) {
@@ -252,6 +266,26 @@ List<ScriptureLine> parseScriptureHtml(String source) {
       }
       return;
     }
+    if (node is html_dom.Element &&
+        (node.classes.contains('siddam') || node.classes.contains('ranjana'))) {
+      // 悉曇/蘭札字是空元素，靠 char 屬性的形似漢字做碼位、
+      // 由隨附字體在該碼位換成對應字形。
+      final glyph = (node.attributes['char'] ?? '').trim();
+      if (glyph.isNotEmpty) {
+        final start = text.length;
+        appendText(glyph);
+        scriptRuns.add(
+          ScriptureScriptRun(
+            offset: start,
+            length: glyph.length,
+            family: node.classes.contains('siddam')
+                ? ScriptureScriptFamily.siddam
+                : ScriptureScriptFamily.ranjana,
+          ),
+        );
+      }
+      return;
+    }
     if (node is html_dom.Text) {
       appendText(node.data);
       return;
@@ -347,6 +381,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
         linehead: line.linehead,
         footnotes: line.footnotes,
         inlineNotes: line.inlineNotes,
+        scriptRuns: line.scriptRuns,
         headingLevel: line.headingLevel,
         role: ScriptureLineRole.navigationAnchor,
       );

@@ -6492,13 +6492,68 @@ TextSpan _interactivePassageText(
     int to,
     int visibleStart,
     int sourceLineStart,
-    List<ScriptureInlineNote> inlineNotes, {
+    List<ScriptureInlineNote> inlineNotes,
+    List<ScriptureScriptRun> scriptRuns, {
     TextSpan Function(String value)? highlightSpan,
   }) {
     TextSpan buildSpan(String value, int start, int sourceStart) =>
         highlightSpan == null
         ? highlighted(value, start, sourceStart)
         : highlightSpan(value);
+
+    /// 依悉曇/蘭札字體區間切段，區間外包一層 fontFamily；
+    /// 切段不增減字數，選取與高亮位移不受影響。
+    List<InlineSpan> fontSplit(int segFrom, int segTo, int visibleBase) {
+      if (scriptRuns.isEmpty || segTo <= segFrom) {
+        return [
+          buildSpan(
+            text.substring(segFrom, segTo),
+            visibleBase,
+            sourceLineStart + segFrom,
+          ),
+        ];
+      }
+      final result = <InlineSpan>[];
+      void plain(int start, int end) {
+        if (end <= start) return;
+        result.add(
+          buildSpan(
+            text.substring(start, end),
+            visibleBase + (start - segFrom),
+            sourceLineStart + start,
+          ),
+        );
+      }
+
+      var cursor = segFrom;
+      for (final run in scriptRuns) {
+        final runStart = run.offset.clamp(cursor, segTo);
+        final runEnd = (run.offset + run.length).clamp(runStart, segTo);
+        plain(cursor, runStart);
+        if (runEnd > runStart) {
+          result.add(
+            TextSpan(
+              style: TextStyle(
+                fontFamily: run.family == ScriptureScriptFamily.siddam
+                    ? 'CBETA Siddam'
+                    : 'CBETA Ranjana',
+              ),
+              children: [
+                buildSpan(
+                  text.substring(runStart, runEnd),
+                  visibleBase + (runStart - segFrom),
+                  sourceLineStart + runStart,
+                ),
+              ],
+            ),
+          );
+        }
+        cursor = runEnd;
+      }
+      plain(cursor, segTo);
+      return result;
+    }
+
     final spans = <InlineSpan>[];
     var cursor = from;
     for (final note in inlineNotes) {
@@ -6507,13 +6562,7 @@ TextSpan _interactivePassageText(
       if (noteEnd <= cursor || noteStart >= to) continue;
       final cut = noteStart.clamp(cursor, to);
       if (cut > cursor) {
-        spans.add(
-          buildSpan(
-            text.substring(cursor, cut),
-            visibleStart + (cursor - from),
-            sourceLineStart + cursor,
-          ),
-        );
+        spans.addAll(fontSplit(cursor, cut, visibleStart + (cursor - from)));
       }
       final noteFrom = noteStart.clamp(cursor, to);
       final noteTo = noteEnd.clamp(noteFrom, to);
@@ -6524,26 +6573,18 @@ TextSpan _interactivePassageText(
               color: const Color(0xFF9C8B78),
               fontSize: settings.fontSize * 0.85,
             ),
-            children: [
-              buildSpan(
-                text.substring(noteFrom, noteTo),
-                visibleStart + (noteFrom - from),
-                sourceLineStart + noteFrom,
-              ),
-            ],
+            children: fontSplit(
+              noteFrom,
+              noteTo,
+              visibleStart + (noteFrom - from),
+            ),
           ),
         );
       }
       cursor = noteTo;
     }
     if (cursor < to) {
-      spans.add(
-        buildSpan(
-          text.substring(cursor, to),
-          visibleStart + (cursor - from),
-          sourceLineStart + cursor,
-        ),
-      );
+      spans.addAll(fontSplit(cursor, to, visibleStart + (cursor - from)));
     }
     return spans;
   }
@@ -6575,6 +6616,7 @@ TextSpan _interactivePassageText(
           visibleOffset(contentOffset),
           sourceLineStart,
           line.inlineNotes,
+          line.scriptRuns,
           highlightSpan: highlightSpan,
         ),
       );
@@ -6621,6 +6663,7 @@ TextSpan _interactivePassageText(
         visibleOffset(contentOffset),
         sourceLineStart,
         line.inlineNotes,
+        line.scriptRuns,
         highlightSpan: highlightSpan,
       ),
     );

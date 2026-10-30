@@ -6,7 +6,7 @@
 
 - Flutter App：CBETA 佛經閱讀、搜尋、AI 語意搜尋、離線經卷與自動更新。
 - 入口：`lib/main.dart`，目前仍包含多數頁面與共用元件。
-- 經文模型與解析：`lib/scripture/`（`models.dart`、`parser.dart`、`cache.dart`）。
+- 經文模型與解析：`lib/scripture/`（`models.dart`、`parser.dart`、`cache.dart`）。悉曇/蘭札字以「形似漢字碼位 + 字體替換」呈現，解析器把區間記錄在 `ScriptureLine.scriptRuns`，閱讀器依區間套 `CBETA Siddam`／`CBETA Ranjana` 字體（偈頌 WidgetSpan 路徑暫不套字體，為已知限制）。
 - 顯示設定：`lib/settings/display_settings.dart`。
 - 搜尋：`lib/search/`，包含簡繁轉換、搜尋歷史、Goto、候選排序與共用輸入框。
 - AI：`lib/ai/`，包含 AI 搜尋網路層與 chunk 模型。

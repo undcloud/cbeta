@@ -4,6 +4,7 @@ class ScriptureLine {
     this.linehead,
     this.footnotes = const [],
     this.inlineNotes = const [],
+    this.scriptRuns = const [],
     this.verseCells = const [],
     this.images = const [],
     this.tableRows = const [],
@@ -15,6 +16,7 @@ class ScriptureLine {
   final String? linehead;
   final List<ScriptureFootnote> footnotes;
   final List<ScriptureInlineNote> inlineNotes;
+  final List<ScriptureScriptRun> scriptRuns;
   final List<String> verseCells;
   final List<ScriptureImage> images;
   final List<List<ScriptureTableCell>> tableRows;
@@ -23,6 +25,21 @@ class ScriptureLine {
 }
 
 enum ScriptureLineRole { regular, volumeTitle, byline, navigationAnchor }
+
+enum ScriptureScriptFamily { siddam, ranjana }
+
+/// 悉曇／蘭札等特殊字體的文字區間（以 `text` 的 UTF-16 位移計）。
+class ScriptureScriptRun {
+  const ScriptureScriptRun({
+    required this.offset,
+    required this.length,
+    required this.family,
+  });
+
+  final int offset;
+  final int length;
+  final ScriptureScriptFamily family;
+}
 
 class ScriptureImage {
   const ScriptureImage({required this.source, this.alt = ''});
