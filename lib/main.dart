@@ -9256,6 +9256,7 @@ class _WorkPickerPageState extends State<_WorkPickerPage>
         _loadingRemoteDictionaries = false;
       });
     } catch (error) {
+      debugPrint('詞典清單載入失敗：$error');
       if (!mounted) return;
       setState(() {
         _remoteDictionariesError = '$error';
@@ -10825,9 +10826,12 @@ class _WorkPickerPageState extends State<_WorkPickerPage>
                 children: [
                   Expanded(
                     child: Text(
-                      _remoteDictionariesError!,
+                      _displayText('詞典清單載入失敗，請檢查網絡後重試', context),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         color: Theme.of(context).colorScheme.error,
+                        fontSize: 13,
                       ),
                     ),
                   ),
