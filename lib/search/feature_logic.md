@@ -12,7 +12,11 @@
 - `goto.dart`：Goto 引文提取与行号规范化；
 - `search_input.dart`：共享输入框、实时候选浮层、词典 key 命中数统计与提交；
 - `feature_logic.md`：本文件；
-- `lib/main.dart`：首页搜索、Goto、AI 入口、卷内搜索、经目/作译者查询、词典查询与阅读器高亮的调用点；
+- `lib/home/home_page.dart`：首页搜索、Goto、经目/作译者查询与词典查询的调用点；
+- `lib/reader/`：卷内搜索与阅读器高亮的调用点；
+- `lib/search/search_api.dart`：线上分页搜索请求（`SearchBatch`、`fetchSearchBatch`、`parseSearchResult`）；
+- `lib/search/passage_resolver.dart`：Goto/行号 → `ScripturePassage` 的本地与线上解析；
+- `lib/search/full_text_search_page.dart`：旧全文搜索页（未被引用，见下）；
 - `lib/dictionary/fodict_service.dart`：词典读取、按 key 匹配与 key 命中统计；
 - `lib/scripture/offline_scan.dart`：离线正文连续扫描会话、背景 isolate 扫描与 KWIC 片段；
 - `lib/download/catalog_cache.dart`：App 内建的全量经目 metadata（work/title/creators/juans）与 `searchWorks` 排序查询（只匹配 work 與 title），首页经目分区与经目查询入口都靠它回答；
@@ -21,7 +25,7 @@
 
 当前没有被任何页面引用的旧实现：
 
-- `lib/main.dart` 的私有 `_FullTextSearchPage`；
+- `lib/search/full_text_search_page.dart` 的 `FullTextSearchPage`（原 `_FullTextSearchPage`）；
 - `lib/dictionary/dictionary_page.dart` 的 `DictionarySearchPage`。
 
 实际全文搜索由首页完成，实际词典查询入口是「选择佛经 → 词典查询」。这两个旧页面不影响现行行为，修改逻辑时不要误把它们当作入口。
