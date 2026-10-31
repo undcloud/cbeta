@@ -20,6 +20,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import 'ai/ai_chunk.dart';
 import 'ai/ai_search_service.dart';
+import 'cbeta_api_headers.dart';
 import 'dictionary/fodict_catalog.dart';
 import 'dictionary/fodict_download_manager.dart';
 import 'dictionary/fodict_service.dart';
@@ -7234,6 +7235,7 @@ Future<List<String>> _loadSelectionLineheads(
           'before': '20',
           'after': '30',
         }),
+        headers: cbetaApiHeaders,
       )
       .timeout(const Duration(seconds: 20));
   if (response.statusCode != 200) return [linehead];
@@ -7287,6 +7289,7 @@ Future<String?> _loadSectionTitle(
   final response = await http
       .get(
         Uri.https('cbdata.dila.edu.tw', '/stable/works/toc', {'work': workId}),
+        headers: cbetaApiHeaders,
       )
       .timeout(const Duration(seconds: 20));
   if (response.statusCode != 200) return null;
@@ -7431,6 +7434,7 @@ Future<ScripturePassage> _resolveGotoPassageOnline(String linehead) async {
         Uri.https('cbdata.dila.edu.tw', '/stable/juans/goto', {
           'linehead': linehead,
         }),
+        headers: cbetaApiHeaders,
       )
       .timeout(const Duration(seconds: 20));
   if (response.statusCode != 200) {
@@ -7493,7 +7497,10 @@ Future<ScripturePassage> _resolveWorkPassageOnline(
   String? targetLinehead,
 }) async {
   final response = await http
-      .get(Uri.https('cbdata.dila.edu.tw', '/stable/works/toc', {'work': work}))
+      .get(
+        Uri.https('cbdata.dila.edu.tw', '/stable/works/toc', {'work': work}),
+        headers: cbetaApiHeaders,
+      )
       .timeout(const Duration(seconds: 20));
   if (response.statusCode != 200) {
     throw Exception('作品目錄 API 回傳 ${response.statusCode}');
@@ -7839,6 +7846,7 @@ Future<_SearchBatch> _fetchSearchBatch(String query, {int start = 0}) async {
           'rows': '$pageSize',
           'around': '30',
         }),
+        headers: cbetaApiHeaders,
       )
       .timeout(_keywordSearchTimeout);
   if (response.statusCode != 200) {
@@ -8931,7 +8939,9 @@ Future<Map<String, dynamic>> _cachedPickerJson(
 ) async {
   final key = uri.toString();
   final future = _WorkPickerResponseCache.json.putIfAbsent(key, () async {
-    final response = await http.get(uri).timeout(const Duration(seconds: 20));
+    final response = await http
+        .get(uri, headers: cbetaApiHeaders)
+        .timeout(const Duration(seconds: 20));
     if (response.statusCode != 200) {
       throw Exception('$serviceName 回傳 ${response.statusCode}');
     }

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import '../cbeta_api_headers.dart';
 import '../scripture/cache.dart';
 import 'api_rate_limiter.dart';
 import 'work_archive.dart';
@@ -51,6 +52,7 @@ class ScriptureUpdateService {
                 'cbdata.dila.edu.tw',
                 '/stable/download/html/$work.html.zip',
               ),
+              headers: cbetaApiHeaders,
             )
             .timeout(const Duration(seconds: 30)),
       );
@@ -79,6 +81,7 @@ class ScriptureUpdateService {
               Uri.https('cbdata.dila.edu.tw', '/stable/changes', {
                 'work': work,
               }),
+              headers: cbetaApiHeaders,
             )
             .timeout(const Duration(seconds: 30)),
       );

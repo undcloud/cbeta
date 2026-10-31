@@ -7,6 +7,8 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../cbeta_api_headers.dart';
+
 class CachedScriptureVolume {
   const CachedScriptureVolume({
     required this.work,
@@ -255,7 +257,7 @@ Future<CachedScriptureVolume> fetchScriptureVolume(
         'work': work,
         'juan': juan,
       }),
-    );
+    )..headers.addAll(cbetaApiHeaders);
     final response = await client
         .send(request)
         .timeout(const Duration(seconds: 20));

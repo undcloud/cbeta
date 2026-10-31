@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:http/http.dart' as http;
 
+import '../cbeta_api_headers.dart';
 import '../scripture/cache.dart';
 
 class WorkArchive {
@@ -23,7 +24,7 @@ Future<WorkArchive> fetchWorkArchive(
     final request = http.Request(
       'GET',
       Uri.https('cbdata.dila.edu.tw', '/stable/download/html/$work.html.zip'),
-    );
+    )..headers.addAll(cbetaApiHeaders);
     final response = await client
         .send(request)
         .timeout(const Duration(seconds: 90));

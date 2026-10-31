@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
+import '../cbeta_api_headers.dart';
 import 'api_rate_limiter.dart';
 
 /// 可從 CBETA scope selector 下載的經目檔案。
@@ -230,7 +231,7 @@ class CatalogUpdateService {
   }
 
   Future<_RemoteFileInfo> _head(http.Client client, Uri uri) async {
-    final request = http.Request('HEAD', uri);
+    final request = http.Request('HEAD', uri)..headers.addAll(cbetaApiHeaders);
     final response = await client
         .send(request)
         .timeout(const Duration(seconds: 30));
@@ -245,7 +246,9 @@ class CatalogUpdateService {
   }
 
   Future<List<int>> _download(http.Client client, Uri uri) async {
-    final response = await client.get(uri).timeout(const Duration(seconds: 90));
+    final response = await client
+        .get(uri, headers: cbetaApiHeaders)
+        .timeout(const Duration(seconds: 90));
     if (response.statusCode != 200) {
       throw Exception('經目下載失敗：HTTP ${response.statusCode}');
     }
@@ -258,7 +261,10 @@ class CatalogUpdateService {
     try {
       final response = await apiRateLimiter.run(
         () => client
-            .get(Uri.parse('$baseUrl/static_pages/log'))
+            .get(
+              Uri.parse('$baseUrl/static_pages/log'),
+              headers: cbetaApiHeaders,
+            )
             .timeout(const Duration(seconds: 30)),
       );
       if (response.statusCode != 200) return null;
