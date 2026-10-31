@@ -694,12 +694,20 @@ return scriptureDisplaySettings.showSimplifiedText
 - 跳转后直接把**命中字元**置中（卷内搜索、线上行号命中、离线位移命中一致），长段落不会只显示行首而把命中推到画面外；`clamp(0, maxScrollExtent)` 会让卷首命中自动滑到最开头、卷末命中滑到最后面；
 - 卷末重复的经题保留文字（`navigationAnchor`），只是不显示行首标记；`volumeTitle` / `byline` 命中视为标题命中（回到卷首、只在顶部经题列高亮）；`navigationAnchor` 视为正文命中，滑到它在卷末的实际位置并在正文高亮，避免两笔搜索结果重复高亮同一个标题；
 - 线上阅读时 `_cachedJuan` 先用 `/stable/juans` 取得线上全文；本地已有该卷就不写入、也不覆盖，本地没有才把线上内容留作离线备份。下载同一部经时，下载器写入压缩档内容并注册版本，自然覆盖线上备份；书签与最近阅读仍以本地优先打开，并用 `sourceOffset + snippet` 回位；
-- 表格与图片仍以 `WidgetSpan` 呈现，在 `SelectableText` 纯文字中各占 1 个 placeholder；`_buildScriptureTextLayout` 与渲染端必须使用相同的前进量，否则锚点与卷内搜索会整段偏移；
+- 表格与图片仍以 `WidgetSpan` 呈现，在区块 `Text.rich` 的纯文字中各占 1 个 placeholder；`_buildScriptureTextLayout` 与渲染端必须使用相同的前进量，否则锚点与卷内搜索会整段偏移；
 - 偈颂（`lg-row`）改以纯文字呈现（每格之间以不可见的 `WidgetSpan` 补足等宽置中间距），因此可以逐字选取；`_verseCellRenderedTexts` 同时供 layout 与渲染使用，两端的格内文字、校勘标记与 placeholder 数量必须一致；
 - 偈颂段落前只在上一行没有自带换行时补一个换行（不额外留空行）；段落後补一个空行；偈字使用较大的行高。这些换行字符也必须同时写进 `_buildScriptureTextLayout` 与渲染端，`lineStarts` 以偈颂列本身为起点，搜索锚点才不会偏移；
 - 标题固定在阅读页顶端显示，卷动内容的卷题/作译者靠右是用不可见的 `WidgetSpan` 留白达成（同一段文字才能选取）；该 placeholder 也算一个字符，reader 端的 `headerPrefixLength` 与 span 的 `toPlainText().length` 必须一致。卷题/作译者行的校勘标记也要一起渲染并计入长度；
 - `WidgetSpan` 内的文字（当前主要是表格）不在纯文字位移系统中，改用 `highlightedWidget` 直接字符串比对来高亮（卷内搜索使用黄色、全局搜索使用绿色）；
 - 关键字高亮以 `_matchRangesIn(layout.text, query)` 先算出所有命中范围，再与每个文字片段求交集；因此跨经文行、跨校勘标记的命中（如「四大五｜蕴迁变」的「五蕴」）也能正确高亮。
+
+### 10.1 分块渲染与跨区块选取
+
+- `lib/scripture/reader_blocks.dart` 的 `buildScriptureReaderBlocks` 把整卷切成区块（正文 4000 字 / 表格 12 行 / 偈颂 24 行为上限，表格与偈颂不跨块），阅读器用 `ListView.builder` 只构建画面内的块，大部头经卷首屏不再整卷排版；
+- 全卷只有**一个** `SelectionArea` 包住 `ListView.builder`，块内用 `Text.rich`（不是 `SelectableText`）渲染，因此选取、复制、查词典与复制引文都能跨块；每块带 `GlobalKey`，`_blockParagraph` 从元素的子树取出真正排版的 `RenderParagraph`（`Text` 元素本身的 renderObject 是外层 `RenderMouseRegion`）；
+- 选中文字来自 `SelectionArea.onSelectionChanged` 的 `SelectedContent.plainText`（存进 `_selectedContentText`），工具列按钮在**触发时**才读取，避免工具列重建时机决定到选不到的文字；
+- 选取范围换算回整卷 layout 位移：`_selectedLayoutRange` 读 `SelectableRegionState.selectionEndpoints`（只有画面座标），用 `_layoutOffsetAtGlobalPoint` 找最近的块段落 `getPositionForOffset`，再加该块的 `offsetBase`（`_scriptureBlockOffsetBases`，即 `layout.lineStarts[startLine]` 扣掉行首标记前缀）与块 0 的 `headerPrefixLength`；引文起止行号由 `_scriptureLineheadAtLayoutOffset` 依 `layout.lineStarts` 还原；
+- 滚动定位同样改成区块制：`_scheduleReaderScroll` 以 `_estimateBlockExtent` 估算目标块位置，块被构建后再用 `RenderParagraph.getOffsetForCaret` 校正，`_scrollRequestId` 让新请求作废旧的重试链；设定改变（字体、简繁）先用 `_captureReaderScrollAnchor` 记下画面顶端的那一块与局部位移，回位时保持顶端文字。
 
 ---
 
@@ -803,6 +811,8 @@ return scriptureDisplaySettings.showSimplifiedText
 - `scrolling reveals the next offline result groups`：离线扫描先只渲染 20 部（第 25 部看不到），卷到底自动放行第二页并出现「收合多顯示的作品」；
 - `test/offline_scan_test.dart`：`OfflineScanSession` 的分块扫描、自行连续推进到全部卷、暂停后不再排下一块、恢复后从中断处继续、没有本地经卷时立即结束，以及 `runOfflineScan` 的 KWIC 片段；
 - `in-volume search highlights ...`、`reader centers ...`、`reader clamps ...`、`reader aligns hits ...`：卷内搜索位移、跨校勘标记、偈颂与滚动对齐；`reader locates hits inside archive paragraph anchors` 用段落级锚点模拟离线下載经文，验证同段多处的关键词依 kwic 上下文定位，且「上一筆／下一筆」会分别置中不同命中；`reader jumps to the exact offline source offset` 验证离线 `sourceOffset` 直接命中第二处重复词、书签存下位移与 snippet；`online search results read the online volume without overwriting the downloaded copy` 验证线上结果优先读线上、且不覆盖本地已下载经卷；`offline scan offsets match the layout source across verse lines` 验证偈颂行之后的 `sourceOffset` 与 layout 来源一致。
+
+- 阅读页分块与跨块选取：`test/scripture_reader_blocks_test.dart` 覆盖 `buildScriptureReaderBlocks` 的 4000 字 / 12 行表格 / 24 行偈颂上限与「表格、偈颂不跨块」；`reader builds a table-heavy volume in lazy blocks` 验证首屏只构建画面内的块、滚出画面后回收；`lazy blocks concatenated reproduce the whole volume text` 验证逐块文字串起来与整卷 layout 完全一致；`reader selection spans lazy blocks for copy and citation` 用「全选 → 复制 / 复制引文」验证一次选取横跨首末两块，复制文字含两端、引文起止行号为 `p. 1a1-60`；
 
 ### 12.2 尚未覆盖或建议补充
 

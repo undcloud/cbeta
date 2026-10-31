@@ -10,7 +10,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show RenderEditable;
+import 'package:flutter/material.dart' as material;
+import 'package:flutter/rendering.dart' show RenderParagraph;
+import 'package:flutter/services.dart' show SystemChannels;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -57,6 +59,119 @@ Color? _dialogBackgroundColor(WidgetTester tester) {
       .descendant(of: find.byType(Dialog), matching: find.byType(Material))
       .first;
   return tester.widget<Material>(material).color;
+}
+
+/// 閱讀頁正文已切成多個可惰性構建的區塊，每個區塊是一個帶 `GlobalKey` 的
+/// `Text`（外層 `SelectionArea` 負責跨區塊選取）。
+Iterable<material.Text> readerBlockTexts(WidgetTester tester) => tester
+    .widgetList<material.Text>(
+      find.descendant(
+        of: find.byType(ListView).first,
+        matching: find.byType(material.Text),
+      ),
+    )
+    .where((text) => text.textSpan != null && text.key is GlobalKey);
+
+/// 區塊根節點的最後一個子節點是正文，前面可能掛著卷題／作譯者。
+InlineSpan? readerBlockBodySpan(material.Text text) {
+  final span = text.textSpan;
+  final children = span is TextSpan ? span.children : null;
+  return children?.lastOrNull ?? span;
+}
+
+material.Text readerFirstBlockText(WidgetTester tester) =>
+    readerBlockTexts(tester).first;
+
+InlineSpan? readerFirstBlockSpan(WidgetTester tester) =>
+    readerFirstBlockText(tester).textSpan;
+
+TextStyle? readerBlockTextStyle(WidgetTester tester) =>
+    readerFirstBlockText(tester).style;
+
+String readerBodyText(WidgetTester tester) {
+  final buffer = StringBuffer();
+  for (final text in readerBlockTexts(tester)) {
+    buffer.write(readerBlockBodySpan(text)?.toPlainText() ?? '');
+  }
+  return buffer.toString();
+}
+
+/// `RenderEditable.getLocalRectForCaret` 的 `RenderParagraph` 版本。
+Rect readerCaretRect(RenderParagraph paragraph, int offset) {
+  final position = TextPosition(offset: offset);
+  final caret = paragraph.getOffsetForCaret(position, Rect.zero);
+  return Rect.fromLTWH(
+    caret.dx,
+    caret.dy,
+    0,
+    paragraph.getFullHeightForCaret(position),
+  );
+}
+
+/// 找出渲染了 `needle` 的正文區塊，並回傳它的 `RenderParagraph`。
+RenderParagraph readerParagraphWith(WidgetTester tester, String needle) {
+  for (final text in readerBlockTexts(tester)) {
+    if (!(text.textSpan?.toPlainText().contains(needle) ?? false)) continue;
+    // `Text` 元素的 renderObject 是它外層的 `RenderMouseRegion`，
+    // 真正排版的 `RenderParagraph` 挂在内層 `RichText` 上。
+    final renderObject = tester.renderObject(
+      find
+          .descendant(of: find.byWidget(text), matching: find.byType(RichText))
+          .first,
+    );
+    if (renderObject is RenderParagraph) return renderObject;
+  }
+  throw StateError('找不到包含「$needle」的正文區塊');
+}
+
+/// 只收集正文（跳過卷題／作譯者前置文字）中帶有指定底色的文字。
+List<String> readerBodyHighlights(WidgetTester tester, Color background) {
+  final highlights = <String>[];
+  void collect(InlineSpan? span) {
+    if (span == null || span is! TextSpan) return;
+    if (span.style?.backgroundColor == background) {
+      highlights.add(span.text ?? '');
+    }
+    for (final child in span.children ?? const <InlineSpan>[]) {
+      collect(child);
+    }
+  }
+
+  for (final text in readerBlockTexts(tester)) {
+    collect(readerBlockBodySpan(text));
+  }
+  return highlights;
+}
+
+/// 找出包含 `needle` 的正文區塊，回傳正文純文字與高亮的起始位移。
+({String plain, List<int> highlights}) readerBlockWithHighlights(
+  WidgetTester tester,
+  String needle,
+  Color background,
+) {
+  for (final text in readerBlockTexts(tester)) {
+    final body = readerBlockBodySpan(text);
+    final plain = body?.toPlainText() ?? '';
+    if (!plain.contains(needle)) continue;
+    final highlights = <int>[];
+    var offset = 0;
+    void walk(InlineSpan? span) {
+      if (span == null) return;
+      if (span is! TextSpan) {
+        offset += span.toPlainText().length;
+        return;
+      }
+      if (span.style?.backgroundColor == background) highlights.add(offset);
+      offset += span.text?.length ?? 0;
+      for (final child in span.children ?? const <InlineSpan>[]) {
+        walk(child);
+      }
+    }
+
+    walk(body);
+    return (plain: plain, highlights: highlights);
+  }
+  throw StateError('找不到包含「$needle」的正文區塊');
 }
 
 void main() {
@@ -330,6 +445,279 @@ void main() {
     }, () => client);
   });
 
+  testWidgets('reader builds a table-heavy volume in lazy blocks', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    final scriptureHtml = List.generate(60, (index) {
+      final row = index + 1;
+      return '<span class="lb" id="T01n0003_p0001a'
+          '${row.toString().padLeft(2, '0')}"></span>'
+          '<div class="bip-table"><div class="bip-table-row">'
+          '<div class="bip-table-cell"><span class="t">表列$row</span></div>'
+          '<div class="bip-table-cell"><span class="t">頁$row</span></div>'
+          '</div></div>';
+    }).join();
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': ['<div id="body">$scriptureHtml</div>'],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '三藏法數',
+              reference: '卷 1',
+              text: '',
+              linehead: 'T01n0003_p0001a01',
+              juan: '1',
+              work: 'T0003',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // 60 行表格切成 5 塊，首幀只構建畫面看得到的區塊。
+      expect(find.text('表列1', findRichText: true), findsOneWidget);
+      expect(find.text('表列60', findRichText: true), findsNothing);
+      expect(readerBlockTexts(tester).length, lessThan(5));
+
+      await tester.scrollUntilVisible(
+        find.text('表列60', findRichText: true),
+        200,
+        scrollable: find
+            .descendant(
+              of: find.byType(ListView).first,
+              matching: find.byType(Scrollable),
+            )
+            .first,
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('表列60', findRichText: true), findsOneWidget);
+      // 捲動離開的區塊會被回收，不會一直留在樹裡。
+      expect(find.text('表列1', findRichText: true), findsNothing);
+    }, () => client);
+  });
+
+  testWidgets('lazy blocks concatenated reproduce the whole volume text', (
+    WidgetTester tester,
+  ) async {
+    // 把畫面拉高到足以一次構建全部區塊，才能逐字比對整卷文字。
+    tester.view.physicalSize = const Size(800, 12000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+
+    final expectedCells = <String>[];
+    final scriptureHtml = StringBuffer();
+    for (var index = 0; index < 60; index++) {
+      final row = index + 1;
+      scriptureHtml.write(
+        '<span class="lb" id="T01n0003_p0001a'
+        '${row.toString().padLeft(2, '0')}"></span>',
+      );
+      switch (row % 5) {
+        case 4:
+          scriptureHtml.write(
+            '<div class="lg-row"><div class="lg-cell">偈$row，</div>'
+            '<div class="lg-cell">頌$row。</div></div>',
+          );
+          expectedCells.add('偈$row，');
+          expectedCells.add('頌$row。');
+        case 0:
+          scriptureHtml.write(
+            '<div class="bip-table"><div class="bip-table-row">'
+            '<div class="bip-table-cell"><span class="t">表$row</span></div>'
+            '</div></div>',
+          );
+          expectedCells.add('表$row');
+        default:
+          scriptureHtml.write('<p>文字$row聞已不樂而歸。</p>');
+          expectedCells.add('文字$row聞已不樂而歸。');
+      }
+    }
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': ['<div id="body">${scriptureHtml.toString()}</div>'],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '三藏法數',
+              reference: '卷 1',
+              text: '',
+              linehead: 'T01n0003_p0001a01',
+              juan: '1',
+              work: 'T0003',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // 空白與 WidgetSpan placeholder 不參與比對。
+      final rendered = readerBodyText(
+        tester,
+      ).replaceAll(RegExp(r'[\s\uFFFC]'), '');
+      final expected = expectedCells.join();
+      expect(rendered.length, expected.length);
+      expect(rendered, expected);
+    }, () => client);
+  });
+
+  testWidgets('reader selection spans lazy blocks for copy and citation', (
+    WidgetTester tester,
+  ) async {
+    // 拉高畫面讓全部區塊都構建，選取才能橫跨區塊。
+    tester.view.physicalSize = const Size(800, 20000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    final filler = '聞已不樂即歸四處經行其數有三四大五蘊遷變寂靜安樂' * 4;
+    final scriptureHtml = List.generate(60, (index) {
+      final row = index + 1;
+      return '<span class="lb" id="T01n0003_p0001a'
+          '${row.toString().padLeft(2, '0')}"></span>'
+          '<p>文字$row$filler。</p>';
+    }).join();
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': ['<div id="body">$scriptureHtml</div>'],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '三藏法數',
+              reference: '卷 1',
+              text: '',
+              linehead: 'T01n0003_p0001a01',
+              juan: '1',
+              work: 'T0003',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final copied = <String>[];
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        (call) async {
+          if (call.method == 'Clipboard.setData') {
+            copied.add(
+              ((call.arguments as Map<Object?, Object?>)['text'] ?? '')
+                  as String,
+            );
+          }
+          return null;
+        },
+      );
+
+      // 60 行 × 約 100 字 > 4000 字上限，必然切成兩塊以上。
+      expect(readerBlockTexts(tester).length, greaterThan(1));
+      final paragraph = readerParagraphWith(tester, '文字1');
+      final plain = paragraph.text.toPlainText();
+      await tester.longPressAt(
+        paragraph.localToGlobal(
+          readerCaretRect(paragraph, plain.indexOf('文字1') + 1).center,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('全選'));
+      await tester.pumpAndSettle();
+      expect(find.text('複製'), findsOneWidget);
+      await tester.tap(find.text('複製'));
+      await tester.pumpAndSettle();
+
+      // 選取跨過了惰性區塊：一次複製要拿到首塊與末塊兩邊的文字。
+      expect(copied, hasLength(1));
+      expect(copied.single, contains('文字1'));
+      expect(copied.single, contains('文字60'));
+      expect(copied.single, contains(filler));
+
+      await tester.longPressAt(
+        paragraph.localToGlobal(
+          readerCaretRect(paragraph, plain.indexOf('文字20') + 1).center,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('全選'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('複製引文'));
+      await tester.pumpAndSettle();
+
+      // 引文的起止行號也必須各自落在首塊與末塊。
+      expect(copied, hasLength(2));
+      expect(
+        copied.last,
+        contains('(CBETA 2026.R1, T01, no. 0003, p. 1a1-60)'),
+      );
+    }, () => client);
+  });
+
   testWidgets('reader uses an offline scripture volume without requesting it', (
     tester,
   ) async {
@@ -371,10 +759,7 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      final renderedText = tester
-          .widget<SelectableText>(find.byType(SelectableText).first)
-          .textSpan!
-          .toPlainText();
+      final renderedText = readerFirstBlockSpan(tester)!.toPlainText();
       expect(renderedText, contains('離線經文內容'));
       expect(networkRequests, 0);
     }, () => client);
@@ -433,10 +818,7 @@ void main() {
         find.text('完整經卷中找不到搜尋命中行：T02n0102_p0499c28', findRichText: true),
         findsNothing,
       );
-      final renderedText = tester
-          .widget<SelectableText>(find.byType(SelectableText).first)
-          .textSpan!
-          .toPlainText();
+      final renderedText = readerFirstBlockSpan(tester)!.toPlainText();
       expect(renderedText, contains('如是我聞。'));
       final parsed = await scriptureVolumeStore.read('T0102', '1');
       expect(parsed?.html, scriptureHtml);
@@ -522,28 +904,13 @@ void main() {
       final scrollable = tester.state<ScrollableState>(
         find
             .descendant(
-              of: find.byType(SingleChildScrollView).first,
+              of: find.byType(ListView).first,
               matching: find.byType(Scrollable),
             )
             .first,
       );
-      final highlights = <String>[];
-      void collect(InlineSpan? span) {
-        if (span == null || span is! TextSpan) return;
-        if (span.style?.backgroundColor == const Color(0xFFDDEDE8)) {
-          highlights.add(span.text ?? '');
-        }
-        for (final child in span.children ?? const <InlineSpan>[]) {
-          collect(child);
-        }
-      }
-
-      // Only collect highlights from the body portion (last child of root),
-      // skipping the header prefix (title, reference, header lines).
-      final rootSpan = tester
-          .widget<SelectableText>(find.byType(SelectableText).first)
-          .textSpan;
-      collect(rootSpan?.children?.lastOrNull);
+      // 只取正文高亮，跳過卷題／作譯者前置文字。
+      final highlights = readerBodyHighlights(tester, const Color(0xFFDDEDE8));
       return (pixels: scrollable.position.pixels, bodyHighlights: highlights);
     }
 
@@ -611,9 +978,6 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      final selectable = tester.widget<SelectableText>(
-        find.byType(SelectableText).first,
-      );
       var count = 0;
       void collect(InlineSpan span) {
         if (span is! TextSpan) return;
@@ -623,7 +987,7 @@ void main() {
         }
       }
 
-      collect(selectable.textSpan!);
+      collect(readerFirstBlockSpan(tester)!);
       return count;
     }
 
@@ -758,9 +1122,6 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      final selectable = tester.widget<SelectableText>(
-        find.byType(SelectableText).first,
-      );
       bool containsStyledSpan(
         InlineSpan span, {
         required String text,
@@ -778,7 +1139,7 @@ void main() {
 
       expect(
         containsStyledSpan(
-          selectable.textSpan!,
+          readerFirstBlockSpan(tester)!,
           text: '中阿含經卷第五',
           color: const Color(0xFF007564),
         ),
@@ -786,7 +1147,7 @@ void main() {
       );
       expect(
         containsStyledSpan(
-          selectable.textSpan!,
+          readerFirstBlockSpan(tester)!,
           text: '東晉罽賓三藏瞿曇僧伽提婆譯',
           color: const Color(0xFF8C7B66),
         ),
@@ -799,7 +1160,7 @@ void main() {
             (span.children?.any(containsMutedInlineNote) ?? false);
       }
 
-      expect(containsMutedInlineNote(selectable.textSpan!), isTrue);
+      expect(containsMutedInlineNote(readerFirstBlockSpan(tester)!), isTrue);
     }, () => client);
   });
 
@@ -856,11 +1217,11 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      final selectable = tester.widget<SelectableText>(
-        find.byType(SelectableText).first,
+      expect(
+        readerFirstBlockSpan(tester)!.toPlainText(),
+        contains('西天譯經三藏[1]'),
       );
-      expect(selectable.textSpan!.toPlainText(), contains('西天譯經三藏[1]'));
-      expect(selectable.textSpan!.toPlainText(), contains('臣法天奉詔譯'));
+      expect(readerFirstBlockSpan(tester)!.toPlainText(), contains('臣法天奉詔譯'));
     }, () => client);
     await scriptureDisplaySettings.update(
       showCollation: false,
@@ -922,10 +1283,7 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      final plain = tester
-          .widget<SelectableText>(find.byType(SelectableText).first)
-          .textSpan!
-          .toPlainText();
+      final plain = readerBodyText(tester);
       // 前一段已自帶換行，不再補第二個換行。
       expect(plain, contains('頌曰：\n'));
       expect(plain, isNot(contains('頌曰：\n\n')));
@@ -1182,10 +1540,7 @@ void main() {
         await tester.pumpAndSettle();
 
         expect(requestedGotoLineheads, ['B36n0198_ph017a02']);
-        final readerText = tester
-            .widget<SelectableText>(find.byType(SelectableText).first)
-            .textSpan!
-            .toPlainText();
+        final readerText = readerFirstBlockSpan(tester)!.toPlainText();
         expect(readerText, contains('博伽梵歌目標段落'));
         expect(find.text('第 1 / 3 卷'), findsOneWidget);
       }, () => client);
@@ -1913,13 +2268,7 @@ void main() {
       await tester.testTextInput.receiveAction(TextInputAction.search);
       await tester.pumpAndSettle();
 
-      expect(
-        tester
-            .widget<SelectableText>(find.byType(SelectableText).first)
-            .textSpan!
-            .toPlainText(),
-        contains('離線行號經文'),
-      );
+      expect(readerFirstBlockSpan(tester)!.toPlainText(), contains('離線行號經文'));
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pumpAndSettle();
@@ -1991,10 +2340,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(
-        tester
-            .widget<SelectableText>(find.byType(SelectableText).first)
-            .textSpan!
-            .toPlainText(),
+        readerFirstBlockSpan(tester)!.toPlainText(),
         contains('Goto 目標經文'),
       );
       expect(requestedPaths, contains('/stable/juans/goto'));
@@ -2646,13 +2992,7 @@ void main() {
         expect(find.text('B0117 三藏法數'), findsOneWidget);
         await tester.tap(find.text('B0117 三藏法數'));
         await tester.pumpAndSettle();
-        expect(
-          tester
-              .widget<SelectableText>(find.byType(SelectableText).first)
-              .textSpan!
-              .toPlainText(),
-          contains('三藏法數'),
-        );
+        expect(readerFirstBlockSpan(tester)!.toPlainText(), contains('三藏法數'));
         expect(
           tester
               .widget<DropdownButton<int>>(find.byType(DropdownButton<int>))
@@ -2701,13 +3041,7 @@ void main() {
         await tester.tap(find.text('到該行'));
         await tester.pumpAndSettle();
         expect(requestedGotoQueries, ['B22n0117_p0005a01']);
-        expect(
-          tester
-              .widget<SelectableText>(find.byType(SelectableText).first)
-              .textSpan!
-              .toPlainText(),
-          contains('三藏法數'),
-        );
+        expect(readerFirstBlockSpan(tester)!.toPlainText(), contains('三藏法數'));
         await tester.pumpWidget(const SizedBox.shrink());
         await tester.pumpAndSettle();
       }, () => client);
@@ -2771,45 +3105,24 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('繁'), findsOneWidget);
-      final scriptureText = tester.widget<SelectableText>(
-        find.byType(SelectableText).first,
-      );
-      expect(scriptureText.textSpan!.toPlainText(), contains('甲[2]乙五蘊經典'));
+      expect(readerBodyText(tester), contains('甲[2]乙五蘊經典'));
       // 偈頌以文字呈現，才能逐字選取。
-      expect(scriptureText.textSpan!.toPlainText(), contains('毘婆尸太子，'));
-      expect(scriptureText.textSpan!.toPlainText(), contains('遊觀於園林，'));
+      expect(readerBodyText(tester), contains('毘婆尸太子，'));
+      expect(readerBodyText(tester), contains('遊觀於園林，'));
       await tester.tap(find.text('繁'));
       await tester.pumpAndSettle();
       expect(scriptureDisplaySettings.showSimplifiedText, isTrue);
-      expect(
-        tester
-            .widget<SelectableText>(find.byType(SelectableText).first)
-            .textSpan!
-            .toPlainText(),
-        contains('甲[2]乙五蕴经典'),
-      );
+      expect(readerBodyText(tester), contains('甲[2]乙五蕴经典'));
       await tester.tap(find.text('简'));
       await tester.pumpAndSettle();
       expect(scriptureDisplaySettings.showSimplifiedText, isFalse);
-      RenderEditable? findEditable(RenderObject object) {
-        if (object is RenderEditable) return object;
-        RenderEditable? editable;
-        object.visitChildren((child) {
-          editable ??= findEditable(child);
-        });
-        return editable;
-      }
 
-      final collationEditable = findEditable(
-        tester.renderObject(find.byType(SelectableText).first),
-      )!;
-      final collationText = collationEditable.text!.toPlainText();
+      final collationParagraph = readerParagraphWith(tester, '[2]');
+      final collationText = collationParagraph.text.toPlainText();
       final collationIndex = collationText.indexOf('[2]');
       expect(collationIndex, greaterThanOrEqualTo(0));
-      final collationTapPos = collationEditable.localToGlobal(
-        collationEditable
-            .getLocalRectForCaret(TextPosition(offset: collationIndex))
-            .center,
+      final collationTapPos = collationParagraph.localToGlobal(
+        readerCaretRect(collationParagraph, collationIndex).center,
       );
       await tester.tapAt(collationTapPos);
       await tester.pumpAndSettle();
@@ -2821,13 +3134,7 @@ void main() {
       await tester.tap(find.text('顯示首行'));
       await tester.pumpAndSettle();
       expect(scriptureDisplaySettings.showLineBeginnings, isTrue);
-      expect(
-        tester
-            .widget<SelectableText>(find.byType(SelectableText).first)
-            .textSpan!
-            .toPlainText(),
-        contains('[0001a01] '),
-      );
+      expect(readerBodyText(tester), contains('[0001a01] '));
     }, () => client);
   });
 
@@ -2885,9 +3192,7 @@ void main() {
       await tester.testTextInput.receiveAction(TextInputAction.search);
       await tester.pumpAndSettle();
 
-      final text = tester.widget<SelectableText>(
-        find.byType(SelectableText).first,
-      );
+      final text = readerFirstBlockSpan(tester)!;
       final highlightedText = <String>[];
       void collectHighlights(InlineSpan span) {
         if (span is! TextSpan) return;
@@ -2899,7 +3204,7 @@ void main() {
         }
       }
 
-      collectHighlights(text.textSpan!);
+      collectHighlights(text);
       expect(highlightedText, containsAll(['安', '置']));
       expect(find.text('1 / 1'), findsOneWidget);
     }, () => client);
@@ -2968,51 +3273,25 @@ void main() {
       await tester.enterText(find.byType(TextField).last, '免者');
       await tester.testTextInput.receiveAction(TextInputAction.search);
       await tester.pumpAndSettle();
-      RenderEditable? findEditable(RenderObject object) {
-        if (object is RenderEditable) return object;
-        RenderEditable? editable;
-        object.visitChildren((child) {
-          editable ??= findEditable(child);
-        });
-        return editable;
-      }
-
-      final editable = findEditable(
-        tester.renderObject(find.byType(SelectableText).first),
-      );
-      expect(editable, isNotNull);
-      final renderEditable = editable!;
-      final queryOffset = renderEditable.text!.toPlainText().indexOf('免者');
+      final renderParagraph = readerParagraphWith(tester, '免者');
+      final queryOffset = renderParagraph.text.toPlainText().indexOf('免者');
       expect(queryOffset, greaterThanOrEqualTo(0));
-      final caret = renderEditable.localToGlobal(
-        renderEditable
-            .getLocalRectForCaret(TextPosition(offset: queryOffset))
-            .center,
+      final caret = renderParagraph.localToGlobal(
+        readerCaretRect(renderParagraph, queryOffset).center,
       );
       final viewport = tester.renderObject<RenderBox>(
-        find.byType(SingleChildScrollView).first,
+        find.byType(ListView).first,
       );
       final viewportRect = viewport.localToGlobal(Offset.zero) & viewport.size;
       // 命中行預設置中顯示。
       expect((caret.dy - viewportRect.center.dy).abs(), lessThan(60));
 
-      final text = tester.widget<SelectableText>(
-        find.byType(SelectableText).first,
+      final highlightedText = readerBodyHighlights(
+        tester,
+        const Color(0xFFFFE08A),
       );
-      final highlightedText = <String>[];
-      void collectHighlights(InlineSpan span) {
-        if (span is! TextSpan) return;
-        if (span.style?.backgroundColor == const Color(0xFFFFE08A)) {
-          highlightedText.add(span.text ?? '');
-        }
-        for (final child in span.children ?? const <InlineSpan>[]) {
-          collectHighlights(child);
-        }
-      }
-
-      collectHighlights(text.textSpan!);
       expect(highlightedText, contains('免者'));
-      expect(text.textSpan!.toPlainText(), contains('[0155a40] '));
+      expect(readerBodyText(tester), contains('[0155a40] '));
       expect(find.text('1 / 1'), findsOneWidget);
     }, () => client);
     await scriptureDisplaySettings.update(
@@ -3084,38 +3363,23 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      RenderEditable? findEditable(RenderObject object) {
-        if (object is RenderEditable) return object;
-        RenderEditable? editable;
-        object.visitChildren((child) {
-          editable ??= findEditable(child);
-        });
-        return editable;
-      }
-
-      final renderEditable = findEditable(
-        tester.renderObject(find.byType(SelectableText).first),
-      )!;
-      final plainText = renderEditable.text!.toPlainText();
+      final renderParagraph = readerParagraphWith(tester, '免者');
+      final plainText = renderParagraph.text.toPlainText();
       final queryOffset = plainText.indexOf('免者');
       expect(queryOffset, greaterThanOrEqualTo(0));
       final lineStartOffset = plainText.indexOf('聞已不樂');
       expect(lineStartOffset, greaterThanOrEqualTo(0));
       final viewport = tester.renderObject<RenderBox>(
-        find.byType(SingleChildScrollView).first,
+        find.byType(ListView).first,
       );
       final viewportRect = viewport.localToGlobal(Offset.zero) & viewport.size;
       // 長行換行時，置中的是命中所在行的行首。
-      final lineCaret = renderEditable.localToGlobal(
-        renderEditable
-            .getLocalRectForCaret(TextPosition(offset: lineStartOffset))
-            .center,
+      final lineCaret = renderParagraph.localToGlobal(
+        readerCaretRect(renderParagraph, lineStartOffset).center,
       );
       expect((lineCaret.dy - viewportRect.center.dy).abs(), lessThan(60));
-      final matchCaret = renderEditable.localToGlobal(
-        renderEditable
-            .getLocalRectForCaret(TextPosition(offset: queryOffset))
-            .center,
+      final matchCaret = renderParagraph.localToGlobal(
+        readerCaretRect(renderParagraph, queryOffset).center,
       );
       expect(matchCaret.dy, greaterThan(lineCaret.dy));
     }, () => client);
@@ -3200,82 +3464,53 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      RenderEditable? findEditable(RenderObject object) {
-        if (object is RenderEditable) return object;
-        RenderEditable? editable;
-        object.visitChildren((child) {
-          editable ??= findEditable(child);
-        });
-        return editable;
-      }
-
-      ({String plain, List<int> highlights}) readSpan() {
-        final root = tester
-            .widget<SelectableText>(find.byType(SelectableText).first)
-            .textSpan!;
-        final highlights = <int>[];
-        var offset = 0;
-        void walk(InlineSpan span) {
-          if (span is! TextSpan) {
-            offset += 1;
-            return;
-          }
-          final text = span.text ?? '';
-          if (span.style?.backgroundColor == const Color(0xFFDDEDE8)) {
-            highlights.add(offset);
-          }
-          offset += text.length;
-          for (final child in span.children ?? const <InlineSpan>[]) {
-            walk(child);
-          }
-        }
-
-        walk(root);
-        return (plain: root.toPlainText(), highlights: highlights);
-      }
-
-      final renderEditable = findEditable(
-        tester.renderObject(find.byType(SelectableText).first),
-      )!;
       final viewport = tester.renderObject<RenderBox>(
-        find.byType(SingleChildScrollView).first,
+        find.byType(ListView).first,
       );
       final viewportRect = viewport.localToGlobal(Offset.zero) & viewport.size;
       final scrollable = tester.state<ScrollableState>(
         find
             .descendant(
-              of: find.byType(SingleChildScrollView).first,
+              of: find.byType(ListView).first,
               matching: find.byType(Scrollable),
             )
             .first,
       );
 
-      void expectCentered(int offset) {
-        final caret = renderEditable.localToGlobal(
-          renderEditable
-              .getLocalRectForCaret(TextPosition(offset: offset))
-              .center,
+      void expectCentered(RenderParagraph paragraph, int offset) {
+        final caret = paragraph.localToGlobal(
+          readerCaretRect(paragraph, offset).center,
         );
         expect((caret.dy - viewportRect.center.dy).abs(), lessThan(60));
       }
 
-      final first = readSpan();
+      final firstParagraph = readerParagraphWith(tester, '五蘊壞滅');
+      final first = readerBlockWithHighlights(
+        tester,
+        '五蘊壞滅',
+        const Color(0xFFDDEDE8),
+      );
       final deadIndex = first.plain.indexOf('五蘊壞滅');
       expect(deadIndex, greaterThanOrEqualTo(0));
       // 段落內有兩處「五蘊」，應依 kwic 前文選到第二處。
       expect(first.highlights.first, deadIndex);
-      expectCentered(deadIndex);
+      expectCentered(firstParagraph, deadIndex);
       final firstPixels = scrollable.position.pixels;
       expect(firstPixels, greaterThan(0));
 
       await tester.tap(find.byTooltip('下一筆'));
       await tester.pumpAndSettle();
 
-      final second = readSpan();
+      final secondParagraph = readerParagraphWith(tester, '五蘊皆空');
+      final second = readerBlockWithHighlights(
+        tester,
+        '五蘊皆空',
+        const Color(0xFFDDEDE8),
+      );
       final emptyIndex = second.plain.indexOf('五蘊皆空');
       expect(emptyIndex, greaterThanOrEqualTo(0));
       expect(second.highlights.first, emptyIndex);
-      expectCentered(emptyIndex);
+      expectCentered(secondParagraph, emptyIndex);
       expect(scrollable.position.pixels, greaterThan(firstPixels));
     }, () => client);
     await scriptureDisplaySettings.update(
@@ -3354,56 +3589,24 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    RenderEditable? findEditable(RenderObject object) {
-      if (object is RenderEditable) return object;
-      RenderEditable? editable;
-      object.visitChildren((child) {
-        editable ??= findEditable(child);
-      });
-      return editable;
-    }
-
-    ({String plain, List<int> highlights}) readSpan() {
-      final root = tester
-          .widget<SelectableText>(find.byType(SelectableText).first)
-          .textSpan!;
-      final highlights = <int>[];
-      var offset = 0;
-      void walk(InlineSpan span) {
-        if (span is! TextSpan) {
-          offset += 1;
-          return;
-        }
-        final text = span.text ?? '';
-        if (span.style?.backgroundColor == const Color(0xFFDDEDE8)) {
-          highlights.add(offset);
-        }
-        offset += text.length;
-        for (final child in span.children ?? const <InlineSpan>[]) {
-          walk(child);
-        }
-      }
-
-      walk(root);
-      return (plain: root.toPlainText(), highlights: highlights);
-    }
-
-    final editable = findEditable(
-      tester.renderObject(find.byType(SelectableText).first),
-    )!;
+    final paragraph = readerParagraphWith(tester, '五蘊壞滅');
     final viewport = tester.renderObject<RenderBox>(
-      find.byType(SingleChildScrollView).first,
+      find.byType(ListView).first,
     );
     final viewportRect = viewport.localToGlobal(Offset.zero) & viewport.size;
 
-    final rendered = readSpan();
+    final rendered = readerBlockWithHighlights(
+      tester,
+      '五蘊壞滅',
+      const Color(0xFFDDEDE8),
+    );
     final firstFive = rendered.plain.indexOf('五蘊幻身');
     final exactFive = rendered.plain.indexOf('五蘊壞滅');
     expect(firstFive, greaterThanOrEqualTo(0));
     expect(exactFive, greaterThan(firstFive));
     expect(rendered.highlights.first, exactFive);
-    final caret = editable.localToGlobal(
-      editable.getLocalRectForCaret(TextPosition(offset: exactFive)).center,
+    final caret = paragraph.localToGlobal(
+      readerCaretRect(paragraph, exactFive).center,
     );
     expect((caret.dy - viewportRect.center.dy).abs(), lessThan(60));
 
@@ -3481,10 +3684,7 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        final plain = tester
-            .widget<SelectableText>(find.byType(SelectableText).first)
-            .textSpan!
-            .toPlainText();
+        final plain = readerFirstBlockSpan(tester)!.toPlainText();
         expect(plain, contains('線上即時經文內容'));
       }, () => client);
 
@@ -3627,27 +3827,14 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      RenderEditable? findEditable(RenderObject object) {
-        if (object is RenderEditable) return object;
-        RenderEditable? editable;
-        object.visitChildren((child) {
-          editable ??= findEditable(child);
-        });
-        return editable;
-      }
-
-      final renderEditable = findEditable(
-        tester.renderObject(find.byType(SelectableText).first),
-      )!;
-      final queryOffset = renderEditable.text!.toPlainText().indexOf('樂遠離行');
+      final renderParagraph = readerParagraphWith(tester, '樂遠離行');
+      final queryOffset = renderParagraph.text.toPlainText().indexOf('樂遠離行');
       expect(queryOffset, greaterThanOrEqualTo(0));
-      final caret = renderEditable.localToGlobal(
-        renderEditable
-            .getLocalRectForCaret(TextPosition(offset: queryOffset))
-            .center,
+      final caret = renderParagraph.localToGlobal(
+        readerCaretRect(renderParagraph, queryOffset).center,
       );
       final viewport = tester.renderObject<RenderBox>(
-        find.byType(SingleChildScrollView).first,
+        find.byType(ListView).first,
       );
       final viewportRect = viewport.localToGlobal(Offset.zero) & viewport.size;
       // 偈頌 WidgetSpan 只佔 1 個純文字字元，位移不能被 cell 文字長度污染。
@@ -3719,10 +3906,7 @@ void main() {
         }
       }
 
-      final selectable = tester.widget<SelectableText>(
-        find.byType(SelectableText).first,
-      );
-      collect(selectable.textSpan);
+      collect(readerFirstBlockSpan(tester));
       expect(highlights, contains('甘露城'));
       expect(find.text('1 / 1'), findsOneWidget);
     }, () => client);
@@ -3759,21 +3943,12 @@ void main() {
       return http.Response('{}', 404);
     });
 
-    RenderEditable findEditable(RenderObject object) {
-      if (object is RenderEditable) return object;
-      late RenderEditable editable;
-      object.visitChildren((child) {
-        editable = findEditable(child);
-      });
-      return editable;
-    }
-
-    Future<void> expectSelectionMenuAt(int offset) async {
-      final editable = findEditable(
-        tester.renderObject(find.byType(SelectableText).first),
-      );
-      final caret = editable.localToGlobal(
-        editable.getLocalRectForCaret(TextPosition(offset: offset)).center,
+    Future<void> expectSelectionMenuAt(
+      RenderParagraph paragraph,
+      int offset,
+    ) async {
+      final caret = paragraph.localToGlobal(
+        readerCaretRect(paragraph, offset).center,
       );
       await tester.longPressAt(caret);
       await tester.pumpAndSettle();
@@ -3803,16 +3978,14 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      final selectable = tester.widget<SelectableText>(
-        find.byType(SelectableText).first,
-      );
-      final plain = selectable.textSpan!.toPlainText();
+      final paragraph = readerParagraphWith(tester, '佛說五蘊皆空經');
+      final plain = paragraph.text.toPlainText();
       // 卷題（固定經名下方）。
-      await expectSelectionMenuAt(plain.indexOf('佛說五蘊皆空經') + 1);
+      await expectSelectionMenuAt(paragraph, plain.indexOf('佛說五蘊皆空經') + 1);
       // 译者／年代。
-      await expectSelectionMenuAt(plain.indexOf('大唐三藏法師') + 1);
+      await expectSelectionMenuAt(paragraph, plain.indexOf('大唐三藏法師') + 1);
       // 偈頌正文。
-      await expectSelectionMenuAt(plain.indexOf('甘露城') + 1);
+      await expectSelectionMenuAt(paragraph, plain.indexOf('甘露城') + 1);
     }, () => client);
   });
 
@@ -3874,11 +4047,9 @@ void main() {
         }
       }
 
-      collect(
-        tester
-            .widget<SelectableText>(find.byType(SelectableText).first)
-            .textSpan,
-      );
+      for (final text in readerBlockTexts(tester)) {
+        collect(text.textSpan);
+      }
       // 「五」與「蘊」分別落在兩個經文行，仍要各自高亮。
       expect(highlights, containsAll(['五', '蘊']));
     }, () => client);
@@ -4103,11 +4274,9 @@ void main() {
 
         expect(find.text('1 / 2 筆'), findsOneWidget);
         expect(juanRequests, 1);
-        final scriptureText = tester.widget<SelectableText>(
-          find.byType(SelectableText),
-        );
-        expect(scriptureText.style?.fontSize, 19);
-        expect(scriptureText.style?.height, 1.9);
+        final scriptureStyle = readerBlockTextStyle(tester);
+        expect(scriptureStyle?.fontSize, 19);
+        expect(scriptureStyle?.height, 1.9);
         expect(
           tester.widget<Scaffold>(find.byType(Scaffold)).backgroundColor,
           const Color(0xFFF5EFE0),
@@ -4123,8 +4292,16 @@ void main() {
 
         expect(find.text('2 / 2 筆'), findsOneWidget);
         expect(juanRequests, 1);
-        expect(find.text('下一卷'), findsOneWidget);
-        await tester.ensureVisible(find.text('下一卷'));
+        await tester.scrollUntilVisible(
+          find.text('下一卷'),
+          300,
+          scrollable: find
+              .descendant(
+                of: find.byType(ListView).first,
+                matching: find.byType(Scrollable),
+              )
+              .first,
+        );
         await tester.pumpAndSettle();
         expect(tester.getCenter(find.text('下一卷')).dy, lessThan(navY));
         expect(tester.getCenter(find.text('2 / 2 筆')).dy, closeTo(navY, 1));
