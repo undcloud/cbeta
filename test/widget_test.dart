@@ -21,6 +21,7 @@ import 'package:xuefo/download/api_rate_limiter.dart';
 import 'package:xuefo/download/catalog_cache.dart';
 import 'package:xuefo/search/candidates.dart';
 import 'package:xuefo/search/search_input.dart';
+import 'package:xuefo/scripture/source_text.dart';
 
 class _MemoryScriptureVolumeStore extends ScriptureVolumeStore {
   final Map<String, CachedScriptureVolume> volumes = {};
@@ -3124,6 +3125,374 @@ void main() {
       backgroundTheme: 'default',
     );
   });
+
+  testWidgets('reader locates hits inside archive paragraph anchors', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: true,
+      backgroundTheme: 'default',
+    );
+    // 離線壓縮檔只有段落級錨點，搜尋結果卻是逐行行號。
+    final buffer = StringBuffer('<div id="body">');
+    for (var i = 0; i < 14; i++) {
+      final lineNumber = (i * 2 + 1).toString().padLeft(2, '0');
+      final text = switch (i) {
+        6 =>
+          '太子曰：云何名老？瑜誐答言：五蘊幻身四相遷變，名之為老。'
+              '太子又問：云何名死？瑜誐答言：五蘊壞滅，名之為死。'
+              '如是種種憂悲苦惱，皆由五蘊和合而生。',
+        12 => '王聞是事，憶念往昔相師之言，五蘊皆空，得法眼淨。',
+        _ =>
+          '王聞是事，憶念往昔相師之言，若得在家必作輪王，'
+              '如是輾轉乃至成佛，化度無量無邊眾生，皆令安住無上菩提。'
+              '王聞是事，憶念往昔相師之言，若得在家必作輪王，'
+              '如是輾轉乃至成佛，化度無量無邊眾生，皆令安住無上菩提。'
+              '王聞是事，憶念往昔相師之言，若得在家必作輪王，'
+              '如是輾轉乃至成佛，化度無量無邊眾生，皆令安住無上菩提。',
+      };
+      buffer.write(
+        '<span class="lb" id="T01n0003_p0155a$lineNumber"></span>'
+        '<p>$text</p>',
+      );
+    }
+    buffer.write('</div>');
+    await scriptureVolumeStore.write(
+      CachedScriptureVolume(
+        work: 'T0003',
+        juan: '1',
+        contentVersion: 'stored-version',
+        html: buffer.toString(),
+      ),
+    );
+    // 行號 0155a14 落在錨點 0155a13 的段落內；0155a26 落在 0155a25 的段落內。
+    const firstHit = ScripturePassage(
+      title: '毘婆尸佛經',
+      reference: '卷 1 · 0155a14',
+      text: '太子又問：云何名死？瑜誐答言：五蘊壞滅',
+      linehead: 'T01n0003_p0155a14',
+      juan: '1',
+      work: 'T0003',
+    );
+    const secondHit = ScripturePassage(
+      title: '毘婆尸佛經',
+      reference: '卷 1 · 0155a26',
+      text: '憶念往昔相師之言，五蘊皆空',
+      linehead: 'T01n0003_p0155a26',
+      juan: '1',
+      work: 'T0003',
+    );
+    final client = MockClient((request) async => http.Response('{}', 404));
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: firstHit,
+            query: '五蘊',
+            searchHits: [firstHit, secondHit],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      RenderEditable? findEditable(RenderObject object) {
+        if (object is RenderEditable) return object;
+        RenderEditable? editable;
+        object.visitChildren((child) {
+          editable ??= findEditable(child);
+        });
+        return editable;
+      }
+
+      ({String plain, List<int> highlights}) readSpan() {
+        final root = tester
+            .widget<SelectableText>(find.byType(SelectableText).first)
+            .textSpan!;
+        final highlights = <int>[];
+        var offset = 0;
+        void walk(InlineSpan span) {
+          if (span is! TextSpan) {
+            offset += 1;
+            return;
+          }
+          final text = span.text ?? '';
+          if (span.style?.backgroundColor == const Color(0xFFDDEDE8)) {
+            highlights.add(offset);
+          }
+          offset += text.length;
+          for (final child in span.children ?? const <InlineSpan>[]) {
+            walk(child);
+          }
+        }
+
+        walk(root);
+        return (plain: root.toPlainText(), highlights: highlights);
+      }
+
+      final renderEditable = findEditable(
+        tester.renderObject(find.byType(SelectableText).first),
+      )!;
+      final viewport = tester.renderObject<RenderBox>(
+        find.byType(SingleChildScrollView).first,
+      );
+      final viewportRect = viewport.localToGlobal(Offset.zero) & viewport.size;
+      final scrollable = tester.state<ScrollableState>(
+        find
+            .descendant(
+              of: find.byType(SingleChildScrollView).first,
+              matching: find.byType(Scrollable),
+            )
+            .first,
+      );
+
+      void expectCentered(int offset) {
+        final caret = renderEditable.localToGlobal(
+          renderEditable
+              .getLocalRectForCaret(TextPosition(offset: offset))
+              .center,
+        );
+        expect((caret.dy - viewportRect.center.dy).abs(), lessThan(60));
+      }
+
+      final first = readSpan();
+      final deadIndex = first.plain.indexOf('五蘊壞滅');
+      expect(deadIndex, greaterThanOrEqualTo(0));
+      // 段落內有兩處「五蘊」，應依 kwic 前文選到第二處。
+      expect(first.highlights.first, deadIndex);
+      expectCentered(deadIndex);
+      final firstPixels = scrollable.position.pixels;
+      expect(firstPixels, greaterThan(0));
+
+      await tester.tap(find.byTooltip('下一筆'));
+      await tester.pumpAndSettle();
+
+      final second = readSpan();
+      final emptyIndex = second.plain.indexOf('五蘊皆空');
+      expect(emptyIndex, greaterThanOrEqualTo(0));
+      expect(second.highlights.first, emptyIndex);
+      expectCentered(emptyIndex);
+      expect(scrollable.position.pixels, greaterThan(firstPixels));
+    }, () => client);
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+  });
+
+  testWidgets('reader jumps to the exact offline source offset', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    final buffer = StringBuffer('<div id="body">');
+    for (var i = 0; i < 12; i++) {
+      buffer.write(
+        '<span class="lb" id="T01n0003_p0155a${i.toString().padLeft(2, '0')}">'
+        '</span><p>王聞是事，憶念往昔相師之言，若得在家必作輪王，'
+        '如是輾轉乃至成佛，化度無量無邊眾生，皆令安住無上菩提。'
+        '王聞是事，憶念往昔相師之言，若得在家必作輪王。</p>',
+      );
+    }
+    const targetText =
+        '太子曰：云何名老？瑜誐答言：五蘊幻身四相遷變，名之為老。'
+        '太子又問：云何名死？瑜誐答言：五蘊壞滅，名之為死。';
+    buffer.write(
+      '<span class="lb" id="T01n0003_p0155a12"></span><p>$targetText</p>',
+    );
+    for (var i = 13; i < 20; i++) {
+      buffer.write(
+        '<span class="lb" id="T01n0003_p0155a$i"></span>'
+        '<p>復次大眾聞是法已，歡喜奉行。</p>',
+      );
+    }
+    buffer.write('</div>');
+    final html = buffer.toString();
+    final lines = parseScriptureHtml(html);
+    final source = buildScriptureSearchSource(lines);
+    final targetSourceOffset = source.indexOf('五蘊壞滅');
+    expect(targetSourceOffset, greaterThan(0));
+    expect(source.indexOf('五蘊幻身'), lessThan(targetSourceOffset));
+    await scriptureVolumeStore.write(
+      CachedScriptureVolume(
+        work: 'T0003',
+        juan: '1',
+        contentVersion: 'stored-version',
+        html: html,
+      ),
+    );
+    final hit = ScripturePassage(
+      title: '毘婆尸佛經',
+      reference: '卷 1 · 0155a12',
+      text: '五蘊壞滅',
+      linehead: 'T01n0003_p0155a12',
+      juan: '1',
+      work: 'T0003',
+      sourceOffset: targetSourceOffset,
+      snippet: '五蘊',
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ScriptureReaderPage(
+          passage: hit,
+          query: '五蘊',
+          searchHits: [hit],
+          initialHitIndex: 0,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    RenderEditable? findEditable(RenderObject object) {
+      if (object is RenderEditable) return object;
+      RenderEditable? editable;
+      object.visitChildren((child) {
+        editable ??= findEditable(child);
+      });
+      return editable;
+    }
+
+    ({String plain, List<int> highlights}) readSpan() {
+      final root = tester
+          .widget<SelectableText>(find.byType(SelectableText).first)
+          .textSpan!;
+      final highlights = <int>[];
+      var offset = 0;
+      void walk(InlineSpan span) {
+        if (span is! TextSpan) {
+          offset += 1;
+          return;
+        }
+        final text = span.text ?? '';
+        if (span.style?.backgroundColor == const Color(0xFFDDEDE8)) {
+          highlights.add(offset);
+        }
+        offset += text.length;
+        for (final child in span.children ?? const <InlineSpan>[]) {
+          walk(child);
+        }
+      }
+
+      walk(root);
+      return (plain: root.toPlainText(), highlights: highlights);
+    }
+
+    final editable = findEditable(
+      tester.renderObject(find.byType(SelectableText).first),
+    )!;
+    final viewport = tester.renderObject<RenderBox>(
+      find.byType(SingleChildScrollView).first,
+    );
+    final viewportRect = viewport.localToGlobal(Offset.zero) & viewport.size;
+
+    final rendered = readSpan();
+    final firstFive = rendered.plain.indexOf('五蘊幻身');
+    final exactFive = rendered.plain.indexOf('五蘊壞滅');
+    expect(firstFive, greaterThanOrEqualTo(0));
+    expect(exactFive, greaterThan(firstFive));
+    expect(rendered.highlights.first, exactFive);
+    final caret = editable.localToGlobal(
+      editable.getLocalRectForCaret(TextPosition(offset: exactFive)).center,
+    );
+    expect((caret.dy - viewportRect.center.dy).abs(), lessThan(60));
+
+    await tester.tap(find.byTooltip('書籤'));
+    await tester.pumpAndSettle();
+    final preferences = await SharedPreferences.getInstance();
+    final saved =
+        jsonDecode(preferences.getString('reader_bookmarks')!) as List<dynamic>;
+    final bookmark = saved.single as Map<String, dynamic>;
+    expect(bookmark['sourceOffset'], targetSourceOffset);
+    expect(bookmark['snippet'], '五蘊');
+  });
+
+  testWidgets(
+    'online search results read the online volume without overwriting '
+    'the downloaded copy',
+    (WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await scriptureDisplaySettings.load();
+      await scriptureDisplaySettings.update(
+        showCollation: false,
+        showLineBeginnings: false,
+        backgroundTheme: 'default',
+      );
+      await scriptureVolumeStore.write(
+        const CachedScriptureVolume(
+          work: 'T0003',
+          juan: '1',
+          contentVersion: 'downloaded-version',
+          html:
+              '<div id="body">'
+              '<span class="lb" id="T01n0003_p0155a01"></span>'
+              '<p>本地已下載的經文內容。</p>'
+              '</div>',
+        ),
+      );
+      final client = MockClient((request) async {
+        if (request.url.path == '/stable/juans') {
+          return http.Response(
+            jsonEncode({
+              'content': 'online-version',
+              'results': [
+                '<div id="body">'
+                    '<span class="lb" id="T01n0003_p0155a01"></span>'
+                    '<p>線上即時經文內容。</p>'
+                    '</div>',
+              ],
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        return http.Response('{}', 404);
+      });
+      const hit = ScripturePassage(
+        title: '毘婆尸佛經',
+        reference: '卷 1 · 0155a01',
+        text: '線上',
+        linehead: 'T01n0003_p0155a01',
+        juan: '1',
+        work: 'T0003',
+        snippet: '線上',
+        fromOnlineIndex: true,
+      );
+
+      await http.runWithClient(() async {
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: ScriptureReaderPage(
+              passage: hit,
+              query: '線上',
+              searchHits: [hit],
+              initialHitIndex: 0,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        final plain = tester
+            .widget<SelectableText>(find.byType(SelectableText).first)
+            .textSpan!
+            .toPlainText();
+        expect(plain, contains('線上即時經文內容'));
+      }, () => client);
+
+      final stored = await scriptureVolumeStore.read('T0003', '1');
+      expect(stored?.contentVersion, 'downloaded-version');
+      expect(stored?.html, contains('本地已下載的經文內容'));
+    },
+  );
 
   testWidgets('reader clamps hit scrolling at the start and end of a juan', (
     WidgetTester tester,

@@ -28,6 +28,7 @@ import 'scripture/cache.dart';
 import 'scripture/models.dart';
 import 'scripture/offline_scan.dart';
 import 'scripture/parser.dart';
+import 'scripture/source_text.dart';
 import 'search/candidates.dart';
 import 'search/conversion.dart';
 import 'search/goto.dart';
@@ -4790,6 +4791,10 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
   final scriptureTextKey = GlobalKey();
   final localSearchController = TextEditingController();
   final Map<String, Future<List<ScriptureLine>>> juanCache = {};
+  bool preferOnline = false;
+  int? _currentSourceOffset;
+  String _currentSnippet = '';
+  String? _historyPositionKey;
   bool didScrollToMatch = false;
   int? _pendingScrollAnchorOffset;
   double? _pendingScrollAnchorDelta;
@@ -4808,15 +4813,25 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
     super.initState();
     currentPassage = widget.passage;
     currentHitIndex = widget.initialHitIndex;
-    linesFuture = _cachedJuan(currentPassage);
+    preferOnline = _preferOnlineFor(currentPassage);
+    linesFuture = _cachedJuan(currentPassage, preferOnline: preferOnline);
     _refreshBookmarkState();
     _persistReadingHistory();
     scriptureDisplaySettings.addListener(_onDisplaySettingsChanged);
   }
 
+  bool _preferOnlineFor(ScripturePassage passage) =>
+      passage.fromOnlineIndex && passage.sourceOffset == null;
+
+  ScripturePassage _positionedPassage() => currentPassage.copyWith(
+    linehead: currentPassage.linehead,
+    sourceOffset: _currentSourceOffset ?? currentPassage.sourceOffset,
+    snippet: _currentSnippet.isEmpty ? currentPassage.snippet : _currentSnippet,
+  );
+
   Future<void> _persistReadingHistory() async {
     try {
-      await _recordRecentReading(currentPassage);
+      await _recordRecentReading(_positionedPassage());
     } catch (error) {
       if (!mounted) return;
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4828,8 +4843,11 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
     }
   }
 
-  String get _bookmarkKey =>
-      '${currentPassage.work}:${currentPassage.juan}:${currentPassage.linehead ?? ''}';
+  String get _bookmarkKey {
+    final offset = _currentSourceOffset ?? currentPassage.sourceOffset;
+    return '${currentPassage.work}:${currentPassage.juan}:'
+        '${currentPassage.linehead ?? offset?.toString() ?? ''}';
+  }
 
   Future<void> _refreshBookmarkState() async {
     try {
@@ -4857,7 +4875,7 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
       if (index >= 0) {
         bookmarks.removeAt(index);
       } else {
-        bookmarks.insert(0, _ReaderBookmark.fromPassage(currentPassage));
+        bookmarks.insert(0, _ReaderBookmark.fromPassage(_positionedPassage()));
       }
       await _saveBookmarks(bookmarks);
       if (!mounted) return;
@@ -4970,8 +4988,11 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
       currentPassage = passage;
       currentHitIndex = 0;
       showSearchNavigation = false;
+      preferOnline = false;
+      _currentSourceOffset = passage.sourceOffset;
+      _currentSnippet = passage.snippet;
       didScrollToMatch = false;
-      linesFuture = _cachedJuan(passage);
+      linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
     });
     _refreshBookmarkState();
     _persistReadingHistory();
@@ -4984,8 +5005,11 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
       currentPassage = passage;
       currentHitIndex = 0;
       showSearchNavigation = false;
+      preferOnline = false;
+      _currentSourceOffset = null;
+      _currentSnippet = '';
       didScrollToMatch = false;
-      linesFuture = _cachedJuan(passage);
+      linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
     });
     _refreshBookmarkState();
     _persistReadingHistory();
@@ -5033,7 +5057,7 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
       showLineBeginnings: settings.showLineBeginnings,
       showCollation: settings.showCollation,
     );
-    final haystack = _buildScriptureSearchSource(lines).toLowerCase();
+    final haystack = buildScriptureSearchSource(lines).toLowerCase();
     final ranges = <({int start, int end})>[];
     var start = 0;
     while (true) {
@@ -5111,7 +5135,10 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
         editable.localToGlobal(caretRect.topLeft).dy - viewportTop;
   }
 
-  Future<List<ScriptureLine>> _cachedJuan(ScripturePassage passage) {
+  Future<List<ScriptureLine>> _cachedJuan(
+    ScripturePassage passage, {
+    required bool preferOnline,
+  }) {
     final linehead = passage.linehead;
     final workMatch = RegExp(
       r'^([A-Z]+)\d+n(\d+[A-Z]?)_p',
@@ -5123,13 +5150,24 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
             : '${workMatch.group(1)}${workMatch.group(2)}');
     final juan = passage.juan;
     if (work == null || juan == null) return _loadJuan(passage);
-    final key = '$work:$juan';
+    final key = '$work:$juan:${preferOnline ? 'online' : 'local'}';
     return juanCache.putIfAbsent(key, () async {
       final cached = await scriptureVolumeStore.read(work, juan);
-      if (cached != null) return parseScriptureHtml(cached.html);
-      final latest = await fetchScriptureVolume(work, juan);
-      await scriptureVolumeStore.write(latest);
-      return parseScriptureHtml(latest.html);
+      if (!preferOnline) {
+        if (cached != null) return parseScriptureHtml(cached.html);
+        final latest = await fetchScriptureVolume(work, juan);
+        await scriptureVolumeStore.write(latest);
+        return parseScriptureHtml(latest.html);
+      }
+      try {
+        final latest = await fetchScriptureVolume(work, juan);
+        // 本地沒有這卷時才留下線上備份；已下載的經卷不被線上內容覆蓋。
+        if (cached == null) await scriptureVolumeStore.write(latest);
+        return parseScriptureHtml(latest.html);
+      } catch (_) {
+        if (cached == null) rethrow;
+        return parseScriptureHtml(cached.html);
+      }
     });
   }
 
@@ -5161,8 +5199,11 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
     setState(() {
       currentPassage = passage;
       currentHitIndex = index;
+      preferOnline = _preferOnlineFor(passage);
+      _currentSourceOffset = passage.sourceOffset;
+      _currentSnippet = passage.snippet;
       didScrollToMatch = false;
-      linesFuture = _cachedJuan(passage);
+      linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
     });
     _refreshBookmarkState();
     _persistReadingHistory();
@@ -5188,11 +5229,14 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
       juan: '$targetJuan',
       linehead: null,
       reference: reference,
+      snippet: '',
     );
     setState(() {
       currentPassage = passage;
+      _currentSourceOffset = null;
+      _currentSnippet = '';
       didScrollToMatch = false;
-      linesFuture = _cachedJuan(passage);
+      linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
     });
     _refreshBookmarkState();
     _persistReadingHistory();
@@ -5204,11 +5248,14 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
       juan: '$juan',
       linehead: null,
       reference: '卷 $juan',
+      snippet: '',
     );
     setState(() {
       currentPassage = passage;
+      _currentSourceOffset = null;
+      _currentSnippet = '';
       didScrollToMatch = false;
-      linesFuture = _cachedJuan(passage);
+      linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
     });
     _refreshBookmarkState();
     _persistReadingHistory();
@@ -5358,9 +5405,8 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                   hitOccurrence,
                 );
                 final targetOffset = hitTarget.offset;
-                final targetScrollStart = hitTarget.inHeader
-                    ? 0
-                    : hitTarget.lineStart;
+                _currentSourceOffset = hitTarget.sourceOffset;
+                _currentSnippet = hitTarget.snippet;
                 final queryRanges = showLocalSearch
                     ? const <({int start, int end})>[]
                     : _matchRangesIn(
@@ -5421,6 +5467,14 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                               );
                               final viewportRenderObject = context
                                   .findRenderObject();
+                              final positionKey =
+                                  '${currentPassage.work}:'
+                                  '${currentPassage.juan}:'
+                                  '${_currentSourceOffset ?? currentPassage.linehead ?? ''}';
+                              if (_historyPositionKey != positionKey) {
+                                _historyPositionKey = positionKey;
+                                unawaited(_persistReadingHistory());
+                              }
                               final anchorOffset = _pendingScrollAnchorOffset;
                               final anchorDelta = _pendingScrollAnchorDelta;
                               _pendingScrollAnchorOffset = null;
@@ -5463,27 +5517,16 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                                 );
                                 return;
                               }
-                              // 捲動對齊「命中所在行」的行首，而不是命中字元，
-                              // 否則長行換行時行首會被推到畫面上方。
-                              final localStart =
-                                  showLocalSearch && localSearchRange != null
-                                  ? _layoutLineStartForOffset(
-                                      layout,
-                                      localSearchRange!.start,
-                                    )
-                                  : null;
+                              // 命中字元置中；長段落也能直接看到實際命中的字，
+                              // 不再只對齊行首而讓命中落在畫面外。
                               final rawScrollOffset =
-                                  localStart ??
-                                  (currentPassage.linehead == null
-                                      ? null
-                                      : targetScrollStart);
-                              final scrollOffset = rawScrollOffset != null
-                                  ? (hitTarget.inHeader && localStart == null
-                                        ? 0
-                                        : rawScrollOffset + headerPrefixLength)
-                                  : null;
-                              if (scrollOffset != null &&
-                                  renderObject is RenderEditable &&
+                                  showLocalSearch && localSearchRange != null
+                                  ? localSearchRange!.start
+                                  : targetOffset;
+                              final scrollOffset = hitTarget.inHeader
+                                  ? 0
+                                  : rawScrollOffset + headerPrefixLength;
+                              if (renderObject is RenderEditable &&
                                   viewportRenderObject is RenderBox) {
                                 final editableLength =
                                     renderObject.text?.toPlainText().length ??
@@ -5503,7 +5546,7 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                                 final viewportTop = viewportRenderObject
                                     .localToGlobal(Offset.zero)
                                     .dy;
-                                // 預設把命中行置中；若命中在卷首或卷末，
+                                // 預設把命中字元置中；若命中在卷首或卷末，
                                 // clamp 會自然滑到最開頭或最後面。
                                 final caretContentY =
                                     readerScrollController.offset +
@@ -5580,9 +5623,7 @@ class _ScriptureReaderPageState extends State<ScriptureReaderPage> {
                                             ? widget.query
                                             : '',
                                         sourceLines: scriptureLines,
-                                        highlightStart:
-                                            showLocalSearch ||
-                                                currentPassage.linehead == null
+                                        highlightStart: showLocalSearch
                                             ? null
                                             : targetOffset,
                                       ),
@@ -6052,14 +6093,6 @@ int _scriptureVisibleContentLength(
           )
         : 0);
 
-int _scriptureSourceAdvance(ScriptureLine line) =>
-    line.text.length +
-    (line.tableRows.isNotEmpty ||
-            line.verseCells.isNotEmpty ||
-            (line.images.isNotEmpty && line.text.isEmpty)
-        ? 1
-        : 0);
-
 /// 這些行在 layout 中會自帶換行，接在其後的偈頌段不需要再補換行。
 bool _lineEndsWithExplicitNewline(ScriptureLine line) =>
     line.text.endsWith('\n') ||
@@ -6215,26 +6248,13 @@ _ScriptureTextLayout _buildScriptureTextLayout(
       buffer.write(content);
       offset += content.length;
     }
-    sourceOffset += _scriptureSourceAdvance(line);
+    sourceOffset += scriptureSourceAdvance(line);
   }
   return _ScriptureTextLayout(
     text: buffer.toString(),
     lineStarts: lineStarts,
     lineSourceStarts: lineSourceStarts,
   );
-}
-
-/// 與 layout 相同行距規則的原始經文文字，用於卷內搜尋比對。
-String _buildScriptureSearchSource(List<ScriptureLine> lines) {
-  final buffer = StringBuffer();
-  for (final line in lines) {
-    buffer.write(line.text);
-    final advance = _scriptureSourceAdvance(line);
-    for (var i = line.text.length; i < advance; i++) {
-      buffer.write('\n');
-    }
-  }
-  return buffer.toString();
 }
 
 /// 把原始經文位移轉成畫面純文字位移（含校勘標記與行首標記）。
@@ -6313,11 +6333,12 @@ int _hitOccurrenceAtIndex(List<ScripturePassage> hits, int index) {
   return occurrence;
 }
 
-/// 依行號與同行的第 N 筆命中，計算畫面純文字中的高亮位移與所在行起點。
+/// 依整卷位移或行號計算畫面純文字中的命中位移。
 ///
-/// 高亮用 `offset`（命中字元），捲動用 `lineStart`，
-/// 讓整行（含換行後的字）都從畫面第一行開始顯示。
-({int offset, int lineStart, bool inHeader}) _resolveSearchTargetOffset(
+/// 離線掃描與書籤帶有整卷來源位移時先驗證 snippet，命中就直接換算；
+/// 線上索引則用逐行行號，找不到時才退回段落錨點搭配 kwic 比對。
+({int offset, int lineStart, bool inHeader, int? sourceOffset, String snippet})
+_resolveSearchTargetOffset(
   _ScriptureTextLayout layout,
   List<ScriptureLine> bodyLines,
   List<ScriptureLine> headerLines,
@@ -6325,36 +6346,274 @@ int _hitOccurrenceAtIndex(List<ScripturePassage> hits, int index) {
   String query,
   int occurrence,
 ) {
-  final linehead = passage.linehead;
-  if (linehead == null) {
-    return (offset: 0, lineStart: 0, inHeader: false);
+  const empty = (
+    offset: 0,
+    lineStart: 0,
+    inHeader: false,
+    sourceOffset: null,
+    snippet: '',
+  );
+  final headerAdvance = headerLines.fold<int>(
+    0,
+    (sum, line) => sum + scriptureSourceAdvance(line),
+  );
+  final source = buildScriptureSearchSource(bodyLines);
+  final storedOffset = passage.sourceOffset;
+  if (storedOffset != null) {
+    final located = _locateSnippetOffset(
+      source,
+      storedOffset - headerAdvance,
+      passage.snippet,
+    );
+    if (located != null) {
+      final layoutOffset = _layoutEditableOffsetForSource(
+        layout,
+        bodyLines,
+        located,
+        showCollation: scriptureDisplaySettings.showCollation,
+      );
+      return (
+        offset: layoutOffset,
+        lineStart: _layoutLineStartForOffset(layout, layoutOffset),
+        inHeader: false,
+        sourceOffset: located + headerAdvance,
+        snippet: passage.snippet.isNotEmpty
+            ? passage.snippet
+            : _lineSnippet(source, located),
+      );
+    }
   }
+
+  final linehead = passage.linehead;
+  if (linehead == null) return empty;
   if (headerLines.any((line) => line.linehead == linehead)) {
-    return (offset: layout.text.length, lineStart: 0, inHeader: true);
+    return (
+      offset: layout.text.length,
+      lineStart: 0,
+      inHeader: true,
+      sourceOffset: null,
+      snippet: '',
+    );
   }
   final index = bodyLines.indexWhere((line) => line.linehead == linehead);
-  if (index < 0) return (offset: 0, lineStart: 0, inHeader: false);
-  final lineStart = layout.lineStarts[index];
-  final lineEnd = index + 1 < layout.lineStarts.length
-      ? layout.lineStarts[index + 1]
-      : layout.text.length;
-  if (query.isEmpty) {
-    return (offset: lineStart, lineStart: lineStart, inHeader: false);
-  }
-  final lowerText = layout.text.toLowerCase();
-  final lowerQuery = query.toLowerCase();
-  var searchFrom = lineStart;
-  var found = 0;
-  while (searchFrom < lineEnd) {
-    final hit = lowerText.indexOf(lowerQuery, searchFrom);
-    if (hit < 0 || hit + lowerQuery.length > lineEnd) break;
-    if (found == occurrence) {
-      return (offset: hit, lineStart: lineStart, inHeader: false);
+  if (index < 0) {
+    // 離線壓縮檔只保留段落級錨點（如 0154c14），線上搜尋卻是逐行行號
+    // （如 0154c20）；改以目標前一個錨點搭配 kwic 上下文定位。
+    final anchored = _resolveArchiveAnchorTarget(
+      layout,
+      bodyLines,
+      passage,
+      query,
+    );
+    if (anchored != null) {
+      final layoutOffset = _layoutEditableOffsetForSource(
+        layout,
+        bodyLines,
+        anchored,
+        showCollation: scriptureDisplaySettings.showCollation,
+      );
+      return (
+        offset: layoutOffset,
+        lineStart: _layoutLineStartForOffset(layout, layoutOffset),
+        inHeader: false,
+        sourceOffset: anchored + headerAdvance,
+        snippet: passage.snippet,
+      );
     }
-    found += 1;
-    searchFrom = hit + lowerQuery.length;
+    return empty;
   }
-  return (offset: lineStart, lineStart: lineStart, inHeader: false);
+  final lineStart = layout.lineStarts[index];
+  final lineSourceStart = layout.lineSourceStarts[index];
+  final lineText = bodyLines[index].text;
+  if (query.isEmpty) {
+    return (
+      offset: lineStart,
+      lineStart: lineStart,
+      inHeader: false,
+      sourceOffset: lineSourceStart + headerAdvance,
+      snippet: _lineSnippet(lineText, 0),
+    );
+  }
+  final lowerLine = lineText.toLowerCase();
+  for (final form in _queryForms(query)) {
+    final lowerForm = form.toLowerCase();
+    var searchFrom = 0;
+    var found = 0;
+    while (searchFrom < lowerLine.length) {
+      final hit = lowerLine.indexOf(lowerForm, searchFrom);
+      if (hit < 0) break;
+      if (found == occurrence) {
+        final bodyOffset = lineSourceStart + hit;
+        final layoutOffset = _layoutEditableOffsetForSource(
+          layout,
+          bodyLines,
+          bodyOffset,
+          showCollation: scriptureDisplaySettings.showCollation,
+        );
+        return (
+          offset: layoutOffset,
+          lineStart: lineStart,
+          inHeader: false,
+          sourceOffset: bodyOffset + headerAdvance,
+          snippet: lineText.substring(hit, hit + form.length),
+        );
+      }
+      found += 1;
+      searchFrom = hit + form.length;
+    }
+  }
+  return (
+    offset: lineStart,
+    lineStart: lineStart,
+    inHeader: false,
+    sourceOffset: lineSourceStart + headerAdvance,
+    snippet: _lineSnippet(lineText, 0),
+  );
+}
+
+List<String> _queryForms(String query) {
+  final traditional = SimplifiedTraditionalConverter.toTraditionalDisplay(
+    query,
+  );
+  return traditional == query ? [query] : [query, traditional];
+}
+
+String _lineSnippet(String text, int offset) {
+  if (text.isEmpty) return '';
+  final start = offset.clamp(0, text.length);
+  final end = (start + 24).clamp(start, text.length);
+  return text.substring(start, end);
+}
+
+/// 在來源文字中驗證位移：優先用原位移，snippet 對不上時找最近的相同字串。
+int? _locateSnippetOffset(String source, int? offset, String snippet) {
+  final lowerSource = source.toLowerCase();
+  final lowerSnippet = snippet.toLowerCase();
+  if (snippet.isEmpty) {
+    if (offset == null) return null;
+    return offset >= 0 && offset <= source.length ? offset : null;
+  }
+  if (offset != null &&
+      offset >= 0 &&
+      offset + lowerSnippet.length <= lowerSource.length &&
+      lowerSource.startsWith(lowerSnippet, offset)) {
+    return offset;
+  }
+  int? nearest;
+  var nearestDistance = 1 << 30;
+  void consider(int hit) {
+    if (offset == null) {
+      nearest ??= hit;
+      return;
+    }
+    final distance = (hit - offset).abs();
+    if (distance < nearestDistance) {
+      nearest = hit;
+      nearestDistance = distance;
+    }
+  }
+
+  if (offset != null) {
+    final windowStart = (offset - 600).clamp(0, lowerSource.length);
+    final windowEnd = (offset + 600 + lowerSnippet.length).clamp(
+      0,
+      lowerSource.length,
+    );
+    var from = windowStart;
+    while (from < windowEnd) {
+      final hit = lowerSource.indexOf(lowerSnippet, from);
+      if (hit < 0 || hit >= windowEnd) break;
+      consider(hit);
+      from = hit + lowerSnippet.length;
+    }
+    if (nearest != null) return nearest;
+  }
+  var from = 0;
+  while (true) {
+    final hit = lowerSource.indexOf(lowerSnippet, from);
+    if (hit < 0) break;
+    consider(hit);
+    from = hit + lowerSnippet.length;
+  }
+  return nearest;
+}
+
+/// 離線／已下載經卷的 HTML 錨點只標到段落開頭，線上搜尋回傳的則是逐行行號。
+/// 先在目前卷內找回目標之前的最後一個錨點，再以 kwic 的前文比對
+/// 錨點段落內重複出現的關鍵字，取得實際命中的整卷來源位移。
+int? _resolveArchiveAnchorTarget(
+  _ScriptureTextLayout layout,
+  List<ScriptureLine> bodyLines,
+  ScripturePassage passage,
+  String query,
+) {
+  final linehead = passage.linehead;
+  if (linehead == null || bodyLines.isEmpty) return null;
+  final split = linehead.lastIndexOf('_p');
+  if (split <= 0) return null;
+  final prefix = linehead.substring(0, split);
+  final target = linehead.substring(split + 2);
+  if (target.isEmpty) return null;
+
+  var anchor = -1;
+  for (var i = 0; i < bodyLines.length; i++) {
+    final head = bodyLines[i].linehead;
+    if (head == null || !head.startsWith('${prefix}_p')) continue;
+    if (head.substring(prefix.length + 2).compareTo(target) <= 0) {
+      anchor = i;
+    } else {
+      break;
+    }
+  }
+  if (anchor < 0) return null;
+  final sourceStart = layout.lineSourceStarts[anchor];
+  if (query.isEmpty) return sourceStart;
+
+  // 錨點之後、下一個錨點之前的行都算這段錨點的內容（偈頌行沒有錨點）。
+  var spanEndIndex = anchor + 1;
+  while (spanEndIndex < bodyLines.length &&
+      bodyLines[spanEndIndex].linehead == null) {
+    spanEndIndex += 1;
+  }
+  final source = buildScriptureSearchSource(bodyLines);
+  final sourceEnd = spanEndIndex < bodyLines.length
+      ? layout.lineSourceStarts[spanEndIndex]
+      : source.length;
+  if (sourceEnd <= sourceStart) return sourceStart;
+
+  final lowerSource = source.toLowerCase();
+  final snippet = passage.text.toLowerCase();
+  // 查詢詞可能仍是簡體，經文與 kwic 則是繁體。
+  final forms = _queryForms(query);
+
+  for (final form in forms) {
+    final lowerForm = form.toLowerCase();
+    final snippetIndex = snippet.indexOf(lowerForm);
+    int? bestOffset;
+    var bestScore = -1;
+    var searchFrom = sourceStart;
+    while (searchFrom < sourceEnd) {
+      final hit = lowerSource.indexOf(lowerForm, searchFrom);
+      if (hit < 0 || hit + lowerForm.length > sourceEnd) break;
+      var score = 0;
+      if (snippetIndex >= 0) {
+        while (score < 24 &&
+            hit - score - 1 >= sourceStart &&
+            snippetIndex - score - 1 >= 0 &&
+            source[hit - score - 1] == snippet[snippetIndex - score - 1]) {
+          score += 1;
+        }
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestOffset = hit;
+      }
+      searchFrom = hit + lowerForm.length;
+    }
+    if (bestOffset == null) continue;
+    return bestOffset;
+  }
+  return sourceStart;
 }
 
 /// 找出包含 `offset` 的那一行在畫面純文字中的起點。
@@ -6702,7 +6961,7 @@ TextSpan _interactivePassageText(
       children.addAll(content);
     }
     offset = offset + visibleLineLength(line);
-    sourceOffset += _scriptureSourceAdvance(line);
+    sourceOffset += scriptureSourceAdvance(line);
   }
 
   for (var lineIndex = 0; lineIndex < sourceLines.length; lineIndex++) {
@@ -6791,7 +7050,7 @@ TextSpan _interactivePassageText(
       offset += 1;
       children.add(const TextSpan(text: '\n'));
       offset += 1;
-      sourceOffset += _scriptureSourceAdvance(line);
+      sourceOffset += scriptureSourceAdvance(line);
     } else if (line.images.isNotEmpty) {
       for (final image in line.images) {
         children.add(
@@ -6837,7 +7096,7 @@ TextSpan _interactivePassageText(
       } else {
         children.add(const TextSpan(text: '\n'));
         offset++;
-        sourceOffset += _scriptureSourceAdvance(line);
+        sourceOffset += scriptureSourceAdvance(line);
       }
     } else if (line.verseCells.isNotEmpty) {
       final verseStyle = _scriptureTextStyle(settings);
@@ -6945,7 +7204,7 @@ TextSpan _interactivePassageText(
         children.add(const TextSpan(text: '\n'));
         offset += 1;
       }
-      sourceOffset += _scriptureSourceAdvance(line);
+      sourceOffset += scriptureSourceAdvance(line);
     } else if (_isCanonNumberLine(line.text)) {
       // 經號行（No. ...）只是索引資訊，用較小、較淺的字級顯示。
       final content = contentSpans(line, offset, sourceOffset);
@@ -6961,7 +7220,7 @@ TextSpan _interactivePassageText(
         ),
       );
       offset = offset + visibleLineLength(line);
-      sourceOffset += _scriptureSourceAdvance(line);
+      sourceOffset += scriptureSourceAdvance(line);
     } else {
       addContent(line);
     }
@@ -7890,7 +8149,8 @@ ScriptureSearchResult _parseSearchResult(Map<String, dynamic> row) {
       : const <Map<String, dynamic>>[];
   final passages = kwicRows
       .map((kwic) {
-        final text = _stripSearchMarkup('${kwic['kwic'] ?? ''}');
+        final rawKwic = '${kwic['kwic'] ?? ''}';
+        final text = _stripSearchMarkup(rawKwic);
         final volume = '${kwic['vol'] ?? ''}';
         final line = '${kwic['lb'] ?? ''}';
         final linehead =
@@ -7909,6 +8169,8 @@ ScriptureSearchResult _parseSearchResult(Map<String, dynamic> row) {
           juan: juan,
           work: work,
           availableJuans: availableJuans,
+          snippet: _searchMarkedTerm(rawKwic),
+          fromOnlineIndex: true,
         );
       })
       .where((passage) => passage.text.isNotEmpty)
@@ -7924,6 +8186,17 @@ ScriptureSearchResult _parseSearchResult(Map<String, dynamic> row) {
     passages: passages,
   );
 }
+
+String _searchMarkedTerm(String rawKwic) {
+  final match = _markPattern.firstMatch(rawKwic);
+  return match == null ? '' : _stripSearchMarkup(match.group(1) ?? '').trim();
+}
+
+final _markPattern = RegExp(
+  r'<mark>(.*?)</mark>',
+  caseSensitive: false,
+  dotAll: true,
+);
 
 String _stripSearchMarkup(String text) => text
     .replaceAll(_htmlTagPattern, '')
@@ -7942,6 +8215,8 @@ class _ReaderBookmark {
     required this.juan,
     required this.linehead,
     required this.availableJuans,
+    this.sourceOffset,
+    this.snippet = '',
   });
 
   final String work;
@@ -7949,8 +8224,10 @@ class _ReaderBookmark {
   final String juan;
   final String? linehead;
   final List<int> availableJuans;
+  final int? sourceOffset;
+  final String snippet;
 
-  String get key => '$work:$juan:${linehead ?? ''}';
+  String get key => '$work:$juan:${linehead ?? sourceOffset?.toString() ?? ''}';
 
   factory _ReaderBookmark.fromPassage(ScripturePassage passage) =>
       _ReaderBookmark(
@@ -7959,6 +8236,8 @@ class _ReaderBookmark {
         juan: passage.juan ?? '1',
         linehead: passage.linehead,
         availableJuans: passage.availableJuans,
+        sourceOffset: passage.sourceOffset,
+        snippet: passage.snippet,
       );
 
   factory _ReaderBookmark.fromJson(Map<String, dynamic> json) =>
@@ -7971,6 +8250,8 @@ class _ReaderBookmark {
             .whereType<num>()
             .map((value) => value.toInt())
             .toList(),
+        sourceOffset: (json['sourceOffset'] as num?)?.toInt(),
+        snippet: json['snippet'] as String? ?? '',
       );
 
   Map<String, Object?> toJson() => {
@@ -7979,6 +8260,8 @@ class _ReaderBookmark {
     'juan': juan,
     'linehead': linehead,
     'availableJuans': availableJuans,
+    if (sourceOffset != null) 'sourceOffset': sourceOffset,
+    if (snippet.isNotEmpty) 'snippet': snippet,
   };
 
   ScripturePassage toPassage() => ScripturePassage(
@@ -7989,6 +8272,8 @@ class _ReaderBookmark {
     juan: juan,
     work: work,
     availableJuans: availableJuans,
+    sourceOffset: sourceOffset,
+    snippet: snippet,
   );
 }
 

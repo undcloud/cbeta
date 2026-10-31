@@ -9,6 +9,7 @@ import 'package:flutter/foundation.dart'
 import 'cache.dart';
 import 'models.dart';
 import 'parser.dart';
+import 'source_text.dart';
 
 final _whitespacePattern = RegExp(r'\s+');
 final _volumeTitleTailPattern = RegExp(r'卷[第]?[〇零一二三四五六七八九十百千兩0-9]+$');
@@ -122,32 +123,41 @@ OfflineScanOutcome _scanVolumeLines({
   final juans = juansByWork[target.work] ?? const <int>[];
   final passages = <ScripturePassage>[];
   var termHits = 0;
+  var sourceOffset = 0;
   for (final line in lines) {
-    if (line.role == ScriptureLineRole.volumeTitle ||
-        line.role == ScriptureLineRole.byline) {
-      continue;
+    final lineRole = line.role;
+    if (lineRole != ScriptureLineRole.volumeTitle &&
+        lineRole != ScriptureLineRole.byline) {
+      final rawText = line.text;
+      final lower = rawText.toLowerCase();
+      final match = rawText.isEmpty ? -1 : lower.indexOf(needle);
+      if (match >= 0) {
+        termHits += _countOccurrences(lower, needle);
+        final displayText = rawText.replaceAll(_whitespacePattern, ' ').trim();
+        final linehead = line.linehead;
+        final lineLabel = linehead == null ? '' : linehead.split('_p').last;
+        passages.add(
+          ScripturePassage(
+            title: title.isEmpty ? target.work : title,
+            reference: [
+              '卷${target.juan}',
+              if (lineLabel.isNotEmpty) lineLabel,
+            ].join(' · '),
+            text: offlineKwicSnippet(displayText, needle),
+            linehead: linehead,
+            juan: target.juan,
+            work: target.work,
+            availableJuans: juans,
+            sourceOffset: sourceOffset + match,
+            snippet: rawText.substring(
+              match,
+              (match + needle.length).clamp(0, rawText.length),
+            ),
+          ),
+        );
+      }
     }
-    final text = line.text.replaceAll(_whitespacePattern, ' ').trim();
-    if (text.isEmpty) continue;
-    final lower = text.toLowerCase();
-    if (!lower.contains(needle)) continue;
-    termHits += _countOccurrences(lower, needle);
-    final linehead = line.linehead;
-    final lineLabel = linehead == null ? '' : linehead.split('_p').last;
-    passages.add(
-      ScripturePassage(
-        title: title.isEmpty ? target.work : title,
-        reference: [
-          '卷${target.juan}',
-          if (lineLabel.isNotEmpty) lineLabel,
-        ].join(' · '),
-        text: offlineKwicSnippet(text, needle),
-        linehead: linehead,
-        juan: target.juan,
-        work: target.work,
-        availableJuans: juans,
-      ),
-    );
+    sourceOffset += scriptureSourceAdvance(line);
   }
   if (passages.isEmpty) {
     return const OfflineScanOutcome(results: [], termHits: 0);

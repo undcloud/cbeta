@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:xuefo/scripture/cache.dart';
 import 'package:xuefo/scripture/offline_scan.dart';
+import 'package:xuefo/scripture/parser.dart';
+import 'package:xuefo/scripture/source_text.dart';
 
 Future<void> _waitFor(
   bool Function() condition, {
@@ -157,8 +159,59 @@ void main() {
         ),
       );
       expect(outcome.results, hasLength(1));
-      expect(outcome.results.single.passages.single.text, contains('般若波羅蜜'));
+      final passage = outcome.results.single.passages.single;
+      expect(passage.text, contains('般若波羅蜜'));
       expect(outcome.termHits, 1);
+
+      final volume = await scriptureVolumeStore.read('T0001', '1');
+      final lines = parseScriptureHtml(volume!.html);
+      final source = buildScriptureSearchSource(lines);
+      expect(passage.sourceOffset, source.indexOf('波羅蜜'));
+      expect(passage.snippet, '波羅蜜');
+    },
+  );
+
+  test(
+    'offline scan offsets match the layout source across verse lines',
+    () async {
+      const html =
+          '<div id="body">'
+          '<p class="juan">測試經卷第一</p>'
+          '<span class="lb" id="T0001_p0001a01"></span>'
+          '<div class="lg-row">'
+          '<div class="lg-cell">自他俱入甘露城，</div>'
+          '<div class="lg-cell">同證一如真法界。</div></div>'
+          '<span class="lb" id="T0001_p0001a02"></span>'
+          '<p>太子又問：云何名死？瑜誐答言：五蘊壞滅，名之為死。</p>'
+          '<span class="lb" id="T0001_p0001a03"></span>'
+          '<p>復次大眾聞是法已，歡喜奉行。</p>'
+          '</div>';
+      await scriptureVolumeStore.write(
+        const CachedScriptureVolume(work: 'T0001', juan: '1', html: html),
+      );
+      final outcome = await runOfflineScan(
+        OfflineScanRequest(
+          needle: '五蘊',
+          targets: [
+            OfflineScanTarget(
+              work: 'T0001',
+              juan: '1',
+              path: '${tempDir.path}/cbeta_scripture/T0001-1.json',
+            ),
+          ],
+          juansByWork: const {
+            'T0001': [1],
+          },
+        ),
+      );
+      final lines = parseScriptureHtml(html);
+      final source = buildScriptureSearchSource(lines);
+      final passage = outcome.results.single.passages.single;
+      final expected = source.indexOf('五蘊');
+      expect(expected, greaterThan(0));
+      expect(passage.sourceOffset, expected);
+      expect(source.startsWith('五蘊壞滅', expected), isTrue);
+      expect(passage.snippet, '五蘊');
     },
   );
 }

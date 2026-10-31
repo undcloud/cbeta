@@ -685,11 +685,15 @@ return scriptureDisplaySettings.showSimplifiedText
 搜索命中与卷内搜索共用一套「画面纯文字位移」系统：
 
 - `_buildScriptureTextLayout` 依 `scriptureLines`、行首标记、校勘标记与直排/表格换行规则，产生实际渲染的文字与每行起始位移；
-- 关键字命中以 `linehead` 定位到目标行，再由 `_resolveSearchTargetOffset` 换算成画面位移；同一行号可能有多笔命中，以「同行第 N 笔」区分；
-- 卷内搜索在原始经文文字中比对（可跨过校勘标记），再把来源位移映射到画面位移，因此「安[2]置」能被「安置」命中并分别高亮「安」「置」；
+- 搜索结果与阅读页来源一一对应：**线上索引结果打开线上经卷，离线索引结果打开本地经卷**，两批结果不会合并，因此不需要去重。`ScripturePassage.fromOnlineIndex` 标示结果来源，`sourceOffset` 保存离线命中在整卷来源文字中的位移（含卷题／作译者行），`snippet` 保存命中字元本身；
+- 线上结果以 `linehead` 定位；线上 `/stable/juans` 每行都有逐行锚点，因此行号能精确找到目标行。同一行号可能有多笔命中，以「同行第 N 笔」区分（`_hitOccurrenceAtIndex` + 行内 `indexOf`）；
+- 离线扫描逐行比对时同时累计 `scriptureSourceAdvance`，把命中直接换算成整卷来源位移；阅读器减去卷题／作译者的前进量后，用 `_layoutEditableOffsetForSource` 映射到画面位移，不依赖段落锚点猜测，长段落内的重复词也能精确命中；
+- 阅读前会以 `snippet` 验证 `sourceOffset`（`_locateSnippetOffset`）：原位移对得上就直接使用；对不上时优先在 ±600 字内找最近的相同字串，再退回全文最近命中。因此经卷改版、下载覆盖线上备份或书签旧位移都不会跳到错误位置；
+- 离线／已下载经卷的 HTML 只带段落级 `lineInfo` 锚点（如 `0154c14`），若线上索引结果因断网退回本地、行号不存在，才使用 `_resolveArchiveAnchorTarget`：取目标之前最近的锚点，只在该锚点到下一个锚点的范围内比对关键词，并用 kwic 前文挑出段落内正确的那一处。简体查询会再用 `toTraditionalDisplay` 比对繁体正文；
+- 找不到位移、行号且无法用段落锚点定位时退回卷首，不再阻止整卷阅读；
+- 跳转后直接把**命中字元**置中（卷内搜索、线上行号命中、离线位移命中一致），长段落不会只显示行首而把命中推到画面外；`clamp(0, maxScrollExtent)` 会让卷首命中自动滑到最开头、卷末命中滑到最后面；
 - 卷末重复的经题保留文字（`navigationAnchor`），只是不显示行首标记；`volumeTitle` / `byline` 命中视为标题命中（回到卷首、只在顶部经题列高亮）；`navigationAnchor` 视为正文命中，滑到它在卷末的实际位置并在正文高亮，避免两笔搜索结果重复高亮同一个标题；
-- 找不到行号（跨卷或经文改版）时退回卷首，不再阻止整卷阅读；
-- 跳转后以「命中所在行」的行首为基准置中显示；`clamp(0, maxScrollExtent)` 会让卷首命中自动滑到最开头、卷末命中滑到最后面，其余情况维持居中；
+- 线上阅读时 `_cachedJuan` 先用 `/stable/juans` 取得线上全文；本地已有该卷就不写入、也不覆盖，本地没有才把线上内容留作离线备份。下载同一部经时，下载器写入压缩档内容并注册版本，自然覆盖线上备份；书签与最近阅读仍以本地优先打开，并用 `sourceOffset + snippet` 回位；
 - 表格与图片仍以 `WidgetSpan` 呈现，在 `SelectableText` 纯文字中各占 1 个 placeholder；`_buildScriptureTextLayout` 与渲染端必须使用相同的前进量，否则锚点与卷内搜索会整段偏移；
 - 偈颂（`lg-row`）改以纯文字呈现（每格之间以不可见的 `WidgetSpan` 补足等宽置中间距），因此可以逐字选取；`_verseCellRenderedTexts` 同时供 layout 与渲染使用，两端的格内文字、校勘标记与 placeholder 数量必须一致；
 - 偈颂段落前只在上一行没有自带换行时补一个换行（不额外留空行）；段落後补一个空行；偈字使用较大的行高。这些换行字符也必须同时写进 `_buildScriptureTextLayout` 与渲染端，`lineStarts` 以偈颂列本身为起点，搜索锚点才不会偏移；
@@ -729,6 +733,7 @@ return scriptureDisplaySettings.showSimplifiedText
 ### 11.4 离线正文连续扫描
 
 - 实作在 `lib/scripture/offline_scan.dart` 的 `OfflineScanSession`：一次只交出一塊 `volumesPerChunk = 10` 卷给 `runOfflineScan`，读档、JSON 解码、`parseScriptureHtml`、逐行比对与 KWIC 片段都在背景 isolate 完成，UI isolate 只负责送出与接收，因此扫描期间不会挤掉任何一帧；
+- 每个命中都会附带 `sourceOffset`（整卷来源位移，按 `scriptureSourceAdvance` 累计，偈颂／表格行的换行也计入）与 `snippet`（实际命中的字元）；阅读器据此直接定位，不再依赖 HTML 段落锚点。位移与 `lib/scripture/source_text.dart` 的 `buildScriptureSearchSource` 共用同一套前进量，离线扫描与阅读器 layout 才会对齐；
 - `flutter test` 的 fake-async 不会推进真实 isolate 的回覆，网页版也没有档案，所以 `offlineScanSupportsIsolate()` 在这两种情况下走同一份同步实作（只少了 isolate 跳板）；经卷 ref 没有 `path` 时（网页版存 SharedPreferences）由主 isolate 用 `scanOfflineVolume` 逐卷读；
 - 首页 `_applyOfflineKeywordResults` 先 `prepare()` 并扫一块让首屏有结果，接着 `start()` 交给会话自行连续推进（每块之间让出 12 ms），**不再依赖卷动或「繼續搜尋本地經卷」按钮**；离线正文会一路扫完全部本地经卷直到 `finished`；
 - 进度透过 `ValueNotifier<OfflineScanProgress>` 回报，页面把通知合并成最多每 300 ms 一次 `setState`（`_offlinePublishInterval`），避免每一块都重建整个结果页；`loadMore()` 在离线模式直接返回，卷动不会再触发扫描；
@@ -797,7 +802,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - `online search keeps loading batches while scrolling`：线上第一批全部渲染、没有「顯示更多作品」按钮，卷到底自动发 `start=2` 的下一批并渲染新一部作品；
 - `scrolling reveals the next offline result groups`：离线扫描先只渲染 20 部（第 25 部看不到），卷到底自动放行第二页并出现「收合多顯示的作品」；
 - `test/offline_scan_test.dart`：`OfflineScanSession` 的分块扫描、自行连续推进到全部卷、暂停后不再排下一块、恢复后从中断处继续、没有本地经卷时立即结束，以及 `runOfflineScan` 的 KWIC 片段；
-- `in-volume search highlights ...`、`reader centers ...`、`reader clamps ...`、`reader aligns hits ...`：卷内搜索位移、跨校勘标记、偈颂与滚动对齐。
+- `in-volume search highlights ...`、`reader centers ...`、`reader clamps ...`、`reader aligns hits ...`：卷内搜索位移、跨校勘标记、偈颂与滚动对齐；`reader locates hits inside archive paragraph anchors` 用段落级锚点模拟离线下載经文，验证同段多处的关键词依 kwic 上下文定位，且「上一筆／下一筆」会分别置中不同命中；`reader jumps to the exact offline source offset` 验证离线 `sourceOffset` 直接命中第二处重复词、书签存下位移与 snippet；`online search results read the online volume without overwriting the downloaded copy` 验证线上结果优先读线上、且不覆盖本地已下载经卷；`offline scan offsets match the layout source across verse lines` 验证偈颂行之后的 `sourceOffset` 与 layout 来源一致。
 
 ### 12.2 尚未覆盖或建议补充
 

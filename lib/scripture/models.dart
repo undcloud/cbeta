@@ -88,6 +88,9 @@ class ScripturePassage {
     this.lines = const [],
     this.showCollation = true,
     this.showLineBeginnings = false,
+    this.sourceOffset,
+    this.snippet = '',
+    this.fromOnlineIndex = false,
   });
 
   final String title;
@@ -101,10 +104,24 @@ class ScripturePassage {
   final bool showCollation;
   final bool showLineBeginnings;
 
+  /// 整卷經文來源中的命中位移（含卷題／作譯者行，以 UTF-16 計）。
+  ///
+  /// 離線掃描與書籤用它精確回位；線上索引結果沒有可靠的整卷位移。
+  final int? sourceOffset;
+
+  /// 命中字元本身，用來在經卷改版後驗證 [sourceOffset] 是否仍然有效。
+  final String snippet;
+
+  /// 是否來自線上全文索引；閱讀器據此優先開啟線上經卷。
+  final bool fromOnlineIndex;
+
   ScripturePassage copyWith({
     required String? linehead,
     String? juan,
     String? reference,
+    int? sourceOffset,
+    String? snippet,
+    bool? fromOnlineIndex,
   }) {
     return ScripturePassage(
       title: title,
@@ -117,6 +134,9 @@ class ScripturePassage {
       lines: lines,
       showCollation: showCollation,
       showLineBeginnings: showLineBeginnings,
+      sourceOffset: sourceOffset,
+      snippet: snippet ?? this.snippet,
+      fromOnlineIndex: fromOnlineIndex ?? this.fromOnlineIndex,
     );
   }
 }
