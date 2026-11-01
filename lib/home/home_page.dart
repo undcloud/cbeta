@@ -114,6 +114,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   ModalRoute<Object?>? _ownRoute;
   bool _offlineScanPausedByUser = false;
   bool _offlineScanPausedByLifecycle = false;
+
+  /// 結果頁被上一頁（閱讀器等）完全蓋住時自動停下掃描，回到結果頁才接上。
+  bool _offlineScanHaltedByOverlay = false;
   AppUpdateInfo? _availableUpdate;
   String _currentVersion = '';
   bool _isUpdating = false;
@@ -123,6 +126,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   String? _fodictBaseDir;
   Future<void>? _fodictBaseDirTask;
   SearchSelection? _pendingSearchSelection;
+
+  /// 最近一次真正送出全文搜尋的原始輸入（用來辨認「輸入沒變的重複點擊」）。
+  String _lastSubmittedRawInput = '';
   final FodictService _fodictService = FodictService();
 
   @override
@@ -152,8 +158,25 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   /// 上方頁面完全蓋住或移開時,轉場已經結束,這時才補上留住的掃描進度。
   void _onRouteTransitionChanged() {
     final animation = _ownRoute?.secondaryAnimation;
-    if (animation == null || animation.status != AnimationStatus.dismissed) {
+    if (animation == null) return;
+    if (animation.status == AnimationStatus.completed) {
+      // 結果頁已經看不見了：不再排下一塊，也把 worker 還給系統。
+      // 留著掃描等於使用者在讀經文時主執行緒還被一批批經卷排著。
+      final session = offlineSearchSession;
+      if (session != null && session.scanning) {
+        _offlineScanHaltedByOverlay = true;
+        session.pause();
+      }
+      releaseSharedOfflineScanPool();
       return;
+    }
+    if (animation.status != AnimationStatus.dismissed) return;
+    if (_offlineScanHaltedByOverlay) {
+      _offlineScanHaltedByOverlay = false;
+      final session = offlineSearchSession;
+      if (session != null && !session.finished && !_offlineScanPausedByUser) {
+        session.resume();
+      }
     }
     if (_pendingOfflineProgress != null &&
         !(_offlinePublishTimer?.isActive ?? false)) {
@@ -186,7 +209,13 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     if (_offlineScanPausedByLifecycle) {
       _offlineScanPausedByLifecycle = false;
       final session = offlineSearchSession;
-      if (session != null && !session.finished && !_offlineScanPausedByUser) {
+      // 回到前台但結果頁還被上一頁蓋著：維持停住，等轉場結束再說。
+      final isCovered =
+          _offlineScanHaltedByOverlay || !(_ownRoute?.isCurrent ?? true);
+      if (session != null &&
+          !session.finished &&
+          !_offlineScanPausedByUser &&
+          !isCovered) {
         session.resume();
         setState(() {});
       }
@@ -577,11 +606,15 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   }
 
   Future<void> _executeSearch(String rawInput, String? selectedQuery) async {
+    // 輸入沒變就再點一次搜尋：全文、經目、字典三條管線會全部重跑，畫面上的結果
+    // 先被清空、字典還要重解析整本，看起來就是卡好幾秒。這種點擊當沒發生過。
+    if (rawInput.isNotEmpty && rawInput == _lastSubmittedRawInput) return;
     final token = ++requestToken;
     final navigator = Navigator.of(context);
     final messenger = ScaffoldMessenger.of(context);
     FocusScope.of(context).unfocus();
     if (rawInput.isEmpty) {
+      _lastSubmittedRawInput = '';
       setState(() {
         submittedQuery = '';
         results = const [];
@@ -665,6 +698,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       }
     }
     if (!mounted || token != requestToken) return;
+    _lastSubmittedRawInput = rawInput;
     await _runKeywordSearch(query, token);
   }
 
@@ -684,7 +718,10 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   }
 
   Future<void> _runKeywordSearch(String query, int token) async {
-    _stopOfflineScan();
+    // 同一個字再搜一次時沿用還在跑（或已掃完）的本地掃描會話：
+    // 重建會話要把兩萬多卷從頭再掃一遍，那就是重送搜尋卡住的來源。
+    final reuseOfflineScan = offlineSearchSession?.query == query;
+    if (!reuseOfflineScan) _stopOfflineScan();
     setState(() {
       submittedQuery = query;
       results = const [];
@@ -722,6 +759,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     });
     if (resultsScrollController.hasClients) {
       resultsScrollController.jumpTo(0);
+    }
+    if (reuseOfflineScan) {
+      _publishOfflineScan(offlineSearchSession!.current);
     }
 
     unawaited(_loadKeywordResults(query, token));
@@ -811,7 +851,14 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       // 上千筆、七十秒左右，而且它是按朝代／譯者等元数据匹配，跟書名查詢
       // 不是同一件事（作譯者与年代在「選擇佛經」側欄有各自分頁）。
       var matches = await searchLocalCatalog(query);
-      if (matches.isEmpty) matches = await searchOfflineCatalog(query);
+      if (matches.isEmpty) {
+        matches = await searchOfflineCatalog(
+          query,
+          // 這一圈要在主 isolate 上逐卷解析 HTML：使用者已經換了搜尋或離開頁面，
+          // 就別再往下讀了，否則畫面換走了主執行緒還被排著。
+          shouldAbort: () => !mounted || token != requestToken,
+        );
+      }
       if (!mounted || token != requestToken) return;
       setState(() {
         catalogSearchSucceeded = true;
@@ -881,6 +928,13 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   }
 
   Future<void> _applyOfflineKeywordResults(String query, int token) async {
+    final existing = offlineSearchSession;
+    if (existing != null && existing.query == query) {
+      // 這一輪的本地掃描還在跑或已掃完：把進度画回去就好，不要再建第二個會話
+      // 從第一卷重掃。
+      _publishOfflineScan(existing.current);
+      return;
+    }
     _stopOfflineScan();
     final session = OfflineScanSession(query);
     offlineSearchSession = session;
@@ -902,6 +956,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     _expandingOfflineWorks.clear();
     _offlineScanPausedByUser = false;
     _offlineScanPausedByLifecycle = false;
+    _offlineScanHaltedByOverlay = false;
     final session = offlineSearchSession;
     offlineSearchSession = null;
     if (session != null) {
@@ -938,6 +993,10 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
           hits: session.pendingHitsFor(work),
           query: session.query,
           availableJuans: session.juansFor(work),
+          // 離開頁面、換搜尋字（會話被換掉）就停手：展開要在主 isolate 上
+          // 一卷一卷解析 HTML，不叫停的話使用者已經走了還在排隊。
+          shouldAbort: () =>
+              !mounted || !identical(offlineSearchSession, session),
         );
         if (!mounted) return;
         if (identical(offlineSearchSession, session)) {
@@ -1146,7 +1205,11 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   void clearSearch() {
     FocusScope.of(context).unfocus();
     searchController.clear();
+    _lastSubmittedRawInput = '';
     _stopOfflineScan();
+    // 離開三项結果的画面回到首頁：把掃描用的 worker 也還給系統，
+    // 下一次搜尋再重新拉起（冷啟動只要幾百毫秒）。
+    releaseSharedOfflineScanPool();
     setState(() {
       submittedQuery = '';
       results = const [];
@@ -1193,6 +1256,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     scriptureDisplaySettings.removeListener(_onDisplaySettingsChanged);
     _ownRoute?.secondaryAnimation?.removeListener(_onRouteTransitionChanged);
     _stopOfflineScan();
+    releaseSharedOfflineScanPool();
     searchController.dispose();
     resultsScrollController
       ..removeListener(_onResultsScroll)

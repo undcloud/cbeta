@@ -486,6 +486,7 @@ Future<String> resolveSearchQuery(
 补充：
 
 - 首页搜索同时发起全文关键字、经目检索与字典 key 检索；三个来源由 `_runKeywordSearch` 以 `unawaited(...)` **并行、异步各自落地**（各自维护 `isKeywordSearchPending`／`isCatalogSearchPending`／`isDictionarySearchPending` 与 `setState`），任一方先完成就先显示，不必等其它方；结果页仍在首页，不存在独立的「全文搜索页」入口；实测服务端与 Dart 客户端都能并行处理这些请求（同一批三个查询并行约 2 秒、串行约 5.5 秒），慢的原因不是并发冲突；
+- **輸入沒變的重複點擊直接無視**：`_executeSearch()` 在 `++requestToken` 之前先比 `rawInput` 與 `_lastSubmittedRawInput`，相同就 return（`_lastSubmittedRawInput` 只在真正送出全文搜尋時記錄，Goto 與 AI 模式不記，所以同一條 Goto 連結可以再點）。不做這層攔截時，三條管線會全部重跑：結果先清空、字典分區要重解析整本（那就是「字典搜尋結果被重置」）、離線掃描還要重建會話，使用者看到的是卡好幾秒。改過輸入、`clearSearch()`（Logo／返回鍵清空）、空輸入才會真的重搜；「清空後再搜同一個字」是新搜尋，仍會發請求並先用 `FullTextSearchCache` 頂住畫面；
 - 首页搜索结果显示为三个可折叠分区：經目搜尋結果、字典搜尋結果、正文搜尋結果；每个分区标题下的内容整体向右缩进（经目内容左内边距 24；字典/正文分组标题与卡片左右内边距 40/40，宽度与经目内容范围一致，不占满屏幕宽度），首页「上次閱讀位置／最近閱讀／我的書籤」列表内容同样左缩进 24，以形成层次；经目与字典分区初始各只显示 1 条，可分别展开全部；正文分区按「作品（一级）→ 卷（二级）」分组：先由 `_groupResultsByWork` 把**同一部作品（work）跨卷的多笔结果合并成一筆**（结果以 passages 的 work 为分组键），因此一级只展示去重后的作品目录；一级 `ExpansionTile`（`_WorkResultGroup`）**默认折叠且懒惰渲染**（只在该作品第一次展开时才构建二级与命中片段，避免正文结果一次性渲染卡顿），二级卷分组在展开后默认展开并列出该卷命中片段；
 - 字典分区使用 `FodictService.searchByKey` 依次尝试提交词、全简体、全繁体的第一个有结果写法，命中后点击条目在**当前结果列表中就地展开/收起完整释义**（不再弹窗）；词条名、摘要与展开后的释义都使用 `_scriptureTextStyle(scriptureDisplaySettings)`，跟随显示设置的字号、字体与行高，展开前后字号一致；字典检索失败只影响该分区，不阻止关键字与经目结果；
 - 首页经目分区**完全由本机回答**：先查 App 内建的完整经目（`CatalogCache.searchWorks`，只匹配书名与编号），没命中再看本地已储存经卷的经名，全程不发请求；「選擇佛經 → 經目查詢」分页才是「本地先铺 + 远端 `/search/toc` 合并」。两者都不搜正文（细节与理由见 11.6）；
@@ -769,7 +770,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 **第一階段只扫索引，第二階段才解析 HTML**
 
-- `runOfflineScan` 只产出 `(work, juan, linehead)`，不带正文；一部经的命中先以 `pendingHits` 发布，卡片展开时才调 `expandOfflineWork()` 用 `.json` 的 HTML 重比一次（实测约 4 ms/卷），摘要与 `sourceOffset` 都取自**带标点的原文**，再点其中一条才进阅读页；
+- `runOfflineScan` 只产出 `(work, juan, linehead)`，不带正文；一部经的命中先以 `pendingHits` 发布，卡片展开时才调 `expandOfflineWork()` 用 `.json` 的 HTML 重比一次（实测约 4 ms/卷），摘要与 `sourceOffset` 都取自**带标点的原文**，再点其中一条才进阅读页；展开的 HTML 解析发生在主 isolate，所以卷与卷之间让出一幀，並由呼叫端傳 `shouldAbort`（`!mounted || 會話已被換掉`）——點開一部長的經再跳走，不會出現「頁面已經換了還在一卷卷解析」；
 - 首页的接線是 `WorkStickyHeader.onExpansionChanged` → `_expandOfflineHits()`，用 `_expandingOfflineWorks` 防重复展开，完成后 `session.applyPassages(work, passages)` 用摘要取代那一部的待展开命中；还没展开完时该列显示「找到 N 處命中，正在載入經文摘要…」占位；
 - 上下文摘要 `offlineKwicSnippet()` 会停在卷题／作译者／校勘夹注的边界（`SidxSource.excluded`）：被结构边界挡住时不加省略号，因为省略号表示删掉的是经文，不是标题；
 - 命中一律排除：卷题、作译者、校勘夹注（`inlineNotes`）、以及卷首那行就在 `#body` 裡的 `No. 1092 [cf. Nos. 1093-1099, 901(Fasc. 5)]`，否则 cf 引用会污染正文结果。
@@ -777,11 +778,16 @@ return scriptureDisplaySettings.showSimplifiedText
 **扫描执行体与节奏**
 
 - `OfflineScanPool` 常驻最多 `min(4, max(2, 处理器数))` 个 isolate，`Isolate.spawn` + `RawReceivePort` 握手、UI 侧共用一个 `ReceivePort`，单块 120 s 逾时就当空结果放过；
+- 池是**模块级共用**（`sharedOfflineScanPool()`／`releaseSharedOfflineScanPool()`），不属于任何一个扫描会话：换字或重送搜索会重建会话，若池跟着会话生死，一次点击就要杀四个 isolate 再生四个，重生的固定开销比扫一卷还大。只有离开搜索页（`ScriptureSearchPageState.dispose`）才释放池；扩容要排队（`_growing`），否则两个会话同时 `_ensureWorkers` 会拿到同一个 worker；
 - 块大小跟着每帧预算走（`volumesPerChunk = 24` 起步、`_batchBudgetMicros = 8000`）：一块跑得比预算快就翻倍，慢过四倍就折半，上限 2000 卷，块之间让出 4 ms，所以索引就位后块会一路长到千卷级，扫描自己推到 `finished`，不依赖卷动或按钮；
 - `flutter test` 的 fake-async 不会推进真实 isolate 的回覆，网页版也没有档案，所以 `offlineScanSupportsIsolate()` 在这两种情况下走同一份同步实作（只少了 isolate 跳板）；经卷 ref 没有 `path` 时（网页版存 SharedPreferences）由主 isolate 用 `scanOfflineVolume` 逐卷读，也不会去建 `cbeta_sidx/`；
+- 任何「只能在 UI isolate 上扫这一块」的兜底（池已释放、`parts < 2`、派工失败）都走 `runOfflineScanInline()`，它与 `runOfflineScan()` 共用 `_runOfflineScan` 但**每卷之间让出一幀**。自适应后一块可长到 2000 卷，同步扫完整块会把整个 App 顶死（Android 直接报「没有响应」），这条路径绝不能再用不分段的 `runOfflineScan`；
 - 缺索引或索引过期就在扫描的 isolate 内从 `.json` 重建（`_loadVolume`），所以第一次扫描同时是回填，之后每卷只剩「读标头与字符集 →（可能命中才）读正文」，罕见字查询连正文都不用打开；
 - 进度透过 `ValueNotifier<OfflineScanProgress>` 回报，页面把通知合并成最多每 300 ms 一次 `setState`（`_offlinePublishInterval`），避免每一块都重建整个结果页；`loadMore()` 在离线模式直接返回，卷动不会再触发扫描；
-- 中断方式：换新搜索、`clearSearch()`、离开页面（`dispose`）都会 `_stopOfflineScan()`；App 进入后台时 `didChangeAppLifecycleState` 自动 `pause()`，回前台自动 `resume()`；用户可用正文分区的「暫停掃描／繼續掃描」按钮就地暂停（暂停只管「不再排下一块」，已交出去的那一块仍会跑完）。
+- 中断方式：换新搜索、`clearSearch()`、离开页面（`dispose`）都会 `_stopOfflineScan()`；App 进入后台时 `didChangeAppLifecycleState` 自动 `pause()`，回前台自动 `resume()`；用户可用正文分区的「暫停掃描／繼續掃描」按钮就地暂停（暂停只管「不再排下一块」，已交出去的那一块仍会跑完）；
+- **「看不見結果頁」等於取消 + 釋放**：結果頁被上一頁完全蓋住（`_ownRoute.secondaryAnimation.status == completed`）就 `pause()` 並 `releaseSharedOfflineScanPool()`，回到結果頁（`dismissed`）才 `resume()`，worker 由下一块掃描惰性重建；`clearSearch()` 同樣釋放池。代價是開一趟閱讀器回來要多等一次 worker 冷啟動（幾百毫秒），換來的是「使用者在讀經文時主執行緒不再被一批批經卷排著」；
+- 只在主 isolate 上跑的兩條兜底路徑一定要能被叫停，否則 dispose 只是「不再排下一塊」，手上那一塊（自適應後可達 2000 卷）照樣把主執行緒排死：`runOfflineScanInline(request, shouldAbort: ...)` 在每卷之間檢查（會話傳入 `_disposed`；`OfflineScanPool.run` 那三個退回主 isolate 的分支把同一個閉包接力傳下去），`searchOfflineCatalog(query, shouldAbort: ...)` 在每部經之前檢查（呼叫端傳 `!mounted || token != requestToken`）；後者的讓幀計數也從「只有命中才算」改成「讀幾部就讓」，沒命中時不再從不讓幀；
+- **同一个字再点一次搜索不会重建扫描会话**（輸入完全沒變時更早就被 `_executeSearch()` 攔掉了，见 §4；這裡管的是「换了写法但解析出同一個 query」，例如先搜簡體再搜同一個繁体词）：`_runKeywordSearch()` 先问 `offlineSearchSession?.query == query`，相同就留着会话、把它的现有进度直接画回去（`_publishOfflineScan(session.current)`），只重发线上请求；线上仍失败时 `_applyOfflineKeywordResults()` 也走同一判断，沿用会话而不建第二个。重建会话等于把两万多个卷从卷 0 重扫一遍，还顺带把已排定的工作全作废——离线时反复点搜索就是靠这条卡住的；换字、`clearSearch()`、离开页面才会真的 dispose。
 
 **跳卷过滤**
 
@@ -793,7 +799,8 @@ return scriptureDisplaySettings.showSimplifiedText
 **已知限制**
 
 - 偈颂（`div.lg-row`/`lg-cell`）与表格列不在 `buildScriptureSearchSource` 里（那一行只贡献一个换行），所以偈颂文字离线搜不到——这是阅读页卷内搜索同样的既有行为，要改得先动搜索源本身；
-- 悉曇／蘭札字目前只以「形似漢字壳字」进索引，按 `code`（如 `SD-A5A9`）或罗马转写的别名检索还没做，但 `runTable` + `refPool` 从第一版就写进档案，将来加别名层不必重建索引。
+- 悉曇／蘭札字目前只以「形似漢字壳字」进索引，按 `code`（如 `SD-A5A9`）或罗马转写的别名检索还没做，但 `runTable` + `refPool` 从第一版就写进档案，将来加别名层不必重建索引；
+- 離線掃描的**主執行緒工作全部可叫停**了，但線上請求本身仍斷不掉：`fetchSearchBatch` 走 `package:http` 的全域 `http.get`（測試也是靠攛改這個全域 client 來注入 mock），`Future.timeout` 只是放棄 await，socket 與那幾十萬位元組的 `bodyBytes` 还在跑。影響只剩带宽与一次 `jsonDecode`（在背景解析，不堵 UI），要真的取消得改成自備可 `close()` 的 client 並同步改所有測試的注入方式。
 
 ### 11.4.1 结果分页与显示
 
@@ -861,6 +868,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - `online search keeps loading batches while scrolling`：线上第一批全部渲染、没有「顯示更多作品」按钮，卷到底自动发 `start=2` 的下一批并渲染新一部作品；
 - `scrolling reveals the next offline result groups`：离线扫描先只渲染 20 部（第 25 部看不到），卷到底自动放行第二页；因为新放的卡片会把尾端按钮挤出画面，要多卷到底一次才会出现「收合多顯示的作品」；
 - `test/offline_scan_test.dart`：端到端的离线扫描 —— `OfflineScanSession` 的分块扫描、自行连续推进到全部卷、暂停后不再排下一块（已交出的那一块仍会跑完）、恢复后从中断处继续、没有本地经卷时立即结束；索引侧覆盖「首轮建索引、次轮直接重用 `.sidx`」「经卷内容更新后戳记失效并重建」「罕见字靠字符集跳卷，不读正文」；第二段覆盖「用 HTML 展开摘要，`snippet`/`sourceOffset` 与原文对得上、上下文不会把卷题扫进来」「展开完成后摘要取代待展开命中」；查询侧覆盖简体输入匹配繁体正文、查询有无标点空格都一样命中，以及 KWIC 摘要的省略号；没有档案路径的经卷（网页版）也在当前 isolate 扫，且不会去建 `cbeta_sidx/`；
+- 重送搜索与「看不见结果頁」後的取消：`test/offline_scan_test.dart` 的「常駐池跨掃描會話重用，離開頁面釋放後才重建」盯住池的生命周期（会话换了不等于 isolate 该杀）；「主 isolate 的兜底掃描能被叫停，不會把整塊掃完」斷言 `shouldAbort` 跳起後 `scannedVolumes` 小於請求卷數（同一請求不叫停仍是全部）；「經目兜底查詢能被叫停，不會讀完全部本地經卷」同理盯 `searchOfflineCatalog`；「展開摘要時換了搜尋就停手」斷言 `expandOfflineWork(shouldAbort: () => true)` 回空而不是一卷卷解析完；`test/widget_test.dart` 的 `re-tapping the same offline search keeps the running scan` 用 300 卷本地经卷扫到中途再点一次搜索，断言 `offlineSearchSession` 仍是同一个对象、`scannedVolumes` 没有退回第一块（把 `_runKeywordSearch()` 的同字重用去掉，这条就红）；`repeat keyword search paints cached results before the API` 同時盯住輸入沒變的重複點擊——再點一次不發新請求（`keywordRequests` 仍是 1）、結果不動，而要等清空後再搜同一個字才算新搜尋，那時先用快取頂住畫面、不等 API 回覆；
 - `test/sidx_test.dart`：正規化规则（空白与标点闭集 191 码位、ASCII 小写）、跨行与重叠命中、`.sidx` 序列化往返（书名与悉曇 `code` 区间）、crc／版本不符判失效、字符集 delta+LEB128 往返、卷题/作译者/夹注/`No. xxxx [cf. ...]` 的排除、行定位表把命中换回 linehead、跳过区间重叠先合并，以及 `sidxSourceStamp` 隨檔案大小或修改時間改變；
 - `test/fodict_key_index_test.dart`：候选统计的新语义与 sidecar 生命周期 —— 同一术语在两部词典各算一笔（计数单位是条目）、大小写不影响命中、`.keys` 编解码往返（含带换行的 key）、戳记不符或档案截断判为不存在、`parseFodictKeys` 与整本解析抽出同一批 key、统计过程不载入含释义的整本（`debugFodictFullDictionaryLoads` 为 0）且重启后靠 sidecar 不再解析 `.dat`（`debugFodictKeyParses` 不增加）、sidecar 损坏时只有那一部回退重建、词典被删后重新列目录会清掉孤儿 `.keys`；
 - `in-volume search highlights ...`、`reader centers ...`、`reader clamps ...`、`reader aligns hits ...`：卷内搜索位移、跨校勘标记、偈颂与滚动对齐；`reader locates hits inside archive paragraph anchors` 用段落级锚点模拟离线下載经文，验证同段多处的关键词依 kwic 上下文定位，且「上一筆／下一筆」会分别置中不同命中；`reader jumps to the exact offline source offset` 验证离线 `sourceOffset` 直接命中第二处重复词、书签存下位移与 snippet；`online search results read the online volume without overwriting the downloaded copy` 验证线上结果优先读线上、且不覆盖本地已下载经卷；`offline scan offsets match the layout source across verse lines` 验证偈颂行之后的 `sourceOffset` 与 layout 来源一致。

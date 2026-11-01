@@ -102,7 +102,29 @@ QueryPattern buildOfflinePattern(String query) {
 }
 
 /// 掃描一批經卷：讀檔、跳卷過濾與 BMH 比對都在拿到請求的 isolate 內完成。
-Future<OfflineScanOutcome> runOfflineScan(OfflineScanRequest request) async {
+Future<OfflineScanOutcome> runOfflineScan(OfflineScanRequest request) =>
+    _runOfflineScan(request, yieldBetweenVolumes: false);
+
+/// 主 isolate 上的兜底掃描。
+///
+/// 塊大小自適應後可長到千卷級，同步掃完整塊會直接把 UI 卡死；逐卷讓出一幀，
+/// 代價是慢一點，換來畫面仍能回應。[shouldAbort] 每卷檢查一次，呼叫端（會話
+/// 已 dispose、頁面已离开、搜尋已過期）用它把還在吃主執行緒的掃描停下來——
+/// 不然「離開頁面」只是不再排下一塊，手上這一塊照樣跑完。
+Future<OfflineScanOutcome> runOfflineScanInline(
+  OfflineScanRequest request, {
+  bool Function()? shouldAbort,
+}) => _runOfflineScan(
+  request,
+  yieldBetweenVolumes: true,
+  shouldAbort: shouldAbort,
+);
+
+Future<OfflineScanOutcome> _runOfflineScan(
+  OfflineScanRequest request, {
+  required bool yieldBetweenVolumes,
+  bool Function()? shouldAbort,
+}) async {
   final pattern = QueryPattern.fromSlotCandidates(request.slotCandidates);
   if (pattern.isBlank || request.targets.isEmpty) {
     return OfflineScanOutcome.empty;
@@ -112,8 +134,14 @@ Future<OfflineScanOutcome> runOfflineScan(OfflineScanRequest request) async {
   final titles = <String, String>{};
   var termHits = 0;
   var built = 0;
+  var scanned = 0;
   for (final target in request.targets) {
     final loaded = await _loadVolume(target, store, pattern);
+    scanned++;
+    if (yieldBetweenVolumes) {
+      await Future<void>.delayed(Duration.zero);
+      if (shouldAbort != null && shouldAbort()) break;
+    }
     if (loaded == null) continue;
     built += loaded.built ? 1 : 0;
     if (loaded.skipped) continue;
@@ -138,7 +166,7 @@ Future<OfflineScanOutcome> runOfflineScan(OfflineScanRequest request) async {
         ),
     ],
     termHits: termHits,
-    scannedVolumes: request.targets.length,
+    scannedVolumes: scanned,
     builtIndexes: built,
   );
 }
@@ -262,11 +290,15 @@ Future<OfflineScanOutcome> scanOfflineVolume(
 ///
 /// 索引正文刪掉了標點，不能直接給人看；點開一部經時用 HTML 重新比對一次
 /// （實測約 4 ms/卷），摘要、行號與 `sourceOffset` 都取自帶標點的原文。
+///
+/// 每一卷都要在主 isolate 上解析整卷 HTML，所以卷與卷之間讓出一幀，並讓呼叫端
+/// 用 [shouldAbort] 在離開頁面或換了搜尋後把這部經的展開停掉。
 Future<List<ScripturePassage>> expandOfflineWork({
   required String work,
   required List<OfflineHit> hits,
   required String query,
   List<int> availableJuans = const [],
+  bool Function()? shouldAbort,
 }) async {
   if (hits.isEmpty) return const [];
   final pattern = buildOfflinePattern(query);
@@ -274,9 +306,12 @@ Future<List<ScripturePassage>> expandOfflineWork({
   final juans = (hits.map((hit) => hit.juan).toSet().toList())..sort();
   final passages = <ScripturePassage>[];
   for (final juan in juans) {
+    if (shouldAbort != null && shouldAbort()) break;
     final volume = await scriptureVolumeStore.readRef(
       ScriptureVolumeRef(work: work, juan: juan),
     );
+    await Future<void>.delayed(Duration.zero);
+    if (shouldAbort != null && shouldAbort()) break;
     if (volume == null) continue;
     final List<ScriptureLine> lines;
     try {
@@ -503,7 +538,6 @@ class OfflineScanSession {
   bool _scanning = false;
   bool _finished = false;
   bool _disposed = false;
-  OfflineScanPool? _pool;
 
   ValueListenable<OfflineScanProgress> get progress => _progress;
   OfflineScanProgress get current => _progress.value;
@@ -586,14 +620,20 @@ class OfflineScanSession {
     );
     final pool =
         offlineScanSupportsIsolate() && (chunk.first.path ?? '').isNotEmpty
-        ? (_pool ??= OfflineScanPool())
+        ? sharedOfflineScanPool()
         : null;
-    if (pool == null) return runOfflineScan(request);
+    // 只能在主 isolate 掃的場合（网页版、測試、池已被釋放）一定要能中止：
+    // 這一塊可能是自適應後的千卷級，會話都 dispose 了還把主執行緒排著。
+    bool cancelled() => _disposed;
+    if (pool == null) {
+      return runOfflineScanInline(request, shouldAbort: cancelled);
+    }
     return pool
-        .run(request, _workerCount)
+        .run(request, _workerCount, shouldAbort: cancelled)
         .then(
           (outcome) => outcome,
-          onError: (Object _) => runOfflineScan(request),
+          onError: (Object _) =>
+              runOfflineScanInline(request, shouldAbort: cancelled),
         );
   }
 
@@ -677,8 +717,6 @@ class OfflineScanSession {
     _disposed = true;
     _generation++;
     _scanning = false;
-    _pool?.dispose();
-    _pool = null;
     _progress.dispose();
   }
 
@@ -723,6 +761,21 @@ class _MergedWork {
 
 const int _commandScan = 1;
 
+OfflineScanPool? _sharedScanPool;
+
+/// 跨搜尋會話重用常駐 worker 池。
+///
+/// 每次換字／重送搜尋都會 dispose 舊會話並建會話；若池跟著會話生死，
+/// 一次點擊要殺四個 isolate 再生四個，重生成本比掃描本身還大。
+OfflineScanPool sharedOfflineScanPool() =>
+    _sharedScanPool ??= OfflineScanPool();
+
+/// 離開搜尋頁時釋放常駐池；下次搜尋會重新拉起 worker。
+void releaseSharedOfflineScanPool() {
+  _sharedScanPool?.dispose();
+  _sharedScanPool = null;
+}
+
 /// 常駐掃描 worker 池。
 ///
 /// `compute` 每一塊都要冷啟動一個 isolate（載入 isolate 組件、首次分配），
@@ -735,24 +788,37 @@ class OfflineScanPool {
 
   final ReceivePort _replies = ReceivePort();
   final List<_ScanWorker> _workers = [];
-  final List<Future<_ScanWorker>> _starting = [];
   final Map<int, Completer<OfflineScanOutcome>> _pending = {};
+
+  /// 池跨會話共用後可能同時被要求扩容，生成 worker 必須排隊，
+  /// 否則兩個並發的 `_ensureWorkers` 會拿到同一個 worker。
+  Future<void> _growing = Future<void>.value();
   bool _disposed = false;
   int _nextId = 1;
 
   /// 把一份請求切成至多 [workerCount] 份並行執行，合併後回傳。
+  ///
+  /// [shouldAbort] 只用在退回主 isolate 自己掃的場合（池已釋放、份數不足），
+  /// 派給 worker 的部分無法被叫停，會話dispose 後那些結果直接丟棄。
   Future<OfflineScanOutcome> run(
     OfflineScanRequest request,
-    int workerCount,
-  ) async {
-    if (_disposed || request.targets.isEmpty) return runOfflineScan(request);
+    int workerCount, {
+    bool Function()? shouldAbort,
+  }) async {
+    if (_disposed || request.targets.isEmpty) {
+      return runOfflineScanInline(request, shouldAbort: shouldAbort);
+    }
     final parts = math.min(
       workerCount,
       math.max(1, request.targets.length ~/ 8),
     );
-    if (parts < 2) return runOfflineScan(request);
+    if (parts < 2) {
+      return runOfflineScanInline(request, shouldAbort: shouldAbort);
+    }
     await _ensureWorkers(parts);
-    if (_disposed) return runOfflineScan(request);
+    if (_disposed) {
+      return runOfflineScanInline(request, shouldAbort: shouldAbort);
+    }
     final size = (request.targets.length + parts - 1) ~/ parts;
     final futures = <Future<OfflineScanOutcome>>[];
     for (var part = 0; part < parts; part++) {
@@ -816,12 +882,15 @@ class OfflineScanPool {
     completer.complete(message[1] as OfflineScanOutcome);
   }
 
-  Future<void> _ensureWorkers(int count) async {
+  Future<void> _ensureWorkers(int count) {
+    final next = _growing.then((_) => _growTo(count));
+    _growing = next.then<void>((_) {}, onError: (Object _) {});
+    return next;
+  }
+
+  Future<void> _growTo(int count) async {
     while (_workers.length < count && !_disposed) {
-      if (_starting.length <= _workers.length) {
-        _starting.add(_ScanWorker.spawn());
-      }
-      final worker = await _starting[_workers.length];
+      final worker = await _ScanWorker.spawn();
       if (_disposed) {
         worker.dispose();
         return;

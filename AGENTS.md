@@ -47,6 +47,7 @@ flutter build apk --release --split-per-abi
 - 點擊候選會替換輸入框文字並立即搜尋。
 - 不選擇直接提交時使用第一候選。
 - Goto 僅首頁判斷。
+- 輸入完全沒變時再點搜尋會被忽略（`_executeSearch` 比對 `_lastSubmittedRawInput`）：避免全文／經目／字典三條管線重跑導致卡頓與字典結果重置；清空搜尋後再搜同一個字才算新搜尋。
 - 顯示文字需跟隨簡繁設定，使用 `_displayText` / `textBuilder`。
 - 修改搜尋邏輯時同步更新 `lib/search/feature_logic.md`。
 

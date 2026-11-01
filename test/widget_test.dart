@@ -1904,6 +1904,66 @@ void main() {
     }, () => client);
   });
 
+  testWidgets('re-tapping the same offline search keeps the running scan', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    for (var index = 1; index <= 300; index++) {
+      final work = 'T${index.toString().padLeft(4, '0')}';
+      await scriptureVolumeStore.write(
+        CachedScriptureVolume(
+          work: work,
+          juan: '1',
+          html:
+              '<div id="body">'
+              '<p class="juan">測試經$index卷第一</p>'
+              '<span class="lb" id="${work.toLowerCase()}n0001_p0001a01"></span>'
+              '<span class="t">般若波羅蜜多心經</span>'
+              '</div>',
+        ),
+      );
+    }
+    final client = MockClient((request) async {
+      throw const SocketException('offline');
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(const CbetaSearchApp());
+      await tester.pumpAndSettle();
+
+      ScriptureSearchPageState pageState() => tester
+          .state<ScriptureSearchPageState>(find.byType(ScriptureSearchPage));
+      dynamic scanSession() => pageState().offlineSearchSession;
+      int scannedNow() {
+        final session = scanSession();
+        return session == null ? 0 : session.scannedVolumes as int;
+      }
+
+      await tester.enterText(find.byType(TextField).first, '般若波羅蜜');
+      await tester.tap(find.byTooltip('搜尋經文'));
+      for (var attempt = 0; attempt < 120 && scannedNow() == 0; attempt++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      final first = scanSession();
+      expect(first, isNotNull);
+      final scannedBefore = scannedNow();
+      expect(scannedBefore, greaterThan(0));
+
+      // 同一個字再點一次：已掃過的卷不該從頭重掃，會話也不能換成新的。
+      await tester.tap(find.byTooltip('搜尋經文'));
+      for (var attempt = 0; attempt < 20; attempt++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      expect(identical(scanSession(), first), isTrue);
+      expect(first.scannedVolumes, greaterThanOrEqualTo(scannedBefore));
+      expect(find.textContaining('離線模式'), findsWidgets);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+    }, () => client);
+  });
+
   testWidgets('scrolling reveals the next offline result groups', (
     tester,
   ) async {
@@ -2096,7 +2156,16 @@ void main() {
       expect(find.textContaining('長阿含經'), findsWidgets);
       expect(keywordRequests, 1);
 
-      // 同一個字再查一次:先畫上次留下的結果,不再讓使用者等 API 數秒。
+      // 輸入沒變再點一次：整條管線不重跑，結果與各分區保持原樣。
+      await tester.tap(find.byTooltip('搜尋經文'));
+      await tester.pump(const Duration(seconds: 1));
+      expect(keywordRequests, 1);
+      expect(find.textContaining('長阿含經'), findsWidgets);
+
+      // 清空後再搜同一個字才算新搜尋:先畫上次留下的結果,不再讓使用者等 API 數秒。
+      await tester.tap(find.text('CBETA 閱讀'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).first, '般若');
       await tester.tap(find.byTooltip('搜尋經文'));
       for (var attempt = 0; attempt < 60 && keywordRequests < 2; attempt++) {
         await tester.pump(const Duration(milliseconds: 16));

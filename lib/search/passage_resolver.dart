@@ -340,7 +340,13 @@ Future<ScripturePassage?> resolveGotoPassageLocally(String linehead) async {
 ///
 /// 優先使用已載入的經目資料，避免為了查詢而解析大量經文 HTML；
 /// 只有經目未收錄的經卷才需要讀取內容。
-Future<List<Map<String, dynamic>>> searchOfflineCatalog(String query) async {
+///
+/// [shouldAbort] 在每一部經之間檢查：那些讀卷與解析 HTML 都发生在呼叫端的
+/// isolate 上（通常是主 isolate），過期的查詢要能立刻停手。
+Future<List<Map<String, dynamic>>> searchOfflineCatalog(
+  String query, {
+  bool Function()? shouldAbort,
+}) async {
   final needle = query.trim();
   if (needle.isEmpty) return const [];
   final refs = await scriptureVolumeStore.listRefs();
@@ -372,6 +378,13 @@ Future<List<Map<String, dynamic>>> searchOfflineCatalog(String query) async {
   final lowerNeedle = needle.toLowerCase();
   var processed = 0;
   for (final entry in firstRefByWork.entries) {
+    // 每一部不在經目裡的經都要讀卷並解析 HTML，所以「讀了幾部」就要讓出一幀，
+    // 不能只在有命中時才讓（沒命中時從不讓幀，等於把主 isolate 排死）。
+    if (processed > 0 && processed % 4 == 0) {
+      await Future<void>.delayed(Duration.zero);
+    }
+    if (shouldAbort != null && shouldAbort()) break;
+    processed++;
     final volume = await scriptureVolumeStore.readRef(entry.value);
     if (volume == null) continue;
     final lines = tryParseLocalVolume(volume);
@@ -387,10 +400,6 @@ Future<List<Map<String, dynamic>>> searchOfflineCatalog(String query) async {
       if (info.byline.isNotEmpty) 'byline': info.byline,
       'offline': true,
     });
-    processed++;
-    if (processed % 8 == 0) {
-      await Future<void>.delayed(Duration.zero);
-    }
   }
   results.sort(
     (left, right) => '${left['title']}'.compareTo('${right['title']}'),

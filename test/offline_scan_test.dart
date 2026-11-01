@@ -7,6 +7,7 @@ import 'package:xuefo/scripture/parser.dart';
 import 'package:xuefo/scripture/sidx_store.dart';
 import 'package:xuefo/scripture/source_text.dart';
 import 'package:xuefo/search/conversion.dart';
+import 'package:xuefo/search/passage_resolver.dart';
 
 Future<void> _waitFor(
   bool Function() condition, {
@@ -351,5 +352,66 @@ void main() {
     expect(snippet.endsWith('…'), isTrue);
     expect(snippet.length, lessThan(text.length + 2));
     expect(offlineKwicSnippet('王舍城', 0, 3), '王舍城');
+  });
+
+  test('主 isolate 的兜底掃描能被叫停，不會把整塊掃完', () async {
+    await seedVolumes(8);
+    final targets = await targetsFor(8);
+    final request = requestFor('波羅蜜多', targets);
+    var checks = 0;
+    final aborted = await runOfflineScanInline(
+      request,
+      shouldAbort: () {
+        checks++;
+        return checks >= 2;
+      },
+    );
+    // 叫停只保證「手上這一卷掃完就收工」，剩下的卷不該繼續排主執行緒。
+    expect(aborted.scannedVolumes, lessThan(8));
+    expect(aborted.termHits, lessThan(8));
+    expect((await runOfflineScanInline(request)).scannedVolumes, 8);
+  });
+
+  test('展開摘要時換了搜尋就停手', () async {
+    await seedVolumes(2);
+    final targets = await targetsFor(2);
+    final outcome = await runOfflineScan(requestFor('波羅蜜多', targets));
+    final group = outcome.groups.first;
+
+    final done = await expandOfflineWork(
+      work: group.work,
+      hits: group.hits,
+      query: '波羅蜜多',
+    );
+    expect(done, isNotEmpty);
+    final aborted = await expandOfflineWork(
+      work: group.work,
+      hits: group.hits,
+      query: '波羅蜜多',
+      shouldAbort: () => true,
+    );
+    expect(aborted, isEmpty);
+  });
+
+  test('經目兜底查詢能被叫停，不會讀完全部本地經卷', () async {
+    await seedVolumes(8);
+    var checks = 0;
+    final aborted = await searchOfflineCatalog(
+      '測試經',
+      shouldAbort: () {
+        checks++;
+        return checks >= 3;
+      },
+    );
+    expect(aborted.length, lessThan(8));
+    expect(await searchOfflineCatalog('測試經'), hasLength(8));
+  });
+
+  test('常駐池跨掃描會話重用，離開頁面釋放後才重建', () {
+    final pool = sharedOfflineScanPool();
+    expect(sharedOfflineScanPool(), same(pool));
+    releaseSharedOfflineScanPool();
+    expect(sharedOfflineScanPool(), isNot(same(pool)));
+    releaseSharedOfflineScanPool();
   });
 }
