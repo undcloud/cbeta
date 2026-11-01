@@ -6,6 +6,8 @@ import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 
+import 'fodict_key_index.dart';
+
 /// 一部已解析詞典的查表資料。
 ///
 /// [lowerKeys] 與 [keys] 同序,讓 key 匹配不必每次掃描都重新分配
@@ -24,17 +26,12 @@ class ParsedDictionary {
   int get length => keys.length;
 }
 
-/// 在背景 isolate 解析 `fodict.dat`；頂層函式才能傳給 [compute]。
-ParsedDictionary parseFodictData(Uint8List data) {
-  if (data.length < 64) {
-    return const ParsedDictionary(entries: {}, keys: [], lowerKeys: []);
-  }
+Map<String, String> _parseFodictEntries(Uint8List data) {
+  if (data.length < 64) return <String, String>{};
 
   final contentStart = ByteData.sublistView(data).getUint32(32, Endian.little);
   final entries = <String, String>{};
-  if (contentStart < 0 || contentStart + 8 > data.length) {
-    return const ParsedDictionary(entries: {}, keys: [], lowerKeys: []);
-  }
+  if (contentStart < 0 || contentStart + 8 > data.length) return entries;
 
   // 以第一條目判斷格式：關鍵字後的 defLen 為 0 者為「分類＋全文」兩段式。
   final firstKwLen = FodictService._readUint32(data, contentStart);
@@ -48,7 +45,12 @@ ParsedDictionary parseFodictData(Uint8List data) {
   } else {
     FodictService._loadStandardFormat(data, contentStart, entries);
   }
+  return entries;
+}
 
+/// 在背景 isolate 解析 `fodict.dat`；頂層函式才能傳給 [compute]。
+ParsedDictionary parseFodictData(Uint8List data) {
+  final entries = _parseFodictEntries(data);
   final keys = List<String>.from(entries.keys, growable: false);
   return ParsedDictionary(
     entries: entries,
@@ -56,6 +58,23 @@ ParsedDictionary parseFodictData(Uint8List data) {
     lowerKeys: [for (final key in keys) key.toLowerCase()],
   );
 }
+
+/// 只取 key 的解析入口，供候選命中數統計使用。
+///
+/// 必須和 [parseFodictData] 共用同一套格式判定與 key 抽取規則：全文式詞典的
+/// key 是從正文句讀切出來的，規則分叉會讓候選統計和字典分區對不上。
+/// 分開的意義只在於不必把十餘 MB 釋義跨 isolate 複製回來。
+List<String> parseFodictKeys(Uint8List data) {
+  final entries = _parseFodictEntries(data);
+  return [for (final key in entries.keys) key.toLowerCase()];
+}
+
+/// 測試計數：為了 key 統計真正把 `.dat` 送進 isolate 解析過幾次。
+/// 內存快取或 `.keys` sidecar 命中時不該增加。
+int debugFodictKeyParses = 0;
+
+/// 測試計數：載入過幾次含釋義的整本詞典。候選統計不該碰到它。
+int debugFodictFullDictionaryLoads = 0;
 
 class FodictEntry {
   final String keyword;
@@ -98,6 +117,13 @@ class FodictService {
   static const _cacheLimit = 2;
   final LinkedHashMap<String, ParsedDictionary> _cache =
       LinkedHashMap<String, ParsedDictionary>();
+
+  /// 詞典 key 索引，只用於候選命中數統計。
+  ///
+  /// 和 [_cache] 分開是有原因的：統計要掃全部已安裝詞典，若共用一個 LRU，
+  /// 統計就會把字典分區剛讀進來的釋義擠出去，兩個功能互相重解析同一批 `.dat`。
+  /// key 本身很小（030 丁福保 31366 條不到 1 MB），所以不需要上限。
+  final Map<String, FodictKeyIndex> _keyIndexCache = {};
 
   static const _dictionaryNames = {
     '001.dfb-j': '佛學大辭典',
@@ -196,6 +222,12 @@ class FodictService {
 
     dicts.sort((a, b) => a.id.compareTo(b.id));
     _dictionaries = dicts;
+    // sidecar 統一放在 `_keys` 目錄，詞典目錄被整包刪除時不會跟著走；
+    // 只有在重新列目錄時順手清掉孤兒，卸掉的詞典才不會留殘檔。
+    await fodictKeyStore.sweepOrphans(
+      baseDir: baseDir,
+      installedIds: {for (final dict in dicts) dict.id},
+    );
     return dicts;
   }
 
@@ -219,6 +251,26 @@ class FodictService {
     return null;
   }
 
+  String _datPath(FodictInfo dict) => '${dict.path}/fodict.dat';
+
+  Future<Uint8List?> _readDatBytes(FodictInfo dict) async {
+    try {
+      if (dict.isAsset) {
+        final byteData = await rootBundle.load(_datPath(dict));
+        return byteData.buffer.asUint8List();
+      }
+      return File(_datPath(dict)).readAsBytes();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// `.dat` 的來源戳記。內建資產沒有檔案路徑，打包長度即為戳記（隨 APK 固定）。
+  Future<int?> _sourceStampFor(FodictInfo dict) async {
+    if (dict.isAsset) return dict.datSize;
+    return fodictSourceStamp(_datPath(dict));
+  }
+
   Future<ParsedDictionary> _loadDictionary(FodictInfo dict) async {
     final cached = _cache.remove(dict.id);
     if (cached != null) {
@@ -226,22 +278,50 @@ class FodictService {
       return cached;
     }
 
-    final Uint8List data;
-    if (dict.isAsset) {
-      final byteData = await rootBundle.load('${dict.path}/fodict.dat');
-      data = byteData.buffer.asUint8List();
-    } else {
-      final datFile = File('${dict.path}/fodict.dat');
-      data = await datFile.readAsBytes();
-    }
+    final data = await _readDatBytes(dict);
+    if (data == null) throw FileSystemException('詞典檔案不可讀', _datPath(dict));
 
     // 數萬條目的解碼如果留在 UI isolate,任何正在進行的滑动手勢都會掉幀。
+    debugFodictFullDictionaryLoads += 1;
     final parsed = await compute(parseFodictData, data);
     _cache[dict.id] = parsed;
     while (_cache.length > _cacheLimit) {
       _cache.remove(_cache.keys.first);
     }
     return parsed;
+  }
+
+  /// 取一部詞典的 key 索引：內存 → `.keys` sidecar → 解析 `.dat`，由便宜到昂貴。
+  ///
+  /// 只有最後一條路會碰 `.dat`，所以寫過 sidecar 之後，候選統計只剩讀
+  /// 幾 KB 到幾百 KB 的小檔，也不必把釋義搬進快取。
+  Future<FodictKeyIndex?> _loadKeyIndex(FodictInfo dict, String baseDir) async {
+    final stamp = await _sourceStampFor(dict);
+    if (stamp == null) return null;
+    final cached = _keyIndexCache[dict.id];
+    if (cached != null && cached.sourceStamp == stamp) return cached;
+
+    final stored = await fodictKeyStore.readAt(
+      baseDir: baseDir,
+      id: dict.id,
+      sourceStamp: stamp,
+    );
+    if (stored != null) {
+      final index = FodictKeyIndex(lowerKeys: stored, sourceStamp: stamp);
+      _keyIndexCache[dict.id] = index;
+      return index;
+    }
+
+    final data = await _readDatBytes(dict);
+    if (data == null) return null;
+    debugFodictKeyParses += 1;
+    final index = FodictKeyIndex(
+      lowerKeys: await compute(parseFodictKeys, data),
+      sourceStamp: stamp,
+    );
+    _keyIndexCache[dict.id] = index;
+    await fodictKeyStore.write(baseDir: baseDir, id: dict.id, index: index);
+    return index;
   }
 
   static void _loadStandardFormat(
@@ -494,34 +574,47 @@ class FodictService {
     return results;
   }
 
+  /// 統計每個候選在詞典 key 裡的命中**條目數**（大小寫不敏感）。
+  ///
+  /// 計數單位是條目而不是不重複術語：同一術語被兩部詞典各收一次算 2 筆。
+  /// 這條路徑只讀 key 索引（見 [_loadKeyIndex]），不會把含釋義的詞典搬進快取。
   Future<Map<String, int>> countKeyMatches(
     String baseDir,
     List<String> candidates, {
     Set<String>? dictionaryIds,
   }) async {
     final dicts = await getDictionaries(baseDir);
-    final filteredDicts = dictionaryIds != null
-        ? dicts.where((d) => dictionaryIds.contains(d.id)).toList()
-        : dicts;
-    final allKeys = <String>{};
-    for (final dict in filteredDicts) {
-      try {
-        final parsed = await _loadDictionary(dict);
-        allKeys.addAll(parsed.keys);
-      } catch (_) {}
-    }
-    // 小寫化只做一次,而不是「候選數 × 關鍵字數」次。
-    final lowerKeys = [for (final key in allKeys) key.toLowerCase()];
-    final counts = <String, int>{};
-    for (final candidate in candidates) {
-      var count = 0;
-      final lowerCandidate = candidate.toLowerCase();
-      for (final lowerKey in lowerKeys) {
-        if (lowerKey.contains(lowerCandidate)) count++;
+    final scoped = dictionaryIds == null
+        ? dicts
+        : dicts.where((dict) => dictionaryIds.contains(dict.id)).toList();
+
+    // 空候選會讓 `contains('')` 命中全部 key，直接給 0。
+    final needles = [
+      for (final candidate in candidates) candidate.trim().toLowerCase(),
+    ];
+    final slots = [
+      for (var index = 0; index < needles.length; index++)
+        if (needles[index].isNotEmpty) index,
+    ];
+    final hits = Int32List(needles.length);
+
+    for (final dict in scoped) {
+      final index = await _loadKeyIndex(dict, baseDir);
+      if (index == null) continue;
+      // 外層走一遍 key、內層比對所有候補，比「每個候補各掃一次全部 key」少走幾輪。
+      for (final lowerKey in index.lowerKeys) {
+        for (final slot in slots) {
+          if (lowerKey.contains(needles[slot])) hits[slot] += 1;
+        }
       }
-      counts[candidate] = count;
+      // 多部詞典之間讓出一幀,避免掃描串成不可中斷的長任務。
+      await Future<void>.delayed(Duration.zero);
     }
-    return counts;
+
+    return <String, int>{
+      for (var index = 0; index < candidates.length; index++)
+        candidates[index]: hits[index],
+    };
   }
 
   Future<List<FodictEntry>> searchByKey(
@@ -593,6 +686,7 @@ class FodictService {
 
   void clearCache() {
     _cache.clear();
+    _keyIndexCache.clear();
     _dictionaries = null;
   }
 }

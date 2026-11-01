@@ -333,7 +333,7 @@ Future<String> preferredQueryForInput(String rawInput);
 
 1. 候选面板每次刷新时，对尚未缓存的候选去重后收集；
 2. 延迟 **180 ms** 防抖，避免每次按键都扫描词典；
-3. 调用 `FodictService.countKeyMatches`（不传 `dictionaryIds`），统计全部词典 key 的包含匹配（大小写不敏感）；
+3. 调用 `FodictService.countKeyMatches`（不传 `dictionaryIds`），按全部词典 key 统计包含匹配（大小写不敏感，计数单位是条目）；
 4. 成功后把缺失候选补 0；失败时保留原有顺序且不显示次数；
 5. 结果按候选 query 缓存；`countScope` 或 `keyMatchCounter` 可用性变化时清空缓存和防抖计时器；
 6. 空输入的历史列表不统计。
@@ -611,9 +611,12 @@ return scriptureDisplaySettings.showSimplifiedText
 
 `FodictService.countKeyMatches(baseDir, candidates)`：
 
-- 首页与词典查询都**不传 `dictionaryIds`**，即按全部可用词典的 key 统计（不再限定内建 030）；
-- 对每个候选统计 `key.contains(candidate)` 的次数（大小写不敏感）；
+- 首页与词典查询都**不传 `dictionaryIds`**，即按全部可用词典的 key 统计（不再限定内建 030）；参数保留给测试收窄范围；
+- 计数单位是**条目**，不是不重复术语：同一术语被两部词典各收一次算 2 笔（早期实现用 `Set` 合并 key，把这一条当成了隐含需求，既没有文档也没有测试支持，且逼着每次统计都物化整批词典的 key 并集）；
+- 对每个候选统计 `key.contains(candidate)` 的条数（大小写不敏感），外层走一遍 key、内层比对全部候选；空候选直接给 0，否则 `contains('')` 会把全部 key 算进去；
 - 返回 `candidate -> count`。
+
+统计只读**词典 key 索引**（`lib/dictionary/fodict_key_index.dart`），不再解析辞典正文：内存 → `<词典目录>/_keys/<id>.keys` sidecar → 解析 `.dat` 重建，三条路径由便宜到昂贵。因此它不会再和字典分区抢那只有 2 条的正文 LRU（`test/fodict_key_index_test.dart` 用 `debugFodictFullDictionaryLoads` 断言统计一个字节都没碰释义）。细节与实测耗时见 `lib/dictionary/feature_logic.md`。
 
 统计是异步的，由 `SearchInput` 做 180 ms 防抖；候选首次显示不等待统计，统计完成后再重排非固定候选。重排时繁体／混排候选优先于简体／中性候选，各组内部再按命中数从大到小（见 4.4）。
 
@@ -677,7 +680,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - 没有标题条领头的正文，key 取开头到第一个句读的位置，句读集合是 `（ ( ： : 半形空格 全形空格 换行 《 。 ！ ？ ； ，`，上限 24 字（`_keywordMaxLength`）；正文前后的私人区装饰字（`U+E000–U+F8FF`）与空白先剥掉，否则会出现空 key；
 - 同名条目（一人有多篇传）不互相覆盖：key 冲突时继续取到下一个句读再试，仍冲突才丢弃该条；
 - 实测结果（本地 `cbeta-fodict/fodict`）：011 得到 3036 条、key 平均 15.4 字、最长 24 字；018 得到 10230 条、平均 14.5 字、最长 24 字。修改前 011 最长 key 是 14098 字（整篇《法显传》），搜「八戒」会命中昙延整篇传记作 key；
-- 影响：`searchByKey` 与 `countKeyMatches` 只扫描 key，所以正文用词（如「八戒」）不再进入候选面板的 `字典 N` 统计；`FodictService.search` 仍匹配 definition，全文检索能力没有丢。
+- 影响：`searchByKey` 与 `countKeyMatches` 只扫描 key，所以正文用词（如「八戒」）不再进入候选面板的 `字典 N` 统计；`FodictService.search` 仍匹配 definition，全文检索能力没有丢。候选统计走的 key 清单来自与 `searchByKey` **同一套解析规则**（`parseFodictKeys` 与 `parseFodictData` 共用 `_parseFodictEntries`），规则分叉会让统计和字典分区对不上，有测试钉住这件事。
 
 标准格式词典（001–030 其余各部）走 `_loadStandardFormat`，key 就是词典自带的字段，不受本节规则影响。
 
@@ -806,7 +809,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - 单字查询仍有服务端下限（约 3.5～4 秒），这是移除 `facet` 后剩下的时间，客户端无法再压缩；
 - 因此 `_loadKeywordResults` 采用 stale-while-revalidate：先发 `_searchAllInOne`，但只要 `_FullTextSearchCache.get(query)` 有上次的快照就立刻用它的 `results` / `nextStart` / `totalFound` / `totalTermHits` / `hasMore` 顶住画面（并把 `isLoading` 关掉），API 回来后整批取代并重新 `remember`；同一个字再查第二次时不再面对空白转圈；
 - `_FullTextSearchCache` 是静态 Map，测试之间会互相污染，所以提供 `debugReset()`，并由档案外的 `resetFullTextSearchCache()` 在 `setUp` 调用；
-- 词典候选统计（`countKeyMatches`）冷启动约 112 ms、热缓存约 7 ms，不是搜索慢的原因。
+- 词典候选统计（`countKeyMatches`）已改为只读 key 索引：首次建 sidecar 约 278 ms、之后重启约 30 ms、同进程重复统计约 12 ms（9 部词典、去重后 75302 条 key 实测；改写前冷启动约 435 ms）。它从来不是搜索慢的原因，改的理由是省掉「统计把辞典正文挤出 LRU → 字典分区重解析」这笔互相拖累的账。
 
 ### 11.6 逾时语义与经目本地回答
 
@@ -859,6 +862,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - `scrolling reveals the next offline result groups`：离线扫描先只渲染 20 部（第 25 部看不到），卷到底自动放行第二页；因为新放的卡片会把尾端按钮挤出画面，要多卷到底一次才会出现「收合多顯示的作品」；
 - `test/offline_scan_test.dart`：端到端的离线扫描 —— `OfflineScanSession` 的分块扫描、自行连续推进到全部卷、暂停后不再排下一块（已交出的那一块仍会跑完）、恢复后从中断处继续、没有本地经卷时立即结束；索引侧覆盖「首轮建索引、次轮直接重用 `.sidx`」「经卷内容更新后戳记失效并重建」「罕见字靠字符集跳卷，不读正文」；第二段覆盖「用 HTML 展开摘要，`snippet`/`sourceOffset` 与原文对得上、上下文不会把卷题扫进来」「展开完成后摘要取代待展开命中」；查询侧覆盖简体输入匹配繁体正文、查询有无标点空格都一样命中，以及 KWIC 摘要的省略号；没有档案路径的经卷（网页版）也在当前 isolate 扫，且不会去建 `cbeta_sidx/`；
 - `test/sidx_test.dart`：正規化规则（空白与标点闭集 191 码位、ASCII 小写）、跨行与重叠命中、`.sidx` 序列化往返（书名与悉曇 `code` 区间）、crc／版本不符判失效、字符集 delta+LEB128 往返、卷题/作译者/夹注/`No. xxxx [cf. ...]` 的排除、行定位表把命中换回 linehead、跳过区间重叠先合并，以及 `sidxSourceStamp` 隨檔案大小或修改時間改變；
+- `test/fodict_key_index_test.dart`：候选统计的新语义与 sidecar 生命周期 —— 同一术语在两部词典各算一笔（计数单位是条目）、大小写不影响命中、`.keys` 编解码往返（含带换行的 key）、戳记不符或档案截断判为不存在、`parseFodictKeys` 与整本解析抽出同一批 key、统计过程不载入含释义的整本（`debugFodictFullDictionaryLoads` 为 0）且重启后靠 sidecar 不再解析 `.dat`（`debugFodictKeyParses` 不增加）、sidecar 损坏时只有那一部回退重建、词典被删后重新列目录会清掉孤儿 `.keys`；
 - `in-volume search highlights ...`、`reader centers ...`、`reader clamps ...`、`reader aligns hits ...`：卷内搜索位移、跨校勘标记、偈颂与滚动对齐；`reader locates hits inside archive paragraph anchors` 用段落级锚点模拟离线下載经文，验证同段多处的关键词依 kwic 上下文定位，且「上一筆／下一筆」会分别置中不同命中；`reader jumps to the exact offline source offset` 验证离线 `sourceOffset` 直接命中第二处重复词、书签存下位移与 snippet；`online search results read the online volume without overwriting the downloaded copy` 验证线上结果优先读线上、且不覆盖本地已下载经卷；`offline scan offsets match the layout source across verse lines` 验证偈颂行之后的 `sourceOffset` 与 layout 来源一致。
 
 - 阅读页分块与跨块选取：`test/scripture_reader_blocks_test.dart` 覆盖 `buildScriptureReaderBlocks` 的 4000 字 / 12 行表格 / 24 行偈颂上限与「表格、偈颂不跨块」；`reader builds a table-heavy volume in lazy blocks` 验证首屏只构建画面内的块、滚出画面后回收；`lazy blocks concatenated reproduce the whole volume text` 验证逐块文字串起来与整卷 layout 完全一致；`reader selection spans lazy blocks for copy and citation` 用「全选 → 复制 / 复制引文」验证一次选取横跨首末两块，复制文字含两端、引文起止行号为 `p. 1a1-60`；
