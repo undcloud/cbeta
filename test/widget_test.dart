@@ -2685,6 +2685,58 @@ void main() {
     },
   );
 
+  testWidgets(
+    'homepage direct submit rewrites the field with the searched form',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await scriptureDisplaySettings.load();
+      await SimplifiedTraditionalConverter.load();
+      var keywordRequests = 0;
+      final client = MockClient((request) async {
+        if (request.url.path == '/stable/search/all_in_one') {
+          keywordRequests++;
+          return http.Response(
+            jsonEncode({
+              'num_found': 0,
+              'total_term_hits': 0,
+              'results': <Object>[],
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        if (request.url.path == '/stable/search/toc') {
+          return http.Response(
+            jsonEncode({'num_found': 0, 'results': <Object>[]}),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        return http.Response('{}', 404);
+      });
+
+      await http.runWithClient(() async {
+        await tester.pumpWidget(const CbetaSearchApp());
+        await tester.enterText(find.byType(TextField).first, '厂丑');
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.byTooltip('搜尋經文'));
+        await tester.pumpAndSettle();
+
+        expect(keywordRequests, 1);
+        final field = tester.widget<TextField>(find.byType(TextField).first);
+        expect(field.controller!.text, '廠丑');
+
+        await tester.tap(find.byTooltip('搜尋經文'));
+        await tester.pumpAndSettle();
+        expect(keywordRequests, 1);
+
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pumpAndSettle();
+      }, () => client);
+    },
+  );
+
   testWidgets('tapping the CBETA logo clears search results to the homepage', (
     tester,
   ) async {

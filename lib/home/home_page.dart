@@ -698,7 +698,16 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       }
     }
     if (!mounted || token != requestToken) return;
-    _lastSubmittedRawInput = rawInput;
+    // 未選候選時實際查詢詞是簡繁轉換的結果，輸入框若仍留原字，看起來就像搜的是
+    // 那幾個簡體字。同步成實際查詢詞，與點選候選後的行為一致。
+    if (query != searchController.text) {
+      searchController.value = TextEditingValue(
+        text: query,
+        selection: TextSelection.collapsed(offset: query.length),
+      );
+    }
+    // 攔截重複點擊的鍵必須是框裡最終的文字，否則轉換後再點一次會重跑三條管線。
+    _lastSubmittedRawInput = query;
     await _runKeywordSearch(query, token);
   }
 

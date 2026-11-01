@@ -495,6 +495,7 @@ Future<String> resolveSearchQuery(
 - 离线搜索是在网络请求失败后扫描本地经卷/经目，候选阶段仍然只看词表；离线正文命中用 `offlineKwicSnippet`（`lib/scripture/offline_scan.dart`）取关键词前后各一段（默认前 40、后 80 字，超出加省略号）作为上下文，而不是整行/整卷原文，避免像「发」这类高频字把整部经文塞进结果；离线扫描的细节见 11.4；
 - 所有 `SearchInput` 入口共用同一套候选生成与「点击只填充、不搜索」交互；
 - 首页搜索按钮传入的 `query` 为空，由待搜索选择或 `resolveSearchQuery` 决定；经目查询按钮由 `_searchToc` 使用待搜索选择或 `preferredQueryForInput`；
+- **未選候選直接提交時，輸入框同步成實際查詢詞**：`_executeSearch()` 解析出 `query` 後，若它與框裡文字不同（例：輸入簡體、實際搜繁體），把 `searchController` 改寫成 `query` 並游標置尾，避免框裡還是簡體、結果卻是繁體而誤以為搜的是原本那幾個字（與點選候選後填充輸入框的行為一致）。與此同時 `_lastSubmittedRawInput` 記錄的是最終框裡文字（`query`）而不是原始輸入，否則轉換後再點一次搜尋會被上一條的重复点击拦截放过、三條管線重跑；
 - AI 页面没有候选面板，直接使用 `convert` 的首选候选；
 - 首页 AI 模式下，空输入仍会显示历史；点击历史行后按搜索键会走 AI 分支，使用 `rawInput` 并忽略 `selectedQuery`，最终交给 AI 页的仍是原始输入；
 - 首页先判断 Goto、再判断 AI 模式，因此 Goto 表达式在 AI 模式下也会打开 Goto；
