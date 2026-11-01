@@ -4,7 +4,7 @@ import 'package:http/http.dart' as http;
 import '../cbeta_api_headers.dart';
 import '../scripture/cache.dart';
 import '../scripture/models.dart';
-import '../scripture/offline_scan.dart';
+import '../scripture/source_text.dart';
 import '../scripture/parser.dart';
 import '../search/goto.dart';
 import '../download/catalog_cache.dart';
@@ -57,6 +57,7 @@ List<Map<String, dynamic>> tocJuanEntries(Map<String, dynamic>? toc) {
 }
 
 String searchResultWorkId(ScriptureSearchResult result) {
+  if (result.workId.isNotEmpty) return result.workId;
   final passageWork = result.passages.firstOrNull?.work;
   if (passageWork != null && passageWork.isNotEmpty) return passageWork;
   final match = workIdPattern.firstMatch(result.title);

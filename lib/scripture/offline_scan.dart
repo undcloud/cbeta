@@ -1,20 +1,24 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart'
-    show ValueListenable, ValueNotifier, compute, kIsWeb;
+    show ValueListenable, ValueNotifier, kIsWeb;
 
+import '../search/conversion.dart';
 import 'cache.dart';
 import 'models.dart';
 import 'parser.dart';
+import 'sidx_norm.dart';
+import 'sidx_store.dart';
 import 'source_text.dart';
 
 final _whitespacePattern = RegExp(r'\s+');
-final _volumeTitleTailPattern = RegExp(r'卷[第]?[〇零一二三四五六七八九十百千兩0-9]+$');
 
-/// 一卷離線經文的定位資訊;`path` 为空時只能由主 isolate 透過 store 讀取。
+/// 一卷離線經文的定位資訊；`path` 為空時只能由主 isolate 透過 store 讀取。
 class OfflineScanTarget {
   const OfflineScanTarget({
     required this.work,
@@ -27,216 +31,424 @@ class OfflineScanTarget {
   final String path;
 }
 
-/// 交付掃描的一份工作:關鍵字、經卷清單,以及各部作品已下載的卷號。
+/// 交給背景掃描的一份工作：查詢候補與經卷清單。
+///
+/// `slotCandidates` 是「原字 ∪ 簡→繁候補」的逐字集合，已由 UI isolate 正規化並
+/// 展開；一般資料型別才能跨 isolate 傳遞，背景因此不需要載入簡繁表。
 class OfflineScanRequest {
   const OfflineScanRequest({
-    required this.needle,
+    required this.slotCandidates,
     required this.targets,
-    required this.juansByWork,
   });
 
-  final String needle;
+  final List<List<int>> slotCandidates;
   final List<OfflineScanTarget> targets;
-  final Map<String, List<int>> juansByWork;
+}
+
+/// 一部作品在本批掃描裡的離線命中。
+class OfflineWorkGroup {
+  const OfflineWorkGroup({
+    required this.work,
+    required this.title,
+    required this.hits,
+  });
+
+  final String work;
+  final String title;
+  final List<OfflineHit> hits;
 }
 
 class OfflineScanOutcome {
-  const OfflineScanOutcome({required this.results, required this.termHits});
+  const OfflineScanOutcome({
+    required this.groups,
+    required this.termHits,
+    required this.scannedVolumes,
+    this.builtIndexes = 0,
+  });
 
-  final List<ScriptureSearchResult> results;
+  final List<OfflineWorkGroup> groups;
   final int termHits;
+  final int scannedVolumes;
+
+  /// 本批中現場從 HTML 建出 `.sidx` 的卷數；首輪掃描後會一路降到 0。
+  final int builtIndexes;
+
+  static const OfflineScanOutcome empty = OfflineScanOutcome(
+    groups: [],
+    termHits: 0,
+    scannedVolumes: 0,
+  );
 }
 
 /// 是否可以交給背景 isolate。
 ///
-/// `flutter test` 的 fake-async 綁定不會推進真實 isolate 的回覆,因此測試
-/// 與網頁版一律走同一份同步實作,只少了 isolate 的跳板。
+/// `flutter test` 的 fake-async 綁定不會推進真實 isolate 的回覆，網頁版也沒有
+/// 檔案系統，兩種情況都走同一份實作，只少了 isolate 的跳板。
 bool offlineScanSupportsIsolate() =>
     !kIsWeb && !Platform.environment.containsKey('FLUTTER_TEST');
 
-/// 掃描一批經卷。背景 isolate 内完成讀檔、JSON 解碼、HTML 解析與匹配,
-/// UI isolate 只負責送出與接收,因此連續掃描不會擠掉任何一幀。
-Future<OfflineScanOutcome> runOfflineScan(OfflineScanRequest request) {
-  if (!offlineScanSupportsIsolate()) return _scanOfflineChunk(request);
-  return compute(_scanOfflineChunk, request);
+/// 把使用者輸入換成離線索引的查詢模式。
+///
+/// 索引側是繁體原樣，查詢只做「簡→繁候補」這一個方向；簡繁表 4064 條映射裡
+/// 只有 270 個字多義，絕大多數關鍵字每個槽位仍只有一個候補。
+QueryPattern buildOfflinePattern(String query) {
+  final runes = normalizedQueryRunes(query);
+  if (runes.isEmpty) return QueryPattern.fromSlotCandidates(const []);
+  return QueryPattern.fromSlotCandidates(
+    SimplifiedTraditionalConverter.traditionalCandidateRunes(
+      String.fromCharCodes(runes),
+    ),
+  );
 }
 
-Future<OfflineScanOutcome> _scanOfflineChunk(OfflineScanRequest request) async {
-  final needle = request.needle;
-  if (needle.isEmpty) {
-    return const OfflineScanOutcome(results: [], termHits: 0);
+/// 掃描一批經卷：讀檔、跳卷過濾與 BMH 比對都在拿到請求的 isolate 內完成。
+Future<OfflineScanOutcome> runOfflineScan(OfflineScanRequest request) async {
+  final pattern = QueryPattern.fromSlotCandidates(request.slotCandidates);
+  if (pattern.isBlank || request.targets.isEmpty) {
+    return OfflineScanOutcome.empty;
   }
-  final results = <ScriptureSearchResult>[];
+  final store = _indexStoreFor(request.targets);
+  final merged = <String, List<OfflineHit>>{};
+  final titles = <String, String>{};
   var termHits = 0;
+  var built = 0;
   for (final target in request.targets) {
-    final lines = await _readVolumeLines(target);
-    if (lines == null) continue;
-    final outcome = _scanVolumeLines(
-      target: target,
-      lines: lines,
-      needle: needle,
-      juansByWork: request.juansByWork,
-    );
-    results.addAll(outcome.results);
-    termHits += outcome.termHits;
-  }
-  return OfflineScanOutcome(results: results, termHits: termHits);
-}
-
-/// 經卷沒有可用檔案路徑時（網頁版存在 SharedPreferences）只能由主 isolate
-/// 讀取，再由同一份匹配邏輯产出結果。
-Future<OfflineScanOutcome> scanOfflineVolume(
-  OfflineScanTarget target,
-  String needle,
-  Map<String, List<int>> juansByWork,
-) async {
-  if (needle.isEmpty) return const OfflineScanOutcome(results: [], termHits: 0);
-  final volume = await scriptureVolumeStore.readRef(
-    ScriptureVolumeRef(work: target.work, juan: target.juan),
-  );
-  if (volume == null) return const OfflineScanOutcome(results: [], termHits: 0);
-  final lines = _parseVolumeLines(volume);
-  if (lines == null) return const OfflineScanOutcome(results: [], termHits: 0);
-  return _scanVolumeLines(
-    target: target,
-    lines: lines,
-    needle: needle,
-    juansByWork: juansByWork,
-  );
-}
-
-List<ScriptureLine>? _parseVolumeLines(CachedScriptureVolume volume) {
-  try {
-    return parseScriptureHtml(volume.html);
-  } catch (_) {
-    return null;
-  }
-}
-
-OfflineScanOutcome _scanVolumeLines({
-  required OfflineScanTarget target,
-  required List<ScriptureLine> lines,
-  required String needle,
-  required Map<String, List<int>> juansByWork,
-}) {
-  final title = localWorkTitle(lines);
-  final juans = juansByWork[target.work] ?? const <int>[];
-  final passages = <ScripturePassage>[];
-  var termHits = 0;
-  var sourceOffset = 0;
-  for (final line in lines) {
-    final lineRole = line.role;
-    if (lineRole != ScriptureLineRole.volumeTitle &&
-        lineRole != ScriptureLineRole.byline) {
-      final rawText = line.text;
-      final lower = rawText.toLowerCase();
-      final match = rawText.isEmpty ? -1 : lower.indexOf(needle);
-      if (match >= 0) {
-        termHits += _countOccurrences(lower, needle);
-        final displayText = rawText.replaceAll(_whitespacePattern, ' ').trim();
-        final linehead = line.linehead;
-        final lineLabel = linehead == null ? '' : linehead.split('_p').last;
-        passages.add(
-          ScripturePassage(
-            title: title.isEmpty ? target.work : title,
-            reference: [
-              '卷${target.juan}',
-              if (lineLabel.isNotEmpty) lineLabel,
-            ].join(' · '),
-            text: offlineKwicSnippet(displayText, needle),
-            linehead: linehead,
-            juan: target.juan,
-            work: target.work,
-            availableJuans: juans,
-            sourceOffset: sourceOffset + match,
-            snippet: rawText.substring(
-              match,
-              (match + needle.length).clamp(0, rawText.length),
-            ),
-          ),
-        );
-      }
-    }
-    sourceOffset += scriptureSourceAdvance(line);
-  }
-  if (passages.isEmpty) {
-    return const OfflineScanOutcome(results: [], termHits: 0);
+    final loaded = await _loadVolume(target, store, pattern);
+    if (loaded == null) continue;
+    built += loaded.built ? 1 : 0;
+    if (loaded.skipped) continue;
+    final volume = loaded.volume!;
+    final hits = <OfflineHit>[];
+    scanNormMatches(volume.bytes, pattern, (match) {
+      final line = volume.lineAt(match.byteStart);
+      hits.add(OfflineHit(juan: volume.juan, linehead: line?.linehead ?? ''));
+    });
+    if (hits.isEmpty) continue;
+    termHits += hits.length;
+    titles.putIfAbsent(volume.work, () => volume.title);
+    merged.putIfAbsent(volume.work, () => <OfflineHit>[]).addAll(hits);
   }
   return OfflineScanOutcome(
-    results: [
-      ScriptureSearchResult(
-        title: '${target.work} ${title.isEmpty ? '（離線經文）' : title}'.trim(),
-        description: '離線經文 · 命中 ${passages.length} 處',
-        passages: passages,
-      ),
+    groups: [
+      for (final entry in merged.entries)
+        OfflineWorkGroup(
+          work: entry.key,
+          title: titles[entry.key] ?? entry.key,
+          hits: entry.value,
+        ),
     ],
     termHits: termHits,
+    scannedVolumes: request.targets.length,
+    builtIndexes: built,
   );
 }
 
-Future<List<ScriptureLine>?> _readVolumeLines(OfflineScanTarget target) async {
-  if (target.path.isEmpty) return null;
-  try {
+ScriptureIndexStore _indexStoreFor(List<OfflineScanTarget> targets) {
+  for (final target in targets) {
+    if (target.path.isEmpty) continue;
+    // 經卷存在 `<支援目錄>/cbeta_scripture/`，索引目錄是它的同層兄弟，
+    // worker 裡沒有 path_provider，只能由路徑反推。
     final file = File(target.path);
-    if (!await file.exists()) return null;
-    final volume = CachedScriptureVolume.fromJson(
-      jsonDecode(await file.readAsString()) as Map<String, dynamic>,
+    final cacheDirectory = file.parent.parent;
+    return ScriptureIndexStore(directoryProvider: () async => cacheDirectory);
+  }
+  return scriptureIndexStore;
+}
+
+class _LoadedVolume {
+  const _LoadedVolume.found(this.volume, {required this.built});
+
+  /// 字符集已判定這一卷不可能命中：正文一個字節都沒讀。
+  const _LoadedVolume.skipped() : volume = null, built = false;
+
+  final SidxVolume? volume;
+  final bool built;
+
+  bool get skipped => volume == null;
+}
+
+/// 取一卷的可搜表示。`.sidx` 缺席或過期時就地重建，所以第一次掃描同時是回填，
+/// 之後每卷只剩「讀標頭與字符集 →（可能命中才）讀正文」。
+///
+/// 跳卷過濾必須发生在讀正文之前：字符集是繁體側且取全部候補的並集，交集為空
+/// 即可整卷跳過，簡體輸入不會被誤跳；過期的索引不能拿來跳卷（內容換了字集可能
+/// 變大），所以戳記不符時一律重建。
+Future<_LoadedVolume?> _loadVolume(
+  OfflineScanTarget target,
+  ScriptureIndexStore store,
+  QueryPattern pattern,
+) async {
+  // 戳記取自來源 `.json` 的 stat，一次系統呼叫就能判索引新舊；
+  // 沒有檔案路徑（網頁版）時不寫索引，戳記固定 0。
+  final stamp = target.path.isEmpty
+      ? 0
+      : (await sidxSourceStamp(target.path)) ?? 0;
+  if (target.path.isNotEmpty) {
+    final skip = await store.readSkipInfoAt(
+      work: target.work,
+      juan: target.juan,
     );
-    if (volume.work != target.work || volume.juan != target.juan) return null;
-    return parseScriptureHtml(volume.html);
+    if (skip != null && skip.sourceStamp == stamp) {
+      if (skip.canSkip(pattern.runeSet)) return const _LoadedVolume.skipped();
+      final volume = await store.readAt(
+        work: target.work,
+        juan: target.juan,
+        sourceStamp: stamp,
+      );
+      if (volume != null) {
+        return _LoadedVolume.found(volume, built: false);
+      }
+    }
+  }
+  final lines = await _readVolumeLines(target);
+  if (lines == null) return null;
+  final volume = buildSidxVolume(
+    work: target.work,
+    juan: target.juan,
+    sourceStamp: stamp,
+    lines: lines.lines,
+  );
+  if (target.path.isNotEmpty) {
+    await store.write(volume);
+  }
+  return _LoadedVolume.found(volume, built: true);
+}
+
+class _VolumeLines {
+  const _VolumeLines(this.lines);
+
+  final List<ScriptureLine> lines;
+}
+
+Future<_VolumeLines?> _readVolumeLines(OfflineScanTarget target) async {
+  final CachedScriptureVolume? volume;
+  if (target.path.isEmpty) {
+    // 網頁版的經卷存在 SharedPreferences，只能由主 isolate 讀。
+    volume = await scriptureVolumeStore.readRef(
+      ScriptureVolumeRef(work: target.work, juan: target.juan),
+    );
+    if (volume == null) return null;
+  } else {
+    try {
+      final file = File(target.path);
+      if (!await file.exists()) return null;
+      final decoded = CachedScriptureVolume.fromJson(
+        jsonDecode(await file.readAsString()) as Map<String, dynamic>,
+      );
+      if (decoded.work != target.work || decoded.juan != target.juan) {
+        return null;
+      }
+      volume = decoded;
+    } catch (_) {
+      return null;
+    }
+  }
+  try {
+    return _VolumeLines(parseScriptureHtml(volume.html));
   } catch (_) {
     return null;
   }
 }
 
-int _countOccurrences(String haystack, String needle) {
-  if (needle.isEmpty) return 0;
-  var count = 0;
-  var index = haystack.indexOf(needle);
-  while (index >= 0) {
-    count += 1;
-    index = haystack.indexOf(needle, index + needle.length);
+/// 經卷沒有檔案路徑時（網頁版）由主 isolate 逐卷讀，用同一份匹配邏輯产结果。
+Future<OfflineScanOutcome> scanOfflineVolume(
+  OfflineScanTarget target,
+  List<List<int>> slotCandidates,
+) => runOfflineScan(
+  OfflineScanRequest(slotCandidates: slotCandidates, targets: [target]),
+);
+
+/// 第二階段：把一部經的離線命中展開成可讀摘要。
+///
+/// 索引正文刪掉了標點，不能直接給人看；點開一部經時用 HTML 重新比對一次
+/// （實測約 4 ms/卷），摘要、行號與 `sourceOffset` 都取自帶標點的原文。
+Future<List<ScripturePassage>> expandOfflineWork({
+  required String work,
+  required List<OfflineHit> hits,
+  required String query,
+  List<int> availableJuans = const [],
+}) async {
+  if (hits.isEmpty) return const [];
+  final pattern = buildOfflinePattern(query);
+  if (pattern.isBlank) return const [];
+  final juans = (hits.map((hit) => hit.juan).toSet().toList())..sort();
+  final passages = <ScripturePassage>[];
+  for (final juan in juans) {
+    final volume = await scriptureVolumeStore.readRef(
+      ScriptureVolumeRef(work: work, juan: juan),
+    );
+    if (volume == null) continue;
+    final List<ScriptureLine> lines;
+    try {
+      lines = parseScriptureHtml(volume.html);
+    } catch (_) {
+      continue;
+    }
+    passages.addAll(
+      _passagesFromLines(
+        work: work,
+        juan: juan,
+        lines: lines,
+        pattern: pattern,
+        availableJuans: availableJuans,
+      ),
+    );
   }
-  return count;
+  return passages;
 }
+
+List<ScripturePassage> _passagesFromLines({
+  required String work,
+  required String juan,
+  required List<ScriptureLine> lines,
+  required QueryPattern pattern,
+  required List<int> availableJuans,
+}) {
+  final source = normalizeScriptureLines(lines);
+  final title = localWorkTitle(lines);
+  final display = _CollapsedText.build(source.normed.source);
+  final passages = <ScripturePassage>[];
+  var recordIndex = 0;
+  scanNormMatches(source.normed.bytes, pattern, (match) {
+    while (recordIndex + 1 < source.records.length &&
+        source.records[recordIndex + 1].byteOffset <= match.byteStart) {
+      recordIndex += 1;
+    }
+    final record = source.records[recordIndex];
+    if (record.byteOffset > match.byteStart) return;
+    final start = source.normed.sourceStart(match.byteStart);
+    final end = source.normed.sourceEnd(match.byteEnd);
+    final lineLabel = record.linehead.split('_p').last;
+    final window = display.windowFor(start, end);
+    final context = display.windowFor(
+      _islandStart(source.excluded, start),
+      _islandEnd(source.excluded, end, source.normed.source.length),
+    );
+    passages.add(
+      ScripturePassage(
+        title: title.isEmpty ? work : title,
+        reference: ['卷$juan', if (lineLabel.isNotEmpty) lineLabel].join(' · '),
+        text: offlineKwicSnippet(
+          display.text,
+          window.start,
+          window.end,
+          from: context.start,
+          to: context.end,
+        ),
+        linehead: record.linehead.isEmpty ? null : record.linehead,
+        juan: juan,
+        work: work,
+        availableJuans: availableJuans,
+        sourceOffset: start,
+        snippet: source.normed.source.substring(start, end),
+      ),
+    );
+  });
+  return passages;
+}
+
+/// 命中左側可以取上下文的起點：最後一個「在命中之前結束」的排除區間之末尾。
+int _islandStart(List<Int32List> excluded, int start) {
+  var left = 0;
+  for (final range in excluded) {
+    if (range[1] <= start && range[1] > left) left = range[1];
+  }
+  return left;
+}
+
+/// 命中右側可以取上下文的終點：第一個「在命中之後開始」的排除區間之開頭。
+int _islandEnd(List<Int32List> excluded, int end, int sourceLength) {
+  var right = sourceLength;
+  for (final range in excluded) {
+    if (range[0] >= end && range[0] < right) right = range[0];
+  }
+  return right;
+}
+
+/// 空白摺疊後的顯示文字，保留「來源位移 → 顯示位移」的對映表。
+class _CollapsedText {
+  const _CollapsedText(this.source, this.text, this._toDisplay);
+
+  final String source;
+  final String text;
+  final Int32List _toDisplay;
+
+  factory _CollapsedText.build(String source) {
+    final buffer = StringBuffer();
+    final map = Int32List(source.length + 1);
+    var index = 0;
+    while (index < source.length) {
+      final start = index;
+      if (_isSpace(source, index)) {
+        while (index < source.length && _isSpace(source, index)) {
+          index += 1;
+        }
+        buffer.write(' ');
+      } else {
+        buffer.write(source[index]);
+        index += 1;
+      }
+      for (var filled = start; filled < index; filled++) {
+        map[filled] = buffer.length;
+      }
+    }
+    for (var filled = source.length; filled < map.length; filled++) {
+      map[filled] = buffer.length;
+    }
+    return _CollapsedText(source, buffer.toString(), map);
+  }
+
+  /// 來源區間 [from, to) 在顯示文字裡的起訖位置（首尾空白不計入）。
+  ///
+  /// 摺疊後的空白會變成一個空格，摘要若正好從換行處開始就會多以一個空格開頭。
+  ({int start, int end}) windowFor(int from, int to) {
+    var left = from.clamp(0, source.length);
+    var right = to.clamp(left, source.length);
+    while (left < right && _isSpace(source, left)) {
+      left += 1;
+    }
+    while (right > left && _isSpace(source, right - 1)) {
+      right -= 1;
+    }
+    if (left >= right) {
+      final position = left <= 0 ? 0 : _toDisplay[left - 1];
+      return (start: position, end: position);
+    }
+    return (
+      start: left <= 0 ? 0 : _toDisplay[left - 1],
+      end: _toDisplay[right - 1],
+    );
+  }
+}
+
+bool _isSpace(String source, int index) =>
+    _whitespacePattern.hasMatch(source[index]);
 
 /// 取匹配詞前後的一段文字作為上下文摘要，避免離線結果顯示整段經文。
+///
+/// [from]／[to] 是上下文可以抵達的邊界（卷題、作譯者與夾注不屬於正文）；
+/// 停在邊界上時不加省略號，因為省略號代表的是刪掉的經文，不是結構標記。
 String offlineKwicSnippet(
   String text,
-  String needle, {
+  int start,
+  int end, {
   int before = 40,
   int after = 80,
+  int from = 0,
+  int? to,
 }) {
-  if (needle.isEmpty) return text;
-  final match = text.toLowerCase().indexOf(needle);
-  if (match < 0) return text;
-  final start = (match - before).clamp(0, text.length);
-  final end = math.min(match + needle.length + after, text.length);
+  if (text.isEmpty) return text;
+  final right = (to ?? text.length).clamp(0, text.length);
+  final left = math.min(from.clamp(0, text.length), right);
+  final match = math.max(start.clamp(left, right), left);
+  final matchEnd = math.max(end.clamp(left, right), match);
+  final sliceStart = math.max(match - before, left);
+  final sliceEnd = math.min(matchEnd + after, right);
   final buffer = StringBuffer();
-  if (start > 0) buffer.write('…');
-  buffer.write(text.substring(start, end));
-  if (end < text.length) buffer.write('…');
+  if (sliceStart > left) buffer.write('…');
+  buffer.write(text.substring(sliceStart, sliceEnd));
+  if (sliceEnd < right) buffer.write('…');
   return buffer.toString();
-}
-
-({String title, String byline}) localVolumeInfo(List<ScriptureLine> lines) {
-  String pick(ScriptureLineRole role) => lines
-      .firstWhere(
-        (line) => line.role == role && line.text.trim().isNotEmpty,
-        orElse: () => const ScriptureLine(text: ''),
-      )
-      .text
-      .trim();
-  return (
-    title: pick(ScriptureLineRole.volumeTitle),
-    byline: pick(ScriptureLineRole.byline),
-  );
-}
-
-String localWorkTitle(List<ScriptureLine> lines) {
-  final title = localVolumeInfo(lines).title;
-  final stripped = title.replaceFirst(_volumeTitleTailPattern, '').trim();
-  return stripped.isEmpty ? title : stripped;
 }
 
 /// 連續掃描的進度快照。
@@ -262,29 +474,36 @@ class OfflineScanProgress {
 
 /// 本地經卷的連續掃描會話。
 ///
-/// 一次只交出一小塊經卷給背景 isolate，掃描本身不佔用 UI isolate，因此
-/// [start] 之後會自行推進到掃完全部經卷，不需要使用者捲動或按按鈕觸發。
-/// 暫停、換字搜尋或離開頁面時以 [pause]／[dispose] 中止。
+/// 塊大小跟著每幀預算自適應：`.sidx` 就位後一卷只需兩次小讀加一次 BMH，塊會一路
+/// 長到千卷級，掃描自己推進到掃完，不需要捲動或按鈕。暫停、換字搜尋或離開頁面時
+/// 以 [pause]／[dispose] 中止。
 class OfflineScanSession {
   OfflineScanSession(this.query);
 
-  static const int volumesPerChunk = 10;
-  static const Duration _chunkGap = Duration(milliseconds: 12);
+  /// 第一塊的卷數；之後依實際耗時倍增或折半。
+  static const int volumesPerChunk = 24;
+  static const int maxVolumesPerChunk = 2000;
+  static const Duration _chunkGap = Duration(milliseconds: 4);
+  static const int _batchBudgetMicros = 8000;
 
   final String query;
-  final List<ScriptureSearchResult> _results = [];
   final ValueNotifier<OfflineScanProgress> _progress =
       ValueNotifier<OfflineScanProgress>(const OfflineScanProgress());
+  final Map<String, _MergedWork> _merged = {};
 
   List<ScriptureVolumeRef>? _refs;
   Map<String, List<int>> _juansByWork = const {};
+  List<List<int>> _slotCandidates = const [];
+  List<ScriptureSearchResult> _results = const [];
   int _cursor = 0;
   int _termHits = 0;
+  int _batchVolumes = volumesPerChunk;
   int _generation = 0;
   bool _paused = false;
   bool _scanning = false;
   bool _finished = false;
   bool _disposed = false;
+  OfflineScanPool? _pool;
 
   ValueListenable<OfflineScanProgress> get progress => _progress;
   OfflineScanProgress get current => _progress.value;
@@ -294,9 +513,18 @@ class OfflineScanSession {
   bool get finished => _finished;
   bool get scanning => _scanning;
 
+  List<int> juansFor(String work) => _juansByWork[work] ?? const [];
+
+  /// 待展開的命中（第一階段只有定位資訊）。
+  List<OfflineHit> pendingHitsFor(String work) =>
+      _merged[work]?.hits ?? const [];
+
   /// 列出本地經卷，按作品與卷號排序；同一會話只列一次。
   Future<void> prepare() async {
     if (_refs != null || _disposed) return;
+    _slotCandidates = buildOfflinePattern(
+      query,
+    ).slots.map((slot) => slot.toList()).toList();
     final refs = await scriptureVolumeStore.listRefs();
     refs.sort((left, right) {
       final byWork = left.work.compareTo(right.work);
@@ -328,47 +556,101 @@ class OfflineScanSession {
       }
       return false;
     }
-    final end = math.min(_cursor + volumesPerChunk, refs.length);
-    final needle = this.needle;
-    if (needle.isNotEmpty) {
-      final chunk = refs.sublist(_cursor, end);
-      final fromFiles = chunk
-          .where((ref) => (ref.path ?? '').isNotEmpty)
-          .map(
-            (ref) => OfflineScanTarget(
-              work: ref.work,
-              juan: ref.juan,
-              path: ref.path!,
-            ),
-          )
-          .toList();
-      if (fromFiles.isNotEmpty) {
-        final outcome = await runOfflineScan(
-          OfflineScanRequest(
-            needle: needle,
-            targets: fromFiles,
-            juansByWork: _juansByWork,
-          ),
-        );
-        _results.addAll(outcome.results);
-        _termHits += outcome.termHits;
-      }
-      // 網頁版的經卷存在 SharedPreferences，只能由主 isolate 逐卷讀。
-      for (final ref in chunk.where((ref) => (ref.path ?? '').isEmpty)) {
-        final outcome = await scanOfflineVolume(
-          OfflineScanTarget(work: ref.work, juan: ref.juan, path: ''),
-          needle,
-          _juansByWork,
-        );
-        _results.addAll(outcome.results);
-        _termHits += outcome.termHits;
-      }
+    if (_slotCandidates.isNotEmpty) {
+      final end = math.min(_cursor + _batchVolumes, refs.length);
+      final timer = Stopwatch()..start();
+      final outcome = await _runBatch(refs.sublist(_cursor, end));
+      timer.stop();
+      _merge(outcome);
+      _adaptBatch(timer.elapsedMicroseconds);
+      _cursor = end;
+    } else {
+      _cursor = refs.length;
     }
-    _cursor = end;
     if (_cursor >= refs.length) _finished = true;
     _notify();
     return true;
   }
+
+  Future<OfflineScanOutcome> _runBatch(List<ScriptureVolumeRef> chunk) {
+    final request = OfflineScanRequest(
+      slotCandidates: _slotCandidates,
+      targets: [
+        for (final ref in chunk)
+          OfflineScanTarget(
+            work: ref.work,
+            juan: ref.juan,
+            path: ref.path ?? '',
+          ),
+      ],
+    );
+    final pool =
+        offlineScanSupportsIsolate() && (chunk.first.path ?? '').isNotEmpty
+        ? (_pool ??= OfflineScanPool())
+        : null;
+    if (pool == null) return runOfflineScan(request);
+    return pool
+        .run(request, _workerCount)
+        .then(
+          (outcome) => outcome,
+          onError: (Object _) => runOfflineScan(request),
+        );
+  }
+
+  void _merge(OfflineScanOutcome outcome) {
+    _termHits += outcome.termHits;
+    for (final group in outcome.groups) {
+      _merged
+          .putIfAbsent(group.work, () => _MergedWork(group.title))
+          .hits
+          .addAll(group.hits);
+    }
+    _rebuildResults();
+  }
+
+  /// 第二階段展開完成後，用可讀摘要取代同一部經的待展開命中。
+  void applyPassages(String work, List<ScripturePassage> passages) {
+    final bucket = _merged[work];
+    if (bucket == null) return;
+    bucket.passages = passages;
+    // 命中清單只追加，所以「已展開的筆數」就是一個前綴；掃描後續新发现的命中
+    // 仍然留在 pendingHits 裡，下次展開時補上。
+    bucket.expandedHits = bucket.hits.length;
+    _rebuildResults();
+    _notify();
+  }
+
+  void _rebuildResults() {
+    _results = [
+      for (final entry in _merged.entries)
+        ScriptureSearchResult(
+          title: '${entry.key} ${entry.value.title}'.trim(),
+          description: '離線經文 · 命中 ${entry.value.hits.length} 處',
+          passages: entry.value.passages,
+          workId: entry.key,
+          // 命中清單會隨掃描增長；發布的是同一個清單，避免每塊複製整部經的命中。
+          pendingHits: _pendingFor(entry.value),
+        ),
+    ];
+  }
+
+  static List<OfflineHit> _pendingFor(_MergedWork work) {
+    final expanded = work.expandedHits;
+    if (expanded == 0) return work.hits;
+    final rest = work.hits.length - expanded;
+    return rest <= 0 ? const [] : work.hits.sublist(expanded);
+  }
+
+  /// 塊大小跟隨每幀預算：省下來的掃描時間直接換成更少的塊次數。
+  void _adaptBatch(int micros) {
+    if (micros < _batchBudgetMicros) {
+      _batchVolumes = math.min(maxVolumesPerChunk, _batchVolumes * 2);
+    } else if (micros > _batchBudgetMicros * 4) {
+      _batchVolumes = math.max(volumesPerChunk, _batchVolumes ~/ 2);
+    }
+  }
+
+  int get _workerCount => math.min(4, math.max(2, Platform.numberOfProcessors));
 
   /// 開始（或從暫停中恢復）連續掃描。
   void start() {
@@ -395,6 +677,8 @@ class OfflineScanSession {
     _disposed = true;
     _generation++;
     _scanning = false;
+    _pool?.dispose();
+    _pool = null;
     _progress.dispose();
   }
 
@@ -420,12 +704,213 @@ class OfflineScanSession {
     _progress.value = OfflineScanProgress(
       scannedVolumes: _cursor,
       totalVolumes: _refs?.length ?? 0,
-      results: List<ScriptureSearchResult>.of(_results),
+      results: _results,
       termHits: _termHits,
       scanning: _scanning,
       finished: _finished,
     );
   }
+}
+
+class _MergedWork {
+  _MergedWork(this.title);
+
+  final String title;
+  final List<OfflineHit> hits = [];
+  List<ScripturePassage> passages = const [];
+  int expandedHits = 0;
+}
+
+const int _commandScan = 1;
+
+/// 常駐掃描 worker 池。
+///
+/// `compute` 每一塊都要冷啟動一個 isolate（載入 isolate 組件、首次分配），
+/// 全藏兩萬多卷時這筆固定開銷比一卷的掃描還大；池把 worker 留著反覆用，並把
+/// 一塊工作切成每 worker 一份並行跑，吞吐接近線性提升。
+class OfflineScanPool {
+  OfflineScanPool() {
+    _replies.listen(_onReply);
+  }
+
+  final ReceivePort _replies = ReceivePort();
+  final List<_ScanWorker> _workers = [];
+  final List<Future<_ScanWorker>> _starting = [];
+  final Map<int, Completer<OfflineScanOutcome>> _pending = {};
+  bool _disposed = false;
+  int _nextId = 1;
+
+  /// 把一份請求切成至多 [workerCount] 份並行執行，合併後回傳。
+  Future<OfflineScanOutcome> run(
+    OfflineScanRequest request,
+    int workerCount,
+  ) async {
+    if (_disposed || request.targets.isEmpty) return runOfflineScan(request);
+    final parts = math.min(
+      workerCount,
+      math.max(1, request.targets.length ~/ 8),
+    );
+    if (parts < 2) return runOfflineScan(request);
+    await _ensureWorkers(parts);
+    if (_disposed) return runOfflineScan(request);
+    final size = (request.targets.length + parts - 1) ~/ parts;
+    final futures = <Future<OfflineScanOutcome>>[];
+    for (var part = 0; part < parts; part++) {
+      final start = part * size;
+      if (start >= request.targets.length) break;
+      final end = math.min(start + size, request.targets.length);
+      futures.add(
+        _dispatch(
+          _workers[part],
+          OfflineScanRequest(
+            slotCandidates: request.slotCandidates,
+            targets: request.targets.sublist(start, end),
+          ),
+        ),
+      );
+    }
+    var termHits = 0;
+    var scanned = 0;
+    var built = 0;
+    final groups = <OfflineWorkGroup>[];
+    for (final outcome in await Future.wait(futures)) {
+      termHits += outcome.termHits;
+      scanned += outcome.scannedVolumes;
+      built += outcome.builtIndexes;
+      groups.addAll(outcome.groups);
+    }
+    return OfflineScanOutcome(
+      groups: _mergeGroups(groups),
+      termHits: termHits,
+      scannedVolumes: scanned,
+      builtIndexes: built,
+    );
+  }
+
+  Future<OfflineScanOutcome> _dispatch(
+    _ScanWorker worker,
+    OfflineScanRequest request,
+  ) {
+    final id = _nextId++;
+    final completer = Completer<OfflineScanOutcome>();
+    _pending[id] = completer;
+    worker.commandPort.send(<Object?>[
+      _commandScan,
+      _replies.sendPort,
+      id,
+      request,
+    ]);
+    return completer.future.timeout(
+      const Duration(seconds: 120),
+      onTimeout: () {
+        _pending.remove(id);
+        return OfflineScanOutcome.empty;
+      },
+    );
+  }
+
+  void _onReply(dynamic message) {
+    if (message is! List || message.length != 2) return;
+    final completer = _pending.remove(message[0]);
+    if (completer == null || completer.isCompleted) return;
+    completer.complete(message[1] as OfflineScanOutcome);
+  }
+
+  Future<void> _ensureWorkers(int count) async {
+    while (_workers.length < count && !_disposed) {
+      if (_starting.length <= _workers.length) {
+        _starting.add(_ScanWorker.spawn());
+      }
+      final worker = await _starting[_workers.length];
+      if (_disposed) {
+        worker.dispose();
+        return;
+      }
+      _workers.add(worker);
+    }
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    for (final worker in _workers) {
+      worker.dispose();
+    }
+    _workers.clear();
+    _replies.close();
+    for (final completer in _pending.values) {
+      if (!completer.isCompleted) completer.complete(OfflineScanOutcome.empty);
+    }
+    _pending.clear();
+  }
+}
+
+List<OfflineWorkGroup> _mergeGroups(List<OfflineWorkGroup> groups) {
+  final order = <String>[];
+  final merged = <String, List<OfflineHit>>{};
+  final titles = <String, String>{};
+  for (final group in groups) {
+    if (!merged.containsKey(group.work)) {
+      order.add(group.work);
+      merged[group.work] = <OfflineHit>[];
+      titles[group.work] = group.title;
+    }
+    merged[group.work]!.addAll(group.hits);
+  }
+  return [
+    for (final work in order)
+      OfflineWorkGroup(work: work, title: titles[work]!, hits: merged[work]!),
+  ];
+}
+
+class _ScanWorker {
+  _ScanWorker(this.commandPort, this._isolate);
+
+  final SendPort commandPort;
+  final Isolate _isolate;
+
+  static Future<_ScanWorker> spawn() async {
+    final handshake = ReceivePort();
+    final completer = Completer<SendPort>();
+    handshake.listen((dynamic message) {
+      completer.complete(message as SendPort);
+      handshake.close();
+    });
+    final isolate = await Isolate.spawn<SendPort>(
+      _workerEntry,
+      handshake.sendPort,
+      debugName: 'cbeta-offline-scan',
+    );
+    return _ScanWorker(await completer.future, isolate);
+  }
+
+  void dispose() {
+    try {
+      _isolate.kill(priority: Isolate.immediate);
+    } catch (_) {
+      // 已經自己死掉的 worker 不需要再殺。
+    }
+  }
+}
+
+void _workerEntry(SendPort control) {
+  final port = RawReceivePort();
+  control.send(port.sendPort);
+  port.handler = (dynamic message) {
+    if (message is! List || message.length != 4 || message[0] != _commandScan) {
+      return;
+    }
+    final reply = message[1] as SendPort;
+    final id = message[2] as int;
+    final request = message[3] as OfflineScanRequest;
+    unawaited(
+      runOfflineScan(request).then(
+        (outcome) => reply.send(<Object?>[id, outcome]),
+        onError: (Object _, StackTrace _) =>
+            reply.send(<Object?>[id, OfflineScanOutcome.empty]),
+      ),
+    );
+  };
 }
 
 int _juanNumber(ScriptureVolumeRef ref) => int.tryParse(ref.juan) ?? 0;

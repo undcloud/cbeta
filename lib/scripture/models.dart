@@ -29,16 +29,21 @@ enum ScriptureLineRole { regular, volumeTitle, byline, navigationAnchor }
 enum ScriptureScriptFamily { siddam, ranjana }
 
 /// 悉曇／蘭札等特殊字體的文字區間（以 `text` 的 UTF-16 位移計）。
+///
+/// [reference] 是 CBETA 的 `code`（例如 `SD-A5A9`）；正文裡留的是形似漢字殼字，
+/// 別名層（依 `code` 或羅馬转寫檢索）以後只加不改，索引不必重建。
 class ScriptureScriptRun {
   const ScriptureScriptRun({
     required this.offset,
     required this.length,
     required this.family,
+    this.reference = '',
   });
 
   final int offset;
   final int length;
   final ScriptureScriptFamily family;
+  final String reference;
 }
 
 class ScriptureImage {
@@ -141,14 +146,43 @@ class ScripturePassage {
   }
 }
 
+/// 離線索引第一階段的命中：只保留定位用的最小資訊。
+///
+/// 正文索引是無標點的座標系，可讀摘要要等第二階段用 HTML 重新比對才有，
+/// 所以全藏掃描只交出 (作品, 卷, 行號)，點開某部經時再展開。
+class OfflineHit {
+  const OfflineHit({required this.juan, required this.linehead});
+
+  final String juan;
+  final String linehead;
+}
+
 class ScriptureSearchResult {
   const ScriptureSearchResult({
     required this.title,
     required this.description,
     required this.passages,
+    this.workId = '',
+    this.pendingHits = const [],
   });
 
   final String title;
   final String description;
   final List<ScripturePassage> passages;
+
+  /// 離線分組的作品 id；正文尚未展開時仍要能認得是哪一部經。
+  final String workId;
+
+  /// 尚未展開成可讀摘要的命中（離線第一段掃描的產物）。
+  final List<OfflineHit> pendingHits;
+
+  bool get isDeferred => passages.isEmpty && pendingHits.isNotEmpty;
+
+  ScriptureSearchResult withPassages(List<ScripturePassage> resolved) =>
+      ScriptureSearchResult(
+        title: title,
+        description: description,
+        passages: resolved,
+        workId: workId,
+      );
 }

@@ -256,6 +256,26 @@ class SimplifiedTraditionalConverter {
     return segments;
   }
 
+  /// 逐字取「原字 ∪ 簡→繁候選」，供離線索引的候補集合匹配。
+  ///
+  /// 索引側是繁體原樣、零簡繁轉換，多義只在查詢側展開：4064 條映射裡 3794 個字
+  /// 只有一個候選，掃描時絕大多數關鍵字走整串 BMH，不會因多義退化成逐字比對。
+  /// 只取單字候選（詞組映射是多字串，放不進逐槽模型），原字一律保留，所以繁体
+  /// 輸入即使不在表中也照樣匹配。
+  static List<List<int>> traditionalCandidateRunes(String input) {
+    final slots = <List<int>>[];
+    for (final rune in input.runes) {
+      final characters = String.fromCharCode(rune);
+      final candidates = <int>{rune};
+      for (final candidate in _mapping[characters] ?? const <String>[]) {
+        final candidateRunes = candidate.runes.toList();
+        if (candidateRunes.length == 1) candidates.add(candidateRunes.single);
+      }
+      slots.add(candidates.toList());
+    }
+    return slots;
+  }
+
   /// 原命中文字：簡體／混合輸入沿用原有的「簡→繁」首選；
   /// 繁體／共用字輸入則以原輸入為命中結果。
   static String _preferredText(String input, ScriptKind scriptKind) {

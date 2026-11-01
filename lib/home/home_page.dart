@@ -86,6 +86,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   /// 正文搜尋結果中當前展開的 work key，用於實現互斥展開。
   String? _expandedWorkKey;
 
+  /// 正在做第二階段展開的作品，避免連續點擊同一部經重複解析。
+  final Set<String> _expandingOfflineWorks = {};
+
   /// 主頁字典搜尋結果中當前展開的詞典 ID，用於實現互斥展開。
   final Set<String> _expandedDictionaryIds = {};
 
@@ -896,6 +899,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     _offlinePublishTimer?.cancel();
     _offlinePublishTimer = null;
     _pendingOfflineProgress = null;
+    _expandingOfflineWorks.clear();
     _offlineScanPausedByUser = false;
     _offlineScanPausedByLifecycle = false;
     final session = offlineSearchSession;
@@ -918,6 +922,33 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         session.resume();
       }
     });
+  }
+
+  /// 第一階段只掃出（作品, 卷, 行號）；點開一部經時用 HTML 再比對一次，
+  /// 摘要與 `sourceOffset` 都取自帶標點的原文。
+  void _expandOfflineHits(ScriptureSearchResult result) {
+    final session = offlineSearchSession;
+    final work = result.workId;
+    if (session == null || work.isEmpty || result.pendingHits.isEmpty) return;
+    if (!_expandingOfflineWorks.add(work)) return;
+    unawaited(() async {
+      try {
+        final passages = await expandOfflineWork(
+          work: work,
+          hits: session.pendingHitsFor(work),
+          query: session.query,
+          availableJuans: session.juansFor(work),
+        );
+        if (!mounted) return;
+        if (identical(offlineSearchSession, session)) {
+          session.applyPassages(work, passages);
+        }
+      } catch (_) {
+        // 展開失敗就維持在「只有行號」的狀態，使用者可以再點一次。
+      } finally {
+        _expandingOfflineWorks.remove(work);
+      }
+    }());
   }
 
   void _onOfflineScanProgress() {
@@ -1832,6 +1863,8 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         ..write(resultWorkKey(result))
         ..write('#')
         ..write(result.passages.length)
+        ..write('/')
+        ..write(result.pendingHits.length)
         ..write('|');
     }
     final text = signature.toString();
@@ -1997,6 +2030,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
             setState(() {
               _expandedWorkKey = expanded ? workKey : null;
             });
+            if (expanded) _expandOfflineHits(result);
           },
           onPassageTap: (passage, passages) {
             Navigator.of(context)

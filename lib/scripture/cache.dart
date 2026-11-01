@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../cbeta_api_headers.dart';
+import 'sidx_store.dart';
 
 class CachedScriptureVolume {
   const CachedScriptureVolume({
@@ -182,6 +183,8 @@ class ScriptureVolumeStore {
       '${directory.path}${Platform.pathSeparator}$fileKey.json',
     );
     await file.writeAsString(stored, flush: true);
+    // 經卷是真相源，`.sidx` 只是派生物；內容換了就丟，下次掃描重建。
+    await scriptureIndexStore.deleteAt(work: volume.work, juan: volume.juan);
   }
 
   Future<List<CachedScriptureVolume>> list() async {
@@ -238,6 +241,7 @@ class ScriptureVolumeStore {
         await entity.delete();
       }
     }
+    await scriptureIndexStore.clearAll();
   }
 }
 

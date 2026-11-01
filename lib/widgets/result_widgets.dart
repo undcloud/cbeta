@@ -292,6 +292,8 @@ class CatalogSearchMatch extends StatelessWidget {
 }
 
 String resultWorkKey(ScriptureSearchResult result) {
+  // 離線第一階段還沒有 passages，靠 workId 認得是哪一部經。
+  if (result.workId.isNotEmpty) return result.workId;
   final work = result.passages.isEmpty
       ? ''
       : (result.passages.first.work ?? '');
@@ -305,10 +307,14 @@ List<ScriptureSearchResult> groupResultsByWork(
   final order = <String>[];
   final titles = <String, String>{};
   final descriptions = <String, String>{};
+  final workIds = <String, String>{};
   final passages = <String, List<ScripturePassage>>{};
+  final pending = <String, List<OfflineHit>>{};
   for (final result in results) {
     final key = resultWorkKey(result);
     final bucket = passages[key];
+    workIds.putIfAbsent(key, () => result.workId);
+    pending.putIfAbsent(key, () => <OfflineHit>[]).addAll(result.pendingHits);
     if (bucket == null) {
       order.add(key);
       passages[key] = List.of(result.passages);
@@ -325,6 +331,8 @@ List<ScriptureSearchResult> groupResultsByWork(
         title: titles[key]!,
         description: descriptions[key]!,
         passages: passages[key]!,
+        workId: workIds[key]!,
+        pendingHits: pending[key]!,
       ),
   ];
 }
@@ -437,6 +445,22 @@ class _WorkStickyHeaderState extends State<WorkStickyHeader>
         order.add(juan);
       }
       groups[juan]!.add(passage);
+    }
+    if (order.isEmpty) {
+      // 離線第一段掃描只有行號，點開才用 HTML 展開摘要。
+      final pending = widget.result.pendingHits.length;
+      return [
+        if (pending > 0)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            child: Text(
+              '找到 $pending 處命中，正在載入經文摘要…',
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF687671)),
+            ),
+          ),
+      ];
     }
     return [
       for (final juan in order)

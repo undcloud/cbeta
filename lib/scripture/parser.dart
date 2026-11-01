@@ -134,6 +134,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
                 ),
                 length: run.length,
                 family: run.family,
+                reference: run.reference,
               ),
             ),
           ),
@@ -281,6 +282,9 @@ List<ScriptureLine> parseScriptureHtml(String source) {
             family: node.classes.contains('siddam')
                 ? ScriptureScriptFamily.siddam
                 : ScriptureScriptFamily.ranjana,
+            // code 是 CBETA 的悉曇碼位（SD-A5A9）；先存進索引的引用池,
+            // 日後要按碼位或羅馬转寫檢索時不必重建索引。
+            reference: (node.attributes['code'] ?? '').trim(),
           ),
         );
       }

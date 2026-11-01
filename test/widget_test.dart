@@ -1886,10 +1886,18 @@ void main() {
       await tester.pumpAndSettle();
 
       // 連續掃描自己推進到掃完,不需要任何捲動或按鈕觸發。
-      expect(find.text('已載入全部 70 筆結果'), findsOneWidget);
+      // 掃完後離線模式不再顯示「載入更多」頁尾,改由結果統計列交代筆數。
+      expect(find.text('「般若波羅蜜」搜尋結果：找到 70 筆結果，共 70 處出現'), findsOneWidget);
       expect(find.textContaining('離線模式'), findsWidgets);
       // 數百筆結果只渲染前 20 部作品,避免點擊最後一卷時整串卡片跟著重畫。
-      expect(find.text('顯示更多作品（剩餘 50 部）'), findsOneWidget);
+      expect(find.textContaining('測試經21'), findsNothing);
+      // 捲到底就自動放行下一頁作品,不需要再按按鈕。
+      await tester.drag(
+        find.byType(CustomScrollView).first,
+        const Offset(0, -10000),
+      );
+      await tester.pumpAndSettle();
+      expect(find.textContaining('測試經21'), findsWidgets);
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pumpAndSettle();
@@ -1931,16 +1939,19 @@ void main() {
       await tester.tap(find.byTooltip('搜尋經文'));
       await tester.pumpAndSettle();
 
-      expect(find.text('已載入全部 30 筆結果'), findsOneWidget);
-      expect(find.text('顯示更多作品（剩餘 10 部）'), findsOneWidget);
+      expect(find.text('「般若波羅蜜」搜尋結果：找到 30 筆結果，共 30 處出現'), findsOneWidget);
+      // 一次只渲染前 20 部作品；分頁按鈕在清單尾端，要捲到底才看得到。
       expect(find.textContaining('測試經25'), findsNothing);
 
-      // 捲到底就自動放行下一頁作品,不需要再按按鈕。
-      await tester.drag(
-        find.byType(CustomScrollView).first,
-        const Offset(0, -10000),
-      );
-      await tester.pumpAndSettle();
+      // 捲到底就自動放行下一頁作品,不需要再按按鈕；放行後清單變長，
+      // 再捲一次才到得了尾端的「收合」按鈕。
+      for (var round = 0; round < 2; round++) {
+        await tester.drag(
+          find.byType(CustomScrollView).first,
+          const Offset(0, -10000),
+        );
+        await tester.pumpAndSettle();
+      }
 
       expect(find.text('收合多顯示的作品'), findsOneWidget);
       expect(
