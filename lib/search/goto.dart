@@ -9,12 +9,16 @@ String extractCbetaGotoQuery(String input) {
 
 String normalizeCbetaGotoLinehead(String input) {
   final linehead = RegExp(
-    r'\b([A-Z]\d{1,3})\s*,?\s*no\.?\s*(\d+)\s*,?\s*p{1,2}\.?\s*([a-z]?)(\d{1,4})([a-z])(\d{1,2})',
+    r'\b([A-Z]+\d{1,3})\s*,?\s*no\.?\s*(\d+[A-Z]?)\s*,?\s*p{1,2}\.?\s*([a-z]?)(\d{1,4})([a-z])(\d{1,2})',
     caseSensitive: false,
   ).firstMatch(input);
   if (linehead == null) return input.trim();
+  // 經號可能是 `1509A` 這類「數字＋別本字母」，補零只能補在數字段，
+  // 否則 `3A` 會被補成 `003A` 而不是 `0003A`。
+  final sutra = linehead.group(2)!.toUpperCase();
+  final digits = RegExp(r'^\d+').matchAsPrefix(sutra)!.group(0)!;
   return '${linehead.group(1)!.toUpperCase()}n'
-      '${linehead.group(2)!.padLeft(4, '0')}_p'
+      '${digits.padLeft(4, '0')}${sutra.substring(digits.length)}_p'
       '${linehead.group(3)!.toLowerCase()}'
       '${linehead.group(4)!.padLeft(linehead.group(3)!.isEmpty ? 4 : 3, '0')}'
       '${linehead.group(5)!.toLowerCase()}'
@@ -24,6 +28,6 @@ String normalizeCbetaGotoLinehead(String input) {
 bool isCbetaGotoExpression(String input) {
   final candidate = normalizeCbetaGotoLinehead(extractCbetaGotoQuery(input));
   return RegExp(
-    r'^[A-Z]\d{1,3}n\d{4}_p[a-z]?\d{3,4}[a-z]\d{2}$',
+    r'^[A-Z]+\d{1,3}n\d{4}[A-Z]?_p[a-z]?\d{3,4}[a-z]\d{2}$',
   ).hasMatch(candidate);
 }

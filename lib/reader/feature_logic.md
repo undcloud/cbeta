@@ -33,7 +33,14 @@
 ## reader_citations.dart
 
 - `formatSelectedPassageForCopy`：把选区拼成 CBETA 引文格式
-  （页/栏/行，如 `T01n0001_p0001a01`，起止同页同栏时折叠）；
+  （页/栏/行，如 `T01n0001_p0001a01`，起止同页同栏时折叠）；行号解析用
+  `citationLineheadPattern`（`lib/common/text_patterns.dart`），形態靠齊
+  CBReader2X `cbreader.js` 的 `_parser_linehead`：藏別前綴可多字母
+  （`GA040n0040_p0002a01`）、`_p` 的底線可省（`T54n2133Ap1190a13`）、頁碼可帶
+  字母前綴（`B36n0198_ph017a02`）；頁碼與行號用 `_stripCitationPadding` 去前導
+  零（字母留在零之前，才與 `normalizeCbetaGotoLinehead` 的補零往返一致）。
+  解析不到時整段引文退回只有 `(CBETA 2026.R1)`，卷號/經號/頁碼一併遺失，
+  所以新增藏別或頁碼形態只要正則沒放寬就會默默變成「沒有編號」；
 - `copySelectedPassage` / `loadSelectionLineheads` / `loadSectionTitle`：
   选区行号与品名读取；`decodeCitationHtml` 清 `<br>`/标签。
 

@@ -187,15 +187,23 @@ String formatSelectedPassageForCopy(
   return '《${passage.title}》$volume$section：「\n$selectedText」$citation';
 }
 
-({String volume, String number, int page, String column, int line})?
+({String volume, String number, String page, String column, String line})?
 _citationLocation(String? linehead) {
   final match = citationLineheadPattern.firstMatch(linehead ?? '');
   if (match == null) return null;
   return (
     volume: match.group(1)!,
     number: match.group(2)!,
-    page: int.parse(match.group(3)!),
+    page: _stripCitationPadding(match.group(3)!),
     column: match.group(4)!,
-    line: int.parse(match.group(5)!),
+    line: _stripCitationPadding(match.group(5)!),
   );
+}
+
+/// `0154`→`154`、`h017`→`h17`、`01`→`1`：字母前綴必須留在零前面，
+/// 否則這段引文再貼回 Goto 時會補錯零。
+String _stripCitationPadding(String value) {
+  final match = citationPaddingZeroPattern.matchAsPrefix(value);
+  if (match == null) return value;
+  return '${match.group(1)}${value.substring(match.end)}';
 }

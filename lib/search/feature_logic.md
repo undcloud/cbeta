@@ -508,8 +508,10 @@ Future<String> resolveSearchQuery(
 相关函数在 `goto.dart`：
 
 1. `extractCbetaGotoQuery`：如果输入中包含括号包裹的 `CBETA ...` 引文，取括号内内容；否则取去除首尾空白的原文；
-2. `normalizeCbetaGotoLinehead`：把 `CBETA 2026.R2, T01, no. 3, pp. 154c20` 之类的引文规范成 `T01n0003_p0154c20`；支持带 `h` 的页码前缀；
+2. `normalizeCbetaGotoLinehead`：把 `CBETA 2026.R2, T01, no. 3, pp. 154c20` 之类的引文规范成 `T01n0003_p0154c20`；形態靠齊 CBReader2X `cbreader.js` 的 `_parser_linehead`：藏別前綴可多字母（`GA040`）、頁碼可帶字母前綴（`p. h17a2` → `ph017a02`）、經號可帶別本字母（`no. 1509A` → `1509A`，補零只補數字段，`3A` → `0003A`）；
 3. `isCbetaGotoExpression`：用规范化后的正则判断是否命中 `卷号n经号_p页码行号` 形式。
+
+不變式：閱讀器「複製引文」輸出的 `(CBETA ..., <卷>, no. <號>, p. <頁欄行>)` 再貼回首頁，必須被 `normalizeCbetaGotoLinehead` 還原成同一個行號（`reader_citations.dart` 的 `_stripCitationPadding` 去零與這裡的補零互為逆操作），兩側任一邊放寬規則時都要補一條往返測試。
 
 执行规则：
 
@@ -523,6 +525,8 @@ Future<String> resolveSearchQuery(
 ```text
 CBETA 2026.R2, B22, no. 117, p. 5a1 → B22n0117_p0005a01
 CBETA 2026.R2, B36, no. 198, p. h17a2 → B36n0198_ph017a02
+CBETA 2026.R1, GA040, no. 0040, p. 1a1 → GA040n0040_p0001a01（雙字母藏別）
+CBETA 2026.R1, T25, no. 1509A, p. 416c18 → T25n1509A_p0416c18（別本字母經號）
 T02n0102_p0499c28 → 命中 Goto
 博伽梵歌 → 不命中 Goto
 ```

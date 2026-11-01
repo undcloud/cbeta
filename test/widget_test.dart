@@ -1396,6 +1396,71 @@ void main() {
     );
   });
 
+  test('citation keeps numbering for two-letter canon works', () {
+    const passage = ScripturePassage(
+      title: '平山堂圖志',
+      reference: '',
+      text: '北',
+      linehead: 'GA040n0040_p0002a01',
+      juan: '1',
+    );
+
+    expect(
+      formatSelectedPassageForCopy(passage, '北'),
+      '《平山堂圖志》卷1：「\n北」'
+      '(CBETA 2026.R1, GA040, no. 0040, p. 2a1)',
+    );
+  });
+
+  test(
+    'citation keeps numbering for letter pages and unpunctuated lineheads',
+    () {
+      const hPage = ScripturePassage(
+        title: '博伽梵歌',
+        reference: '',
+        text: '原人歌',
+        linehead: 'B36n0198_ph017a02',
+        juan: '1',
+      );
+
+      expect(
+        formatSelectedPassageForCopy(hPage, '原人歌'),
+        '《博伽梵歌》卷1：「\n原人歌」'
+        '(CBETA 2026.R1, B36, no. 0198, p. h17a2)',
+      );
+
+      // 梵語千字文這類行號在經號與 p 之間沒有底線（parser 之外來的資料也可能如此）。
+      const joined = ScripturePassage(
+        title: '梵語千字文',
+        reference: '',
+        text: '阿',
+        linehead: 'T54n2133Ap1190a13',
+        juan: '1',
+      );
+
+      expect(
+        formatSelectedPassageForCopy(joined, '阿'),
+        '《梵語千字文》卷1：「\n阿」'
+        '(CBETA 2026.R1, T54, no. 2133A, p. 1190a13)',
+      );
+
+      // 引文貼回首页 Goto 必须还原成同一个行号（补零与去零要往返一致）。
+      expect(
+        normalizeCbetaGotoLinehead(
+          extractCbetaGotoQuery(formatSelectedPassageForCopy(hPage, '原人歌')),
+        ),
+        'B36n0198_ph017a02',
+      );
+      expect(
+        normalizeCbetaGotoLinehead(
+          extractCbetaGotoQuery(formatSelectedPassageForCopy(joined, '阿')),
+        ),
+        'T54n2133A_p1190a13',
+      );
+      expect(isCbetaGotoExpression('T54n2133A_p1190a13'), isTrue);
+    },
+  );
+
   test('Goto extracts CBETA citations from surrounding copied text', () {
     expect(
       extractCbetaGotoQuery(
@@ -1427,6 +1492,20 @@ void main() {
       isTrue,
     );
     expect(isCbetaGotoExpression('博伽梵歌'), isFalse);
+    // GA 之类双字母藏别（《平山堂圖志》GA040n0040）也要能解析、能跳。
+    expect(
+      normalizeCbetaGotoLinehead('CBETA 2026.R1, GA040, no. 0040, p. 1a1'),
+      'GA040n0040_p0001a01',
+    );
+    expect(
+      isCbetaGotoExpression('CBETA 2026.R1, GA040, no. 0040, p. 1a1'),
+      isTrue,
+    );
+    // 別本字母經號：補零只補數字段（3A → 0003A）。
+    expect(
+      normalizeCbetaGotoLinehead('CBETA 2026.R1, T25, no. 3A, p. 416c18'),
+      'T25n0003A_p0416c18',
+    );
     expect(
       extractCbetaGotoQuery('（CBETA 2026.R2, B22, no. 117, p. 5a1）'),
       'CBETA 2026.R2, B22, no. 117, p. 5a1',
