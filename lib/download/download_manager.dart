@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import '../scripture/cache.dart';
+import '../scripture/offline_scan.dart';
 import 'api_rate_limiter.dart';
 import 'catalog_cache.dart';
 import 'download_models.dart';
@@ -18,6 +19,7 @@ class DownloadManager extends ChangeNotifier {
   final Future<String?> Function(String work) _releaseVersionLoader;
   final List<DownloadGroup> _queue = [];
   final Map<String, LocalVersion> _versions = {};
+  final List<String> _failedWorkIds = [];
   DownloadStatus _status = DownloadStatus.pending;
   DownloadProgress? _progress;
   bool _cancelled = false;
@@ -32,6 +34,7 @@ class DownloadManager extends ChangeNotifier {
 
   List<DownloadGroup> get queue => List.unmodifiable(_queue);
   Map<String, LocalVersion> get versions => Map.unmodifiable(_versions);
+  List<String> get failedWorkIds => List.unmodifiable(_failedWorkIds);
   DownloadStatus get status => _status;
   DownloadProgress? get progress => _progress;
   bool get isDownloading => _status == DownloadStatus.downloading;
@@ -226,6 +229,7 @@ class DownloadManager extends ChangeNotifier {
     _cancelled = false;
     _completedCount = 0;
     _failedCount = 0;
+    _failedWorkIds.clear();
     _completedJuans = 0;
     _totalItems = 0;
     _totalJuans = 0;
@@ -260,6 +264,10 @@ class DownloadManager extends ChangeNotifier {
       notifyListeners();
       await _processDownloadQueue(items);
     }
+
+    // 索引建置在背景 worker 裡追進度：收完才宣告結束，否則使用者以為下載好了，
+    // 第一次搜還是得自己把沒建完的卷補一遍。
+    await offlineIndexQueue.flush();
 
     _status = _cancelled
         ? DownloadStatus.cancelled
@@ -422,6 +430,9 @@ class DownloadManager extends ChangeNotifier {
 
     if (failed) {
       _failedCount++;
+      if (!_failedWorkIds.contains(item.work)) {
+        _failedWorkIds.add(item.work);
+      }
     } else {
       _completedCount++;
     }
@@ -439,7 +450,10 @@ class DownloadManager extends ChangeNotifier {
     String? release,
   }) async {
     try {
-      await scriptureVolumeStore.write(volume);
+      final path = await scriptureVolumeStore.write(volume);
+      // 經卷一落地就把搜尋索引排在後面：攢著到下載結束才建的話，
+      // 使用者第一次搜要把整藏重解析一遍。
+      await offlineIndexQueue.add(work, volume.juan, path);
       _versions['$work:${volume.juan}'] = LocalVersion(
         work: work,
         juan: volume.juan,
@@ -473,7 +487,8 @@ class DownloadManager extends ChangeNotifier {
     for (final volume in volumes) {
       if (!existing.contains(volume.juan)) continue;
       try {
-        await scriptureVolumeStore.write(volume);
+        final path = await scriptureVolumeStore.write(volume);
+        await offlineIndexQueue.add(work, volume.juan, path);
         _versions['$work:${volume.juan}'] = LocalVersion(
           work: work,
           juan: volume.juan,
@@ -487,6 +502,8 @@ class DownloadManager extends ChangeNotifier {
       }
     }
     if (replaced > 0) {
+      // 覆寫過的卷要把重建好的索引收乾淨，更新才算真的結束。
+      await offlineIndexQueue.flush();
       await _saveVersions();
       notifyListeners();
     }

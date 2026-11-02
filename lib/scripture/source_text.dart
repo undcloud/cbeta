@@ -12,7 +12,8 @@ int scriptureSourceAdvance(ScriptureLine line) =>
             line.verseCells.isNotEmpty ||
             (line.images.isNotEmpty && line.text.isEmpty)
         ? 1
-        : 0);
+        : 0) +
+    (line.paragraphEnd ? 1 : 0);
 
 /// 與閱讀器 layout 相同行距規則的原始經文文字，用於卷內搜尋與位移換算。
 String buildScriptureSearchSource(List<ScriptureLine> lines) {

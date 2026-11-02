@@ -215,12 +215,47 @@ void main() {
         expect(firstJuan?.html, contains('id="T01n0001_p0001a01"'));
         final secondJuan = await volumeStore.read('T0001', '2');
         expect(secondJuan?.html, contains('id="T01n0001_p0002a01"'));
+        await store.saveQueue(manager.queue);
       }, () => client);
 
       expect(requested, [
         'https://cbdata.dila.edu.tw/stable/changes?work=T0001',
         'https://cbdata.dila.edu.tw/stable/download/html/T0001.html.zip',
       ]);
+    });
+
+    test('reports works missing from CBETA data service', () async {
+      final client = MockClient((request) async {
+        if (request.url.path.endsWith('.html.zip')) {
+          return http.Response('not found', 404);
+        }
+        if (request.url.path == '/stable/juans') {
+          return http.Response('{"num_found":0,"results":[]}', 200);
+        }
+        throw StateError('Unexpected request: ${request.url}');
+      });
+
+      await http.runWithClient(() async {
+        final manager = DownloadManager(
+          releaseVersionLoader: (_) async => null,
+        );
+        manager.addToQueue(const [
+          DownloadGroup(
+            id: 'missing-work',
+            label: '測試',
+            items: [
+              DownloadItem(work: 'X0046', title: '未提供作品', juans: ['1']),
+            ],
+          ),
+        ]);
+
+        await manager.startDownload();
+
+        expect(manager.status, DownloadStatus.failed);
+        expect(manager.failedWorkIds, ['X0046']);
+        expect(manager.hasQueuedItems, isTrue);
+        await store.saveQueue(manager.queue);
+      }, () => client);
     });
   });
 }

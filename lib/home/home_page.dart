@@ -11,6 +11,7 @@ import '../search/candidates.dart';
 import '../search/conversion.dart';
 import '../search/goto.dart';
 import '../search/history.dart';
+import '../search/offline_preference.dart';
 import '../download/catalog_cache.dart';
 import '../settings/display_settings.dart';
 import '../feedback/feedback_dialog.dart';
@@ -142,6 +143,8 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     unawaited(_checkForAppUpdate());
     // 經目查詢改走本地全量目錄,先暖好，第一次搜尋才不用等解析 4 MB JSON。
     unawaited(CatalogCache.instance.load().catchError((_) {}));
+    // 「僅離線」開關要在第一次搜尋前就知道狀態。
+    unawaited(loadOfflineKeywordSearchOnly());
   }
 
   @override
@@ -783,6 +786,11 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       if (kIsWeb) {
         throw Exception('CBETA 搜尋服務未開放網頁跨域存取；請使用桌面或行動版 App。');
       }
+      if (offlineKeywordSearchOnly) {
+        // 只掃本地：請求不發出去，也就不必等伺服器那十幾秒。
+        await _applyOfflineKeywordResults(query, token);
+        return;
+      }
       final cached = FullTextSearchCache.get(query);
       if (cached != null && mounted && token == requestToken) {
         // 同一個字再查一次時先用上次的結果頂住畫面,回覆後再整批取代;
@@ -986,6 +994,17 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         session.resume();
       }
     });
+  }
+
+  /// 「僅離線」開關：把正文搜尋固定在本地經卷上。
+  ///
+  /// 切到僅離線時要立刻補一次本地掃描，否則已經在轉圈的畫面還要等線上逾時。
+  void _toggleOfflineKeywordSearch() {
+    final next = !offlineKeywordSearchOnly;
+    unawaited(setOfflineKeywordSearchOnly(next));
+    setState(() {});
+    if (!next || submittedQuery.isEmpty) return;
+    unawaited(_applyOfflineKeywordResults(submittedQuery, requestToken));
   }
 
   /// 第一階段只掃出（作品, 卷, 行號）；點開一部經時用 HTML 再比對一次，
@@ -1291,6 +1310,21 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
             icon: const Icon(Icons.menu_rounded),
           ),
           actions: [
+            IconButton(
+              tooltip: displayText(
+                offlineKeywordSearchOnly
+                    ? '僅離線搜尋正文：開啟（不請求線上全文）'
+                    : '僅離線搜尋正文：關閉（先請求線上全文）',
+                context,
+              ),
+              icon: Icon(
+                offlineKeywordSearchOnly
+                    ? Icons.cloud_off_rounded
+                    : Icons.cloud_outlined,
+              ),
+              color: offlineKeywordSearchOnly ? const Color(0xFF176B67) : null,
+              onPressed: kIsWeb ? null : _toggleOfflineKeywordSearch,
+            ),
             ScriptDisplayButton(),
             SettingsButton(
               availableUpdate: _availableUpdate,

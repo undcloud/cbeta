@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -6,7 +7,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart'
-    show ValueListenable, ValueNotifier, kIsWeb;
+    show ValueListenable, ValueNotifier, kIsWeb, visibleForTesting;
 
 import '../search/conversion.dart';
 import 'cache.dart';
@@ -14,7 +15,6 @@ import 'models.dart';
 import 'parser.dart';
 import 'sidx_norm.dart';
 import 'sidx_store.dart';
-import 'source_text.dart';
 
 final _whitespacePattern = RegExp(r'\s+');
 
@@ -84,8 +84,13 @@ class OfflineScanOutcome {
 ///
 /// `flutter test` 的 fake-async 綁定不會推進真實 isolate 的回覆，網頁版也沒有
 /// 檔案系統，兩種情況都走同一份實作，只少了 isolate 的跳板。
+/// [offlineScanIsolateOverride] 讓測試能強制走真的 worker 池。
 bool offlineScanSupportsIsolate() =>
-    !kIsWeb && !Platform.environment.containsKey('FLUTTER_TEST');
+    offlineScanIsolateOverride ??
+    (!kIsWeb && !Platform.environment.containsKey('FLUTTER_TEST'));
+
+@visibleForTesting
+bool? offlineScanIsolateOverride;
 
 /// 把使用者輸入換成離線索引的查詢模式。
 ///
@@ -286,13 +291,115 @@ Future<OfflineScanOutcome> scanOfflineVolume(
   OfflineScanRequest(slotCandidates: slotCandidates, targets: [target]),
 );
 
+/// 一批待建索引的經卷。
+class OfflineIndexBuildRequest {
+  const OfflineIndexBuildRequest({required this.targets});
+
+  final List<OfflineScanTarget> targets;
+}
+
+/// 只做「讀 `.json` → 寫 `.sidx`」，不比對任何查詢。
+///
+/// 下載時就把索引前置好，使用者第一次搜只剩讀標頭與正文，不必再整藏解析一次
+/// HTML。戳記相符的卷直接跳過，重跑一次同一批是無害的。
+Future<int> buildOfflineIndexBatch(List<OfflineScanTarget> targets) async {
+  if (targets.isEmpty) return 0;
+  final store = _indexStoreFor(targets);
+  var built = 0;
+  for (final target in targets) {
+    if (target.path.isEmpty) continue;
+    final stamp = await sidxSourceStamp(target.path) ?? 0;
+    final existing = await store.readSkipInfoAt(
+      work: target.work,
+      juan: target.juan,
+    );
+    if (existing != null && existing.sourceStamp == stamp) continue;
+    final lines = await _readVolumeLines(target);
+    if (lines == null) continue;
+    await store.write(
+      buildSidxVolume(
+        work: target.work,
+        juan: target.juan,
+        sourceStamp: stamp,
+        lines: lines.lines,
+      ),
+    );
+    built++;
+  }
+  return built;
+}
+
+/// 下載期間的索引工作佇列。
+///
+/// 一次派一卷會把常駐池打成數萬則訊息，所以累積到一批再交出去；下載本身在等
+/// 網路，建索引在背景 worker 裡慢慢追。
+class OfflineIndexQueue {
+  static const int _batchSize = 32;
+
+  /// 並行中的批次上限；下載快過建置時用它回壓，別把記憶體堆滿待辦。
+  static const int _maxInFlight = 4;
+
+  final List<OfflineScanTarget> _pending = [];
+  final List<Future<void>> _inFlight = [];
+
+  Future<void> add(String work, String juan, String path) async {
+    if (kIsWeb || path.isEmpty) return;
+    _pending.add(OfflineScanTarget(work: work, juan: juan, path: path));
+    if (_pending.length < _batchSize) return;
+    if (_inFlight.length >= _maxInFlight) {
+      await Future.wait(List<Future<void>>.of(_inFlight));
+    }
+    drain();
+  }
+
+  /// 把待辦交出去（下載結束、取消或換任務時呼叫）。
+  Future<void> flush() async {
+    drain();
+    while (_inFlight.isNotEmpty) {
+      await Future.wait(List<Future<void>>.of(_inFlight));
+    }
+  }
+
+  void drain() {
+    if (_pending.isEmpty) return;
+    final batch = List<OfflineScanTarget>.of(_pending);
+    _pending.clear();
+    final future = _runBatch(batch);
+    _inFlight.add(future);
+    unawaited(future.whenComplete(() => _inFlight.remove(future)));
+  }
+
+  List<OfflineScanTarget> get pendingTargets => List.unmodifiable(_pending);
+
+  Future<void> _runBatch(List<OfflineScanTarget> batch) async {
+    final pool = offlineScanSupportsIsolate() && batch.first.path.isNotEmpty
+        ? sharedOfflineScanPool()
+        : null;
+    if (pool == null) {
+      await buildOfflineIndexBatch(batch);
+      return;
+    }
+    await pool.runBuild(
+      OfflineIndexBuildRequest(targets: batch),
+      _defaultWorkerCount(),
+    );
+  }
+}
+
+/// 下載流程共用的索引佇列。
+final OfflineIndexQueue offlineIndexQueue = OfflineIndexQueue();
+
+int _defaultWorkerCount() =>
+    math.min(4, math.max(2, Platform.numberOfProcessors));
+
 /// 第二階段：把一部經的離線命中展開成可讀摘要。
 ///
 /// 索引正文刪掉了標點，不能直接給人看；點開一部經時用 HTML 重新比對一次
 /// （實測約 4 ms/卷），摘要、行號與 `sourceOffset` 都取自帶標點的原文。
 ///
-/// 每一卷都要在主 isolate 上解析整卷 HTML，所以卷與卷之間讓出一幀，並讓呼叫端
-/// 用 [shouldAbort] 在離開頁面或換了搜尋後把這部經的展開停掉。
+/// 解析整卷 HTML 是 CPU 活，正常路徑把它派給常駐池的 worker；網頁版、測試或池
+/// 已釋放時才退回主 isolate 一卷一卷做，那種場合卷與卷之間讓出一幀，並用
+/// [shouldAbort] 在離開頁面或換了搜尋後停手。
 Future<List<ScripturePassage>> expandOfflineWork({
   required String work,
   required List<OfflineHit> hits,
@@ -301,47 +408,179 @@ Future<List<ScripturePassage>> expandOfflineWork({
   bool Function()? shouldAbort,
 }) async {
   if (hits.isEmpty) return const [];
+  if (shouldAbort != null && shouldAbort()) return const [];
   final pattern = buildOfflinePattern(query);
   if (pattern.isBlank) return const [];
   final juans = (hits.map((hit) => hit.juan).toSet().toList())..sort();
-  final passages = <ScripturePassage>[];
-  for (final juan in juans) {
-    if (shouldAbort != null && shouldAbort()) break;
-    final volume = await scriptureVolumeStore.readRef(
-      ScriptureVolumeRef(work: work, juan: juan),
-    );
-    await Future<void>.delayed(Duration.zero);
-    if (shouldAbort != null && shouldAbort()) break;
-    if (volume == null) continue;
-    final List<ScriptureLine> lines;
-    try {
-      lines = parseScriptureHtml(volume.html);
-    } catch (_) {
-      continue;
-    }
-    passages.addAll(
-      _passagesFromLines(
+  // 網頁版的卷存在 SharedPreferences，沒有檔案戳記可依賴；其餘情況先取檔案
+  // 路徑，展開快取與 worker 池都靠它認出「同一卷還沒變」。
+  final targets = [
+    for (final juan in juans)
+      OfflineScanTarget(
         work: work,
         juan: juan,
-        lines: lines,
-        pattern: pattern,
-        availableJuans: availableJuans,
+        path: kIsWeb ? '' : await _volumePath(work, juan),
       ),
-    );
+  ];
+  final request = OfflineExpandRequest(
+    work: work,
+    slotCandidates: [for (final slot in pattern.slots) slot.toList()],
+    targets: targets,
+    availableJuans: availableJuans,
+  );
+  final pool = offlineScanSupportsIsolate() && targets.first.path.isNotEmpty
+      ? sharedOfflineScanPool()
+      : null;
+  if (pool == null) {
+    return runOfflineExpandInline(request, shouldAbort: shouldAbort);
   }
+  final passages = await pool.runExpand(request, _defaultWorkerCount());
+  // 叫停時丟棄已经回來的結果：展開的代價只花在還活著的搜尋上。
+  if (shouldAbort != null && shouldAbort()) return const [];
   return passages;
 }
 
-List<ScripturePassage> _passagesFromLines({
+/// 展開用的請求：一部經、要看哪幾卷，以及已由 UI 正規化的查詢候補。
+class OfflineExpandRequest {
+  const OfflineExpandRequest({
+    required this.work,
+    required this.slotCandidates,
+    required this.targets,
+    required this.availableJuans,
+  });
+
+  final String work;
+  final List<List<int>> slotCandidates;
+  final List<OfflineScanTarget> targets;
+  final List<int> availableJuans;
+}
+
+Future<List<ScripturePassage>> runOfflineExpand(OfflineExpandRequest request) =>
+    _runOfflineExpand(request, yieldBetweenVolumes: false);
+
+Future<List<ScripturePassage>> runOfflineExpandInline(
+  OfflineExpandRequest request, {
+  bool Function()? shouldAbort,
+}) => _runOfflineExpand(
+  request,
+  yieldBetweenVolumes: true,
+  shouldAbort: shouldAbort,
+);
+
+Future<List<ScripturePassage>> _runOfflineExpand(
+  OfflineExpandRequest request, {
+  required bool yieldBetweenVolumes,
+  bool Function()? shouldAbort,
+}) async {
+  final pattern = QueryPattern.fromSlotCandidates(request.slotCandidates);
+  if (pattern.isBlank || request.targets.isEmpty) return const [];
+  final passages = <ScripturePassage>[];
+  for (final target in request.targets) {
+    if (shouldAbort != null && shouldAbort()) break;
+    final volume = await _expandedVolume(target);
+    if (yieldBetweenVolumes) {
+      await Future<void>.delayed(Duration.zero);
+      if (shouldAbort != null && shouldAbort()) break;
+    }
+    if (volume == null) continue;
+    passages.addAll(
+      _passagesFromExpanded(
+        work: request.work,
+        juan: target.juan,
+        volume: volume,
+        pattern: pattern,
+        availableJuans: request.availableJuans,
+      ),
+    );
+  }
+  // 一部經的卷被切成好幾份並行跑，合併後要還原成「卷號、卷內位置」的閱讀順序，
+  // 否則點開某一筆時跳到的不是畫面上那一筆。
+  passages.sort(_comparePassages);
+  return passages;
+}
+
+int _comparePassages(ScripturePassage left, ScripturePassage right) {
+  final byJuan = (int.tryParse(left.juan ?? '') ?? 0).compareTo(
+    int.tryParse(right.juan ?? '') ?? 0,
+  );
+  if (byJuan != 0) return byJuan;
+  return (left.sourceOffset ?? 0).compareTo(right.sourceOffset ?? 0);
+}
+
+Future<String> _volumePath(String work, String juan) async {
+  if (kIsWeb) return '';
+  try {
+    return await scriptureVolumeStore.pathFor(work, juan);
+  } catch (_) {
+    // 識別碼不合法時照舊走 store 讀；讀不到就是沒有這一卷。
+    return '';
+  }
+}
+
+/// 展開一整卷要付的錢：解析 HTML、正規化、以及「來源位移 → 顯示位移」表。
+///
+/// 換了關鍵字重開同一部經、或掃描又補來幾筆命中時都要再展開一次，差異只在比對
+/// 哪個字，整卷解析屬白重複。以來源檔的戳記為 key，經卷改版時自然失效。
+class _ExpandedVolume {
+  _ExpandedVolume({
+    required this.stamp,
+    required this.source,
+    required this.display,
+  });
+
+  final int stamp;
+  final SidxSource source;
+  final _CollapsedText display;
+}
+
+final LinkedHashMap<String, _ExpandedVolume> _expandedVolumes = LinkedHashMap();
+const int _expandedVolumeCacheLimit = 24;
+
+Future<_ExpandedVolume?> _expandedVolume(OfflineScanTarget target) async {
+  final path = target.path;
+  if (path.isEmpty) {
+    // 網頁版沒有檔案戳記可依賴，每次照原樣重讀重解析。
+    final lines = await _readVolumeLines(target);
+    if (lines == null) return null;
+    return _expandToVolume(0, lines.lines);
+  }
+  final stamp = await sidxSourceStamp(path) ?? 0;
+  final cached = _expandedVolumes[path];
+  if (cached != null && cached.stamp == stamp) {
+    _expandedVolumes.remove(path);
+    _expandedVolumes[path] = cached;
+    return cached;
+  }
+  _expandedVolumes.remove(path);
+  final lines = await _readVolumeLines(target);
+  if (lines == null) return null;
+  final volume = _expandToVolume(stamp, lines.lines);
+  _expandedVolumes[path] = volume;
+  while (_expandedVolumes.length > _expandedVolumeCacheLimit) {
+    _expandedVolumes.remove(_expandedVolumes.keys.first);
+  }
+  return volume;
+}
+
+_ExpandedVolume _expandToVolume(int stamp, List<ScriptureLine> lines) {
+  final source = normalizeScriptureLines(lines);
+  return _ExpandedVolume(
+    stamp: stamp,
+    source: source,
+    display: _CollapsedText.build(source.normed.source),
+  );
+}
+
+List<ScripturePassage> _passagesFromExpanded({
   required String work,
   required String juan,
-  required List<ScriptureLine> lines,
+  required _ExpandedVolume volume,
   required QueryPattern pattern,
   required List<int> availableJuans,
 }) {
-  final source = normalizeScriptureLines(lines);
-  final title = localWorkTitle(lines);
-  final display = _CollapsedText.build(source.normed.source);
+  final source = volume.source;
+  final display = volume.display;
+  final title = source.title;
   final passages = <ScripturePassage>[];
   var recordIndex = 0;
   scanNormMatches(source.normed.bytes, pattern, (match) {
@@ -690,7 +929,7 @@ class OfflineScanSession {
     }
   }
 
-  int get _workerCount => math.min(4, math.max(2, Platform.numberOfProcessors));
+  int get _workerCount => _defaultWorkerCount();
 
   /// 開始（或從暫停中恢復）連續掃描。
   void start() {
@@ -760,6 +999,8 @@ class _MergedWork {
 }
 
 const int _commandScan = 1;
+const int _commandBuild = 2;
+const int _commandExpand = 3;
 
 OfflineScanPool? _sharedScanPool;
 
@@ -776,7 +1017,7 @@ void releaseSharedOfflineScanPool() {
   _sharedScanPool = null;
 }
 
-/// 常駐掃描 worker 池。
+/// 常駐背景工作池：掃描、建索引、展開摘要三種活都在同一批 worker 上跑。
 ///
 /// `compute` 每一塊都要冷啟動一個 isolate（載入 isolate 組件、首次分配），
 /// 全藏兩萬多卷時這筆固定開銷比一卷的掃描還大；池把 worker 留著反覆用，並把
@@ -788,7 +1029,7 @@ class OfflineScanPool {
 
   final ReceivePort _replies = ReceivePort();
   final List<_ScanWorker> _workers = [];
-  final Map<int, Completer<OfflineScanOutcome>> _pending = {};
+  final Map<int, Completer<Object?>> _pending = {};
 
   /// 池跨會話共用後可能同時被要求扩容，生成 worker 必須排隊，
   /// 否則兩個並發的 `_ensureWorkers` 會拿到同一個 worker。
@@ -826,12 +1067,14 @@ class OfflineScanPool {
       if (start >= request.targets.length) break;
       final end = math.min(start + size, request.targets.length);
       futures.add(
-        _dispatch(
+        _dispatch<OfflineScanOutcome>(
           _workers[part],
+          _commandScan,
           OfflineScanRequest(
             slotCandidates: request.slotCandidates,
             targets: request.targets.sublist(start, end),
           ),
+          OfflineScanOutcome.empty,
         ),
       );
     }
@@ -853,33 +1096,105 @@ class OfflineScanPool {
     );
   }
 
-  Future<OfflineScanOutcome> _dispatch(
+  /// 把索引建置分給現成的 worker；池已釋放或卷數太少時自己在當前 isolate 做完。
+  Future<void> runBuild(
+    OfflineIndexBuildRequest request,
+    int workerCount,
+  ) async {
+    if (_disposed || request.targets.isEmpty) {
+      await buildOfflineIndexBatch(request.targets);
+      return;
+    }
+    final parts = math.min(
+      math.max(1, workerCount),
+      math.max(1, request.targets.length ~/ 8),
+    );
+    await _ensureWorkers(parts);
+    if (_disposed) {
+      await buildOfflineIndexBatch(request.targets);
+      return;
+    }
+    final size = (request.targets.length + parts - 1) ~/ parts;
+    final futures = <Future<int>>[];
+    for (var part = 0; part < parts; part++) {
+      final start = part * size;
+      if (start >= request.targets.length) break;
+      final end = math.min(start + size, request.targets.length);
+      futures.add(
+        _dispatch<int>(
+          _workers[part],
+          _commandBuild,
+          OfflineIndexBuildRequest(
+            targets: request.targets.sublist(start, end),
+          ),
+          0,
+        ),
+      );
+    }
+    await Future.wait(futures);
+  }
+
+  /// 展開一部經的命中；卷數少到不值得並行時留在當前 isolate。
+  Future<List<ScripturePassage>> runExpand(
+    OfflineExpandRequest request,
+    int workerCount,
+  ) async {
+    if (request.targets.isEmpty) return const [];
+    final parts = math.min(math.max(1, workerCount), request.targets.length);
+    await _ensureWorkers(parts);
+    if (_disposed) return runOfflineExpandInline(request);
+    final size = (request.targets.length + parts - 1) ~/ parts;
+    final futures = <Future<List<ScripturePassage>>>[];
+    for (var start = 0; start < request.targets.length; start += size) {
+      final end = math.min(start + size, request.targets.length);
+      futures.add(
+        _dispatch<List<ScripturePassage>>(
+          _workers[futures.length % parts],
+          _commandExpand,
+          OfflineExpandRequest(
+            work: request.work,
+            slotCandidates: request.slotCandidates,
+            targets: request.targets.sublist(start, end),
+            availableJuans: request.availableJuans,
+          ),
+          const <ScripturePassage>[],
+        ),
+      );
+    }
+    final passages = <ScripturePassage>[];
+    for (final part in await Future.wait(futures)) {
+      passages.addAll(part);
+    }
+    passages.sort(_comparePassages);
+    return passages;
+  }
+
+  Future<T> _dispatch<T>(
     _ScanWorker worker,
-    OfflineScanRequest request,
+    int command,
+    Object? payload,
+    T fallback,
   ) {
     final id = _nextId++;
-    final completer = Completer<OfflineScanOutcome>();
+    final completer = Completer<Object?>();
     _pending[id] = completer;
-    worker.commandPort.send(<Object?>[
-      _commandScan,
-      _replies.sendPort,
-      id,
-      request,
-    ]);
-    return completer.future.timeout(
-      const Duration(seconds: 120),
-      onTimeout: () {
-        _pending.remove(id);
-        return OfflineScanOutcome.empty;
-      },
-    );
+    worker.commandPort.send(<Object?>[command, _replies.sendPort, id, payload]);
+    return completer.future
+        .timeout(
+          const Duration(seconds: 120),
+          onTimeout: () {
+            _pending.remove(id);
+            return fallback;
+          },
+        )
+        .then<T>((dynamic value) => value is T ? value : fallback);
   }
 
   void _onReply(dynamic message) {
     if (message is! List || message.length != 2) return;
     final completer = _pending.remove(message[0]);
     if (completer == null || completer.isCompleted) return;
-    completer.complete(message[1] as OfflineScanOutcome);
+    completer.complete(message[1]);
   }
 
   Future<void> _ensureWorkers(int count) {
@@ -908,7 +1223,7 @@ class OfflineScanPool {
     _workers.clear();
     _replies.close();
     for (final completer in _pending.values) {
-      if (!completer.isCompleted) completer.complete(OfflineScanOutcome.empty);
+      if (!completer.isCompleted) completer.complete(null);
     }
     _pending.clear();
   }
@@ -966,17 +1281,25 @@ void _workerEntry(SendPort control) {
   final port = RawReceivePort();
   control.send(port.sendPort);
   port.handler = (dynamic message) {
-    if (message is! List || message.length != 4 || message[0] != _commandScan) {
+    if (message is! List || message.length != 4) {
       return;
     }
+    final command = message[0] as int;
     final reply = message[1] as SendPort;
     final id = message[2] as int;
-    final request = message[3] as OfflineScanRequest;
+    final payload = message[3];
+    final Future<Object?> work = switch (command) {
+      _commandScan => runOfflineScan(payload as OfflineScanRequest),
+      _commandBuild => buildOfflineIndexBatch(
+        (payload as OfflineIndexBuildRequest).targets,
+      ),
+      _commandExpand => runOfflineExpand(payload as OfflineExpandRequest),
+      _ => Future<Object?>.value(),
+    };
     unawaited(
-      runOfflineScan(request).then(
-        (outcome) => reply.send(<Object?>[id, outcome]),
-        onError: (Object _, StackTrace _) =>
-            reply.send(<Object?>[id, OfflineScanOutcome.empty]),
+      work.then(
+        (Object? result) => reply.send(<Object?>[id, result]),
+        onError: (Object _, StackTrace _) => reply.send(<Object?>[id, null]),
       ),
     );
   };

@@ -10,6 +10,7 @@ class ScriptureLine {
     this.tableRows = const [],
     this.headingLevel = 0,
     this.role = ScriptureLineRole.regular,
+    this.paragraphEnd = false,
   });
 
   final String text;
@@ -22,6 +23,7 @@ class ScriptureLine {
   final List<List<ScriptureTableCell>> tableRows;
   final int headingLevel;
   final ScriptureLineRole role;
+  final bool paragraphEnd;
 }
 
 enum ScriptureLineRole { regular, volumeTitle, byline, navigationAnchor }
@@ -73,12 +75,14 @@ class ScriptureFootnote {
     required this.label,
     required this.clue,
     required this.content,
+    this.verseCellIndex,
   });
 
   final int offset;
   final String label;
   final String clue;
   final String content;
+  final int? verseCellIndex;
 }
 
 class ScripturePassage {

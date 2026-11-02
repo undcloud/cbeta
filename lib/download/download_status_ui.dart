@@ -1,11 +1,19 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart' hide Text;
 import '../dictionary/fodict_download_manager.dart';
 import '../download/download_manager.dart';
 import '../download/download_models.dart';
 import '../download/update_manager.dart';
 import '../common/app_nav.dart';
+import '../scripture/index_maintenance.dart';
 import '../widgets/display_text.dart';
+
+/// 搜尋索引（`.sidx`）的除錯入口：清除與重建，不需要重新下載經文。
+///
+/// 索引是經文的派生物，這顆按鈕只驗得出「索引到底省下多少時間」這件事；
+/// 驗完把這裡改成 `false` 就隱藏入口，其他程式碼不動。
+bool searchIndexDebugEntriesVisible = true;
 
 Future<void> showOfflineDataManager(BuildContext context) {
   Navigator.of(context).pop();
@@ -110,6 +118,10 @@ class _DownloadStatusPanel extends StatefulWidget {
 }
 
 class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
+  /// 除錯入口的回報文字；null 時顯示固定說明。
+  String? _indexStatus;
+  bool _indexRebuilding = false;
+
   @override
   void dispose() {
     widget.onDisposed?.call();
@@ -145,196 +157,221 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
             16,
             MediaQuery.of(context).viewInsets.bottom + 16,
           ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                displayText('下載管理', context),
-                style: Theme.of(context).textTheme.titleLarge,
-              ),
-              const SizedBox(height: 4),
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      displayText(
-                        '已下載 ${manager.downloadedWorkCount} 部經文 · '
-                        '${manager.downloadedJuanCount} 卷',
-                        context,
-                      ),
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  TextButton.icon(
-                    onPressed: manager.isDownloading
-                        ? null
-                        : () => _confirmUpdate(context),
-                    icon: const Icon(Icons.sync_rounded, size: 18),
-                    label: Text(
-                      displayText(
-                        updateManager.canResume ? '繼續更新' : '更新',
-                        context,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              ..._buildUpdateSection(context),
-              if (manager.isDownloading && progress != null) ...[
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  displayText('下載管理', context),
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 4),
                 Row(
                   children: [
                     Expanded(
                       child: Text(
                         displayText(
-                          '下載中：${progress.completedItems}/${progress.totalItems} 部'
-                          ' · ${progress.completedJuans}/${progress.totalJuans} 卷',
+                          '已下載 ${manager.downloadedWorkCount} 部經文 · '
+                          '${manager.downloadedJuanCount} 卷',
                           context,
                         ),
+                        style: Theme.of(context).textTheme.bodySmall,
                       ),
                     ),
                     const SizedBox(width: 8),
+                    TextButton.icon(
+                      onPressed: manager.isDownloading
+                          ? null
+                          : () => _confirmUpdate(context),
+                      icon: const Icon(Icons.sync_rounded, size: 18),
+                      label: Text(
+                        displayText(
+                          updateManager.canResume ? '繼續更新' : '更新',
+                          context,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                ..._buildUpdateSection(context),
+                if (manager.isDownloading && progress != null) ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          displayText(
+                            '下載中：${progress.completedItems}/${progress.totalItems} 部'
+                            ' · ${progress.completedJuans}/${progress.totalJuans} 卷',
+                            context,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        displayText(
+                          '速度 ${formatDownloadSpeed(manager.downloadSpeedBytesPerSecond)}',
+                          context,
+                        ),
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  LinearProgressIndicator(value: progress.fraction),
+                  if (progress.currentWork != null) ...[
+                    const SizedBox(height: 4),
                     Text(
                       displayText(
-                        '速度 ${formatDownloadSpeed(manager.downloadSpeedBytesPerSecond)}',
+                        progress.currentJuan == null
+                            ? '目前：${progress.currentWork}'
+                            : '目前：${progress.currentWork} 卷 ${progress.currentJuan}',
                         context,
                       ),
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
                   ],
-                ),
-                const SizedBox(height: 4),
-                LinearProgressIndicator(value: progress.fraction),
-                if (progress.currentWork != null) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    displayText(
-                      progress.currentJuan == null
-                          ? '目前：${progress.currentWork}'
-                          : '目前：${progress.currentWork} 卷 ${progress.currentJuan}',
-                      context,
-                    ),
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                ],
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton(
-                        onPressed: manager.cancelDownload,
-                        child: Text(displayText('暫停', context)),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: manager.cancelDownload,
+                          child: Text(displayText('暫停', context)),
+                        ),
                       ),
-                    ),
-                  ],
-                ),
-              ] else ...[
-                if (manager.status == DownloadStatus.completed)
-                  Text(
-                    displayText('下載完成', context),
-                    style: const TextStyle(color: Colors.green),
-                  )
-                else if (manager.status == DownloadStatus.cancelled)
-                  Text(displayText('已暫停下載', context))
-                else if (manager.status == DownloadStatus.failed)
-                  Text(
-                    displayText('下載中斷，尚有未完成的經卷', context),
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
-                    ),
-                  )
-                else if (manager.hasQueuedItems)
-                  Text(displayText('有未完成的下載任務', context))
-                else
-                  Text(displayText('目前沒有下載任務', context)),
-                if (manager.canResume && !updateManager.isUpdating) ...[
-                  const SizedBox(height: 8),
-                  FilledButton.icon(
-                    onPressed: manager.resumeDownload,
-                    icon: const Icon(Icons.play_arrow_rounded),
-                    label: Text(displayText('繼續下載', context)),
+                    ],
                   ),
-                ],
-              ],
-              if (pendingGroups.isNotEmpty) ...[
-                const SizedBox(height: 16),
-                const Divider(),
-                Row(
-                  children: [
-                    Expanded(
+                ] else ...[
+                  if (manager.status == DownloadStatus.completed)
+                    Text(
+                      displayText('下載完成', context),
+                      style: const TextStyle(color: Colors.green),
+                    )
+                  else if (manager.status == DownloadStatus.cancelled)
+                    Text(displayText('已暫停下載', context))
+                  else if (manager.status == DownloadStatus.failed)
+                    Text(
+                      displayText('下載中斷，尚有未完成的經卷', context),
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    )
+                  else if (manager.hasQueuedItems)
+                    Text(displayText('有未完成的下載任務', context))
+                  else
+                    Text(displayText('目前沒有下載任務', context)),
+                  if (manager.status == DownloadStatus.failed &&
+                      manager.failedWorkIds.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
                       child: Text(
                         displayText(
-                          '下載隊列（${manager.pendingWorkCount} 部待下載）',
+                          '失敗作品：${manager.failedWorkIds.take(12).join('、')}'
+                          '${manager.failedWorkIds.length > 12 ? ' 等 ${manager.failedWorkIds.length} 部' : ''}',
                           context,
                         ),
-                        style: const TextStyle(fontWeight: FontWeight.bold),
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
                       ),
                     ),
-                    IconButton(
-                      tooltip: displayText('刪除所有下載任務', context),
-                      icon: const Icon(Icons.delete_sweep_outlined),
-                      onPressed: () {
-                        manager.clearQueue();
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            content: Text(displayText('已清除所有下載任務', context)),
+                  if (manager.canResume && !updateManager.isUpdating) ...[
+                    const SizedBox(height: 8),
+                    FilledButton.icon(
+                      onPressed: manager.resumeDownload,
+                      icon: const Icon(Icons.play_arrow_rounded),
+                      label: Text(displayText('繼續下載', context)),
+                    ),
+                  ],
+                ],
+                if (pendingGroups.isNotEmpty) ...[
+                  const SizedBox(height: 16),
+                  const Divider(),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          displayText(
+                            '下載隊列（${manager.pendingWorkCount} 部待下載）',
+                            context,
+                          ),
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: displayText('刪除所有下載任務', context),
+                        icon: const Icon(Icons.delete_sweep_outlined),
+                        onPressed: () {
+                          manager.clearQueue();
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(displayText('已清除所有下載任務', context)),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 200),
+                    child: ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: pendingGroups.length,
+                      itemBuilder: (context, index) {
+                        final entry = pendingGroups[index];
+                        final group = entry.group;
+                        final juanCount = entry.items.fold<int>(
+                          0,
+                          (sum, item) =>
+                              sum + manager.pendingJuans(item).length,
+                        );
+                        return ListTile(
+                          dense: true,
+                          title: Text(
+                            displayText(
+                              group.label.replaceFirst(
+                                RegExp(r'（\d+ 部）\s*$'),
+                                '（${entry.items.length} 部）',
+                              ),
+                              context,
+                            ),
+                          ),
+                          subtitle: Text(
+                            displayText(
+                              '${entry.items.length} 部經典 · $juanCount 卷',
+                              context,
+                            ),
+                          ),
+                          trailing: IconButton(
+                            tooltip: displayText('移除此下載任務', context),
+                            icon: const Icon(Icons.delete_outline),
+                            onPressed: () => manager.removeFromQueue(group.id),
                           ),
                         );
                       },
                     ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                ConstrainedBox(
-                  constraints: const BoxConstraints(maxHeight: 200),
-                  child: ListView.builder(
-                    shrinkWrap: true,
-                    itemCount: pendingGroups.length,
-                    itemBuilder: (context, index) {
-                      final entry = pendingGroups[index];
-                      final group = entry.group;
-                      final juanCount = entry.items.fold<int>(
-                        0,
-                        (sum, item) => sum + manager.pendingJuans(item).length,
-                      );
-                      return ListTile(
-                        dense: true,
-                        title: Text(
-                          displayText(
-                            group.label.replaceFirst(
-                              RegExp(r'（\d+ 部）\s*$'),
-                              '（${entry.items.length} 部）',
-                            ),
-                            context,
-                          ),
-                        ),
-                        subtitle: Text(
-                          displayText(
-                            '${entry.items.length} 部經典 · $juanCount 卷',
-                            context,
-                          ),
-                        ),
-                        trailing: IconButton(
-                          tooltip: displayText('移除此下載任務', context),
-                          icon: const Icon(Icons.delete_outline),
-                          onPressed: () => manager.removeFromQueue(group.id),
-                        ),
-                      );
-                    },
                   ),
+                ],
+                const SizedBox(height: 16),
+                const Divider(),
+                ..._buildFodictDownloadSection(context),
+                if (!kIsWeb && searchIndexDebugEntriesVisible) ...[
+                  const SizedBox(height: 16),
+                  const Divider(),
+                  ..._buildIndexDebugSection(context),
+                ],
+                const SizedBox(height: 16),
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: Text(displayText('關閉', context)),
                 ),
               ],
-              const SizedBox(height: 16),
-              const Divider(),
-              ..._buildFodictDownloadSection(context),
-              const SizedBox(height: 16),
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(),
-                child: Text(displayText('關閉', context)),
-              ),
-            ],
+            ),
           ),
         );
       },
@@ -475,6 +512,68 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
       const SizedBox(height: 12),
       const Divider(),
     ];
+  }
+
+  /// 除錯用：把派生的搜尋索引清掉或全量重建，經文本體不受影響。
+  List<Widget> _buildIndexDebugSection(BuildContext context) {
+    return [
+      Text(
+        displayText('搜尋索引（除錯）', context),
+        style: const TextStyle(fontWeight: FontWeight.bold),
+      ),
+      const SizedBox(height: 4),
+      Text(
+        displayText(_indexStatus ?? '索引是經文的派生物，刪掉就能重建；第一次搜尋會逐卷補回。', context),
+        style: Theme.of(context).textTheme.bodySmall,
+      ),
+      const SizedBox(height: 8),
+      Row(
+        children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: _indexRebuilding ? null : _clearSearchIndexes,
+              icon: const Icon(Icons.cleaning_services_outlined, size: 18),
+              label: Text(displayText('清除索引', context)),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: FilledButton.tonalIcon(
+              onPressed: _indexRebuilding ? null : _rebuildSearchIndexes,
+              icon: const Icon(Icons.construction_outlined, size: 18),
+              label: Text(displayText('重建索引', context)),
+            ),
+          ),
+        ],
+      ),
+    ];
+  }
+
+  Future<void> _clearSearchIndexes() async {
+    final removed = await scriptureIndexMaintenance.clearAllIndexes();
+    if (!mounted) return;
+    setState(() => _indexStatus = '已刪除 $removed 個索引檔（經文未動），下次搜尋逐卷重建');
+  }
+
+  Future<void> _rebuildSearchIndexes() async {
+    setState(() {
+      _indexRebuilding = true;
+      _indexStatus = '正在重建索引…';
+    });
+    final removed = await scriptureIndexMaintenance.clearAllIndexes();
+    final head = '已刪除 $removed 個舊索引';
+    final built = await scriptureIndexMaintenance.rebuildIndexes(
+      onProgress: (done, total) {
+        if (!mounted) return;
+        setState(() => _indexStatus = '$head · 已重建 $done/$total 卷');
+      },
+      shouldAbort: () => !mounted,
+    );
+    if (!mounted) return;
+    setState(() {
+      _indexRebuilding = false;
+      _indexStatus = '$head · 重建完成，共 $built 卷';
+    });
   }
 
   List<Widget> _buildFodictDownloadSection(BuildContext context) {

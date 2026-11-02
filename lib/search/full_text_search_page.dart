@@ -6,6 +6,7 @@ import '../scripture/offline_scan.dart';
 import '../search/candidates.dart';
 import '../search/conversion.dart';
 import '../search/history.dart';
+import '../search/offline_preference.dart';
 import '../search/search_input.dart';
 import '../settings/display_settings.dart';
 import '../reader/reader_page.dart';
@@ -154,7 +155,8 @@ class _FullTextSearchPageState extends State<FullTextSearchPage> {
       loading = true;
       loadingMore = false;
       error = null;
-      offlineMode = false;
+      // 「僅離線」開關：不請求線上全文，直接掃本地經卷。
+      offlineMode = offlineKeywordSearchOnly;
       hasMore = false;
       scannedVolumes = 0;
       totalVolumes = 0;

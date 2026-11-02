@@ -33,8 +33,9 @@ class _MemoryScriptureVolumeStore extends ScriptureVolumeStore {
       volumes['$work:$juan'];
 
   @override
-  Future<void> write(CachedScriptureVolume volume) async {
+  Future<String> write(CachedScriptureVolume volume) async {
     volumes[volume.key] = volume;
+    return volume.key;
   }
 
   @override
@@ -45,6 +46,11 @@ class _MemoryScriptureVolumeStore extends ScriptureVolumeStore {
     for (final volume in volumes.values)
       ScriptureVolumeRef(work: volume.work, juan: volume.juan),
   ];
+
+  // 記憶體經卷沒有檔案可指；回空字串讓呼叫端改走 store 讀取，也避免在
+  // fake async 下碰 path_provider 的平台通道（永遠等不到回覆）。
+  @override
+  Future<String> pathFor(String work, String juan) async => '';
 
   @override
   Future<CachedScriptureVolume?> readRef(ScriptureVolumeRef ref) async =>
@@ -216,7 +222,8 @@ void main() {
       '<div id="body"><span class="lb" id="T01n0001_p0001a01"></span>'
       '<p>甲</p><p>乙</p></div>',
     );
-    expect(paragraphs.single.text, '甲\n乙\n');
+    expect(paragraphs.map((line) => line.text).join(), '甲\n乙\n');
+    expect(paragraphs.map((line) => line.paragraphEnd), [true, false]);
   });
 
   test('scripture HTML retains CBETA heading levels for display styling', () {
@@ -277,7 +284,7 @@ void main() {
         showLineBeginnings: true,
         showCollation: true,
       ),
-      '[1]毘婆尸佛經卷上\n',
+      '[＊]毘婆尸佛經卷上\n',
     );
   });
 
@@ -290,10 +297,12 @@ void main() {
         '<p>甲<a class="noteAnchor" href="#n0001002"></a>乙</p>'
         '<span class="lb" id="T01n0001_p0001a02"></span>'
         '<div class="lg-row"><div class="lg-cell">'
-        '<a class="noteAnchor add" href="#cb_note_1"></a>毘婆尸太子，</div>'
+        '<a class="noteAnchor add" href="#cb_note_1"></a>毘婆尸太子，'
+        '<a class="noteAnchor star" href="#n0001003"></a></div>'
         '<div class="lg-cell">遊觀於園林，</div></div>'
         '</div><div id="back" style="display:none">'
         '<div class="footnote" id="n0001002">宋【明】</div>'
+        '<div class="footnote" id="n0001003">星號校勘</div>'
         '<span class="footnote add" id="cb_note_1">忽【CB】，怱【大】</span>'
         '</div></body></html>',
       );
@@ -301,15 +310,17 @@ void main() {
       expect(lines.first.footnotes.single.label, '2');
       expect(lines.first.footnotes.single.content, '宋【明】');
       expect(lines[1].verseCells, ['毘婆尸太子，', '遊觀於園林，']);
-      expect(lines[1].footnotes.single.label, 'A1');
-      expect(lines[1].footnotes.single.content, '忽【CB】，怱【大】');
+      expect(lines[1].footnotes.first.label, 'A1');
+      expect(lines[1].footnotes.first.content, '忽【CB】，怱【大】');
+      expect(lines[1].footnotes.last.label, '＊');
+      expect(lines[1].footnotes.last.content, '星號校勘');
       expect(
         visibleScriptureLine(
           lines[1],
           showLineBeginnings: true,
           showCollation: true,
         ),
-        '[0001a02] [A1]毘婆尸太子，遊觀於園林，\n',
+        '[0001a02] [A1]毘婆尸太子，[＊]遊觀於園林，\n',
       );
       expect(lines.any((line) => line.text.contains('宋【明】')), isFalse);
     },

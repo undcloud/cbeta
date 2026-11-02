@@ -47,7 +47,12 @@ String visibleScriptureLine(
   return result.toString();
 }
 
+/// 測試計數：整卷 HTML 被解析過幾次。展開摘要那一段有快取之後，同一卷再展開
+/// 一次不該讓這個數字繼續長。
+int debugScriptureHtmlParses = 0;
+
 List<ScriptureLine> parseScriptureHtml(String source) {
+  debugScriptureHtmlParses += 1;
   final fragment = parseFragment(source);
   final root = fragment.querySelector('#body') ?? fragment;
   final footnoteContent = {
@@ -57,6 +62,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
   };
   final lines = <ScriptureLine>[];
   String? linehead;
+  int? activeVerseCellIndex;
   var headingLevel = 0;
   var lineRole = ScriptureLineRole.regular;
   final text = StringBuffer();
@@ -68,6 +74,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
   var inlineNotes = <ScriptureInlineNote>[];
   final scriptRuns = <ScriptureScriptRun>[];
   final activeInlineNotes = <int>[];
+  var paragraphEnd = false;
 
   void flushLine() {
     // 夾注跨行(lb 在 small 內)時：本行末補上右括號並記錄本段的樣式範圍，
@@ -111,6 +118,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
                   label: note.label,
                   clue: note.clue,
                   content: note.content,
+                  verseCellIndex: note.verseCellIndex,
                 ),
               )
               .toList(),
@@ -145,6 +153,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
           ),
           headingLevel: headingLevel,
           role: lineRole,
+          paragraphEnd: paragraphEnd,
         ),
       );
     }
@@ -158,6 +167,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
     scriptRuns.clear();
     headingLevel = 0;
     lineRole = ScriptureLineRole.regular;
+    paragraphEnd = false;
     if (continuesInlineNotes) {
       text.write('（');
       activeCell?.write('（');
@@ -183,6 +193,18 @@ List<ScriptureLine> parseScriptureHtml(String source) {
     return const {'p', 'div'}.contains(node.localName)
         ? '$children\n'
         : children;
+  }
+
+  bool hasFollowingParagraph(html_dom.Element element) {
+    final siblings = element.parent?.nodes;
+    if (siblings == null) return false;
+    final index = siblings.indexWhere((sibling) => identical(sibling, element));
+    if (index < 0) return false;
+    for (final sibling in siblings.skip(index + 1)) {
+      if (sibling is html_dom.Text && sibling.data.trim().isEmpty) continue;
+      return sibling is html_dom.Element && sibling.localName == 'p';
+    }
+    return false;
   }
 
   void visit(html_dom.Node node) {
@@ -250,7 +272,9 @@ List<ScriptureLine> parseScriptureHtml(String source) {
       final clue = href.replaceFirst(_anchorPrefixPattern, '');
       final addNote = node.classes.contains('add');
       final noteNumber = _noteNumberPattern.firstMatch(href)?.group(1);
-      final label = addNote
+      final label = node.classes.contains('star')
+          ? '＊'
+          : addNote
           ? 'A${_trailingDigitsPattern.firstMatch(clue)?.group(1) ?? ''}'
           : noteNumber == null
           ? null
@@ -262,6 +286,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
             label: label,
             clue: clue,
             content: footnoteContent[clue] ?? '',
+            verseCellIndex: activeVerseCellIndex,
           ),
         );
       }
@@ -318,17 +343,21 @@ List<ScriptureLine> parseScriptureHtml(String source) {
         flushLine();
       }
       verseCells = [];
-      for (final cell in node.children.where(
-        (child) => child.classes.contains('lg-cell'),
-      )) {
+      final cells = node.children
+          .where((child) => child.classes.contains('lg-cell'))
+          .toList();
+      for (var cellIndex = 0; cellIndex < cells.length; cellIndex++) {
+        final cell = cells[cellIndex];
         final cellText = StringBuffer();
         activeCell = cellText;
+        activeVerseCellIndex = cellIndex;
         for (final child in cell.nodes) {
           visit(child);
         }
         verseCells.add(cellText.toString().trim());
       }
       activeCell = null;
+      activeVerseCellIndex = null;
       flushLine();
       return;
     }
@@ -356,6 +385,11 @@ List<ScriptureLine> parseScriptureHtml(String source) {
     }
     if (isBlock && text.isNotEmpty && !text.toString().endsWith('\n')) {
       appendText('\n');
+    }
+    if (isBlock &&
+        (text.isNotEmpty || images.isNotEmpty || tableRows.isNotEmpty)) {
+      paragraphEnd = hasFollowingParagraph(node);
+      flushLine();
     }
     if (isHeading || isStyledLine) flushLine();
   }
@@ -391,6 +425,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
         scriptRuns: line.scriptRuns,
         headingLevel: line.headingLevel,
         role: ScriptureLineRole.navigationAnchor,
+        paragraphEnd: line.paragraphEnd,
       );
     }
     return line;

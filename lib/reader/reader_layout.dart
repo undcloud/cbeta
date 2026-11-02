@@ -123,12 +123,17 @@ List<String> _verseCellRenderedTexts(
 }) {
   final rendered = <String>[];
   var cellStart = 0;
-  for (final cell in line.verseCells) {
+  for (var cellIndex = 0; cellIndex < line.verseCells.length; cellIndex++) {
+    final cell = line.verseCells[cellIndex];
     final cellEnd = cellStart + cell.length;
     final buffer = StringBuffer();
     var cursor = 0;
     for (final note in line.footnotes) {
-      if (note.offset < cellStart || note.offset > cellEnd) continue;
+      if (note.verseCellIndex != null
+          ? note.verseCellIndex != cellIndex
+          : note.offset < cellStart || note.offset > cellEnd) {
+        continue;
+      }
       final local = (note.offset - cellStart).clamp(cursor, cell.length);
       buffer.write(cell.substring(cursor, local));
       if (showCollation) {
@@ -271,6 +276,10 @@ ScriptureTextLayout buildScriptureTextLayout(
       );
       buffer.write(content);
       offset += content.length;
+    }
+    if (line.paragraphEnd) {
+      buffer.write('\n');
+      offset += 1;
     }
     sourceOffset += scriptureSourceAdvance(line);
   }
@@ -1149,8 +1158,9 @@ TextSpan interactivePassageText(
             text: cellText,
             footnotes: line.footnotes
                 .where(
-                  (note) =>
-                      note.offset >= sourceCursor && note.offset <= cellEnd,
+                  (note) => note.verseCellIndex != null
+                      ? note.verseCellIndex == cellIndex
+                      : note.offset >= sourceCursor && note.offset <= cellEnd,
                 )
                 .map(
                   (note) => ScriptureFootnote(
@@ -1256,6 +1266,10 @@ TextSpan interactivePassageText(
       sourceOffset += scriptureSourceAdvance(line);
     } else {
       addContent(line);
+    }
+    if (line.paragraphEnd) {
+      children.add(const TextSpan(text: '\n'));
+      offset += 1;
     }
   }
   return TextSpan(children: children);

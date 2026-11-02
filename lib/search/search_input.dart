@@ -367,6 +367,8 @@ class _SearchInputState extends State<SearchInput> {
       _suppress = false;
       _hideOverlay();
       _focusNode.unfocus();
+      // 點候選／歷史就等同送出：輸入框先同步成實際查詢詞，再回報搜尋。
+      widget.onSearch(selection);
     });
   }
 

@@ -361,8 +361,8 @@ Future<String> preferredQueryForInput(String rawInput);
 
 ### 4.6 点击、提交、焦点
 
-- **点击转换候选**：输入框文字替换为该候选，记录待搜索的 `SearchSelection`（`isExplicit = true`），隐藏浮层并失焦；**不立即搜索**，用户需要再按搜索按钮或键盘搜索键；
-- **点击历史行**：输入框保留历史原始输入，待搜索 query 使用 `search_selections` 保存的实际搜索词；同样不立即搜索；
+- **点击转换候选**：输入框文字替换为该候选，记录待搜索的 `SearchSelection`（`isExplicit = true`），隐藏浮层并失焦，**随即提交搜索**（同一帧回调里调用 `onSearch`，效果与按搜索按钮等价）；
+- **点击历史行**：输入框保留历史原始输入，待搜索 query 使用 `search_selections` 保存的实际搜索词；同样在填充后立即提交；
 - **按搜索按钮/键盘搜索键**：
   - 如果当前输入等于待搜索选择的 `rawInput` 或 `query`，直接提交待搜索选择；
   - 否则用 `resolveSearchQuery` 重新解析（见 5.5）；
@@ -612,8 +612,8 @@ return scriptureDisplaySettings.showSimplifiedText
 - 输入框使用 `SearchInput`，支持拼音/简繁输入时的实时候选；
 - 候选产生规则与第三章相同：首选、原始输入、全简体、双向组合；
 - 候选面板为每个候选统计所选词典的 key 命中数，并按第四章的规则排序、显示 `字典 N`；
-- 点击候选只替换输入框文字，不立即查询；
-- 键盘搜索键或「搜尋」按钮才执行查询。
+- 点击候选立即执行查询（与首页、经目、全文一致）；
+- 键盘搜索键或「搜尋」按钮同样执行查询。
 
 ### 9.2 按 key 命中数统计
 
@@ -759,6 +759,8 @@ return scriptureDisplaySettings.showSimplifiedText
 
 - 实测 600 卷：读档 106 ms、`jsonDecode` 再加 185 ms、`parseScriptureHtml` 再加 2239 ms —— 九成以上的时间花在把 HTML 解析成 DOM。离线全文要的只是「一串可比对的文字」，所以扫描第一階段改读预先建好的正規化字节档，命中集合与旧实作完全一致，速度约 40～140 倍；
 - 索引目录是 `<支援目录>/cbeta_sidx/{work}-{juan}.sidx`，与经卷 `cbeta_scripture/{work}-{juan}.json` 同层。**`.json` 是真相源，`.sidx` 是派生物**，可随时删除重建；`ScriptureVolumeStore.write()` 写完经卷会顺手 `scriptureIndexStore.deleteAt()`，`clearAll()` 会连索引目录一起清掉。
+- **下载/更新完成时就建索引**：`DownloadManager._storeVolume()` 写完 `.json` 立刻把 `(work, juan, path)` 交给 `offlineIndexQueue`（批 32 卷、最多 4 批在飞），`replaceDownloadedVolumes()` 与下载结束前 `flush()`；这样第一次离线搜索不再边扫边逐卷重建（两万多卷时那是最大的卡顿来源），`index_maintenance.dart` 的 `rebuildIndexes()` 也能在「删光索引但不重下经文」的情况下重建；
+- 索引读取有**有界内存缓存**（`SidxStore` 的卷缓存 24 MB、跳卷信息 4096 条，`LinkedHashMap` LRU）：同一字重搜、或换字重扫同一批卷时不再重复 `stat` + 读档；`write`／`deleteAt`／`clearAll` 会同时失效内存副本，避免删掉索引后仍读到旧字节；
 
 **正規化规则（写死并版本化：`sidxNormVersion`）**
 
@@ -777,7 +779,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 **第一階段只扫索引，第二階段才解析 HTML**
 
-- `runOfflineScan` 只产出 `(work, juan, linehead)`，不带正文；一部经的命中先以 `pendingHits` 发布，卡片展开时才调 `expandOfflineWork()` 用 `.json` 的 HTML 重比一次（实测约 4 ms/卷），摘要与 `sourceOffset` 都取自**带标点的原文**，再点其中一条才进阅读页；展开的 HTML 解析发生在主 isolate，所以卷与卷之间让出一幀，並由呼叫端傳 `shouldAbort`（`!mounted || 會話已被換掉`）——點開一部長的經再跳走，不會出現「頁面已經換了還在一卷卷解析」；
+- `runOfflineScan` 只产出 `(work, juan, linehead)`，不带正文；一部经的命中先以 `pendingHits` 发布，卡片展开时才调 `expandOfflineWork()` 用 `.json` 的 HTML 重比一次（实测约 4 ms/卷），摘要与 `sourceOffset` 都取自**带标点的原文**，再点其中一条才进阅读页；展开同样派给常驻池（`runExpand`），按来源 `.json` 的戳记做**整卷解析缓存**（`_expandedVolumes`，24 卷 LRU）：换字重开同一部经不会重解析同一卷；池已释放、网页版（`path` 为空）或测试环境退回 `runOfflineExpandInline`，主 isolate 一卷一卷做、卷间让出一帧，并由呼叫端传 `shouldAbort`（`!mounted || 會話已被換掉`）——點開一部長的經再跳走，不會出現「頁面已經換了還在一卷卷解析」；
 - 首页的接線是 `WorkStickyHeader.onExpansionChanged` → `_expandOfflineHits()`，用 `_expandingOfflineWorks` 防重复展开，完成后 `session.applyPassages(work, passages)` 用摘要取代那一部的待展开命中；还没展开完时该列显示「找到 N 處命中，正在載入經文摘要…」占位；
 - 上下文摘要 `offlineKwicSnippet()` 会停在卷题／作译者／校勘夹注的边界（`SidxSource.excluded`）：被结构边界挡住时不加省略号，因为省略号表示删掉的是经文，不是标题；
 - 命中一律排除：卷题、作译者、校勘夹注（`inlineNotes`）、以及卷首那行就在 `#body` 裡的 `No. 1092 [cf. Nos. 1093-1099, 901(Fasc. 5)]`，否则 cf 引用会污染正文结果。
@@ -789,7 +791,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - 块大小跟着每帧预算走（`volumesPerChunk = 24` 起步、`_batchBudgetMicros = 8000`）：一块跑得比预算快就翻倍，慢过四倍就折半，上限 2000 卷，块之间让出 4 ms，所以索引就位后块会一路长到千卷级，扫描自己推到 `finished`，不依赖卷动或按钮；
 - `flutter test` 的 fake-async 不会推进真实 isolate 的回覆，网页版也没有档案，所以 `offlineScanSupportsIsolate()` 在这两种情况下走同一份同步实作（只少了 isolate 跳板）；经卷 ref 没有 `path` 时（网页版存 SharedPreferences）由主 isolate 用 `scanOfflineVolume` 逐卷读，也不会去建 `cbeta_sidx/`；
 - 任何「只能在 UI isolate 上扫这一块」的兜底（池已释放、`parts < 2`、派工失败）都走 `runOfflineScanInline()`，它与 `runOfflineScan()` 共用 `_runOfflineScan` 但**每卷之间让出一幀**。自适应后一块可长到 2000 卷，同步扫完整块会把整个 App 顶死（Android 直接报「没有响应」），这条路径绝不能再用不分段的 `runOfflineScan`；
-- 缺索引或索引过期就在扫描的 isolate 内从 `.json` 重建（`_loadVolume`），所以第一次扫描同时是回填，之后每卷只剩「读标头与字符集 →（可能命中才）读正文」，罕见字查询连正文都不用打开；
+- 缺索引或索引过期就在扫描的 isolate 内从 `.json` 重建（`_loadVolume`）；下载流程已经提前建好，这里只剩「下载中／旧版留下的卷」与调试删档后的兜底回填。之后每卷只剩「读标头与字符集 →（可能命中才）读正文」，罕见字查询连正文都不用打开；
 - 进度透过 `ValueNotifier<OfflineScanProgress>` 回报，页面把通知合并成最多每 300 ms 一次 `setState`（`_offlinePublishInterval`），避免每一块都重建整个结果页；`loadMore()` 在离线模式直接返回，卷动不会再触发扫描；
 - 中断方式：换新搜索、`clearSearch()`、离开页面（`dispose`）都会 `_stopOfflineScan()`；App 进入后台时 `didChangeAppLifecycleState` 自动 `pause()`，回前台自动 `resume()`；用户可用正文分区的「暫停掃描／繼續掃描」按钮就地暂停（暂停只管「不再排下一块」，已交出去的那一块仍会跑完）；
 - **「看不見結果頁」等於取消 + 釋放**：結果頁被上一頁完全蓋住（`_ownRoute.secondaryAnimation.status == completed`）就 `pause()` 並 `releaseSharedOfflineScanPool()`，回到結果頁（`dismissed`）才 `resume()`，worker 由下一块掃描惰性重建；`clearSearch()` 同樣釋放池。代價是開一趟閱讀器回來要多等一次 worker 冷啟動（幾百毫秒），換來的是「使用者在讀經文時主執行緒不再被一批批經卷排著」；
@@ -816,6 +818,12 @@ return scriptureDisplaySettings.showSimplifiedText
 - 两种分页按钮互斥，不重复出现：离线模式只有「顯示更多作品（剩餘 N 部）／收合多顯示的作品」，线上模式只有「載入更多結果」；按钮排在清单尾端，画面内没有卷到底时不会被构建；
 - 向下卷动是两种模式的主要推进方式（`_onResultsScroll`）：离线模式到底就 `_revealMoreKeywordGroups()` 再放行一页卡片，线上模式到底就 `loadMore(fromScroll: true)` 发下一批请求；扫描期间每 300 ms 发布一次快照，若几百张卡片全部挂在一棵 `Column` 上，点击最后一卷时整串卡片会跟着重画而卡死；
 - 页面被其它路由盖住时（`_ownRoute.secondaryAnimation` 监听 + `isCurrent` 判断），进度只存进 `_pendingOfflineProgress`，等转场结束（`dismissed`）再一次性 flush，避免打开阅读器动画期间还在重建整页。
+
+### 11.4.2 「僅離線」開關與索引除錯入口
+
+- 首頁 AppBar 的雲朵按鈕切換 `offlineKeywordSearchOnly`（持久化 key `search_offline_only`，`lib/search/offline_preference.dart`）：開啟時 `_loadKeywordResults()` **不發線上請求**，直接走本地掃描（`_applyOfflineKeywordResults`）；全文搜尋頁的 `offlineMode` 也跟同一個值，避免每次搜尋都先等線上 45 秒完才落回本地；
+- 切換的當下若已有 `submittedQuery`，會立刻補跑一次本地掃描，不必等下一次搜尋；關閉後恢復「先線上、失敗才離線」的原路徑；
+- 下載管理面板底部有除錯用的「清除索引／重建索引」按鈕（`searchIndexDebugEntriesVisible`，非 const 開關）：清除只刪 `cbeta_sidx/` 不動 `.json`，重建是逐卷增量（戳記相符的卷會跳過），可以用來量測「索引到底省下多少時間」而不用重下兩萬多卷；入口穩定後把這個旗標改成 `false` 即隱藏。
 
 ### 11.5 在线全文延迟
 
@@ -854,14 +862,14 @@ return scriptureDisplaySettings.showSimplifiedText
 `test/widget_test.dart` 中与搜索相关的主要测试：
 
 - `homepage toggles persisted simplified text display`：`convert`、`convertCandidates`、`toSimplified`/`toSimplifiedAll`、`toTraditionalDisplay` 的典型结果与简繁显示切换；
-- `live search input shows history and candidate choices`：空输入历史、实时候选、原始输入标记、标签随显示模式转换、点击候选只填充、光标变化后按搜索键仍提交原始输入；
+- `live search input shows history and candidate choices`：空输入历史、实时候选、原始输入标记、标签随显示模式转换、点击候选立即提交、光标变化后按搜索键仍提交原始输入；
 - `candidate rows show and sort by dictionary key hits`：词典命中数显示、固定候选保持前两位、其余按次数排序；
 - `search query resolution prioritizes selection, history, and hits`：选中候选 > 历史 > 首选；命中数更高时覆盖首选；统计异常退回首选；全简体候选标记；
-- `searches are saved and can be selected again`：首页写入 `search_history`、清空后重新聚焦显示历史、点击历史后按搜索键再次搜索；
-- `homepage ambiguous simplified input offers candidates`：多候选面板、点击候选不搜索、按搜索按钮后才搜索；
+- `searches are saved and can be selected again`：首页写入 `search_history`、清空后重新聚焦显示历史、点击历史立即再次搜索；
+- `homepage ambiguous simplified input offers candidates`：多候选面板、点击候选立即搜索；
 - `multi-character ambiguous input offers cross-product candidates`：`厂丑` 的四个组合与延迟提交；
 - `work picker converts simplified text before TOC search`：经目查询点击候选后使用转换结果；
-- `dictionary tab offers live candidates and records the query`：词典页实时候选、命中数、点击候选不查询、按钮查询、写入 history + selection、不执行 Goto；
+- `dictionary tab offers live candidates and records the query`：词典页实时候选、命中数、点击候选立即查询、按钮查询、写入 history + selection、不执行 Goto；
 - `dictionary explicit traditional selection is not converted back`：词典页明确选择「雲」后按搜索，仍以「雲」查询与记录，不回退成「云」；
 - `homepage groups results into collapsible sections`：首页经目 / 字典 / 正文三个分区、经目与字典初始各 1 条与展开全部、各分区折叠/展开；
 - `dictionary key matches keep simplified candidates`：词典 key 统计与简繁候选；
@@ -928,7 +936,7 @@ return scriptureDisplaySettings.showSimplifiedText
 | 等待计数后再排序 | 候选立即展示；命中数异步返回后只重排非固定候选 |
 | 纯繁体/共用字不生成候选 | 任何非空输入都生成候选，并提供全简体候选 |
 | 历史选择参与候选置顶 | 历史只作为候选标记与查询词优先级，固定项只有首选和原文 |
-| 点击候选立即搜索 | 点击只填充输入框，必须再按搜索按钮/搜索键 |
+| 点击候选只填充，必须再按搜索按钮/搜索键 | 点击候选立即提交搜索，与按搜索按钮等价 |
 | 文本编辑下拉框 | 根 Overlay 中的只读 Material 列表 |
 | 只判断“全简体/全繁体” | 增加 mixed / neutral 与共用字处理 |
 | 所有入口都做 Goto | 只有首页自动判断；另有独立 Goto 查询标签页 |

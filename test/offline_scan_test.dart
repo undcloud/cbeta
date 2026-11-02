@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:xuefo/scripture/cache.dart';
+import 'package:xuefo/scripture/index_maintenance.dart';
 import 'package:xuefo/scripture/offline_scan.dart';
 import 'package:xuefo/scripture/parser.dart';
 import 'package:xuefo/scripture/sidx_store.dart';
@@ -413,5 +414,169 @@ void main() {
     releaseSharedOfflineScanPool();
     expect(sharedOfflineScanPool(), isNot(same(pool)));
     releaseSharedOfflineScanPool();
+  });
+
+  test('下載時預建索引：之後的掃描不必再解析 HTML', () async {
+    await seedVolumes(3);
+    final targets = await targetsFor(3);
+    expect(await buildOfflineIndexBatch(targets), 3);
+
+    final outcome = await runOfflineScan(requestFor('波羅蜜', targets));
+    expect(outcome.builtIndexes, 0);
+    expect(outcome.termHits, 3);
+    // 同一批再建一次是增量：戳記沒變的卷直接跳過。
+    expect(await buildOfflineIndexBatch(targets), 0);
+  });
+
+  test('建置佇列攢批交出去，flush 之後才全部落地', () async {
+    await seedVolumes(5);
+    final targets = await targetsFor(5);
+    final queue = OfflineIndexQueue();
+    for (final target in targets) {
+      await queue.add(target.work, target.juan, target.path);
+    }
+    // 還不滿一批：下載還在跑時不為幾卷就派工。
+    expect(queue.pendingTargets, hasLength(5));
+    await queue.flush();
+    expect(queue.pendingTargets, isEmpty);
+    expect((await runOfflineScan(requestFor('波羅蜜', targets))).builtIndexes, 0);
+  });
+
+  test('.sidx 記憶體快取讓重複搜尋不再讀檔', () async {
+    await seedVolumes(3);
+    final targets = await targetsFor(3);
+    final request = requestFor('波羅蜜', targets);
+    await runOfflineScan(request);
+
+    debugSidxBodyReads = 0;
+    expect((await runOfflineScan(request)).termHits, 3);
+    expect(debugSidxBodyReads, 3);
+
+    debugSidxBodyReads = 0;
+    expect((await runOfflineScan(request)).termHits, 3);
+    expect(debugSidxBodyReads, 0);
+  });
+
+  test('同一部經再展開一次不重解析整卷', () async {
+    await seedVolumes(2);
+    final targets = await targetsFor(2);
+    final outcome = await runOfflineScan(requestFor('波羅蜜多', targets));
+    final group = outcome.groups.first;
+
+    debugScriptureHtmlParses = 0;
+    final first = await expandOfflineWork(
+      work: group.work,
+      hits: group.hits,
+      query: '波羅蜜多',
+    );
+    expect(first, isNotEmpty);
+    final parsed = debugScriptureHtmlParses;
+    expect(parsed, greaterThan(0));
+
+    debugScriptureHtmlParses = 0;
+    final again = await expandOfflineWork(
+      work: group.work,
+      hits: group.hits,
+      query: '波羅蜜多',
+    );
+    expect(debugScriptureHtmlParses, 0);
+    expect(
+      again.map((passage) => passage.text).toList(),
+      first.map((passage) => passage.text).toList(),
+    );
+  });
+
+  test('經卷改版後展開快取失效，摘要跟著換', () async {
+    await seedVolumes(1);
+    final targets = await targetsFor(1);
+    final outcome = await runOfflineScan(requestFor('波羅蜜多', targets));
+    final group = outcome.groups.first;
+    expect(
+      await expandOfflineWork(
+        work: group.work,
+        hits: group.hits,
+        query: '波羅蜜多',
+      ),
+      isNotEmpty,
+    );
+
+    await scriptureVolumeStore.write(
+      CachedScriptureVolume(
+        work: 'T0001',
+        juan: '1',
+        contentVersion: 'v99',
+        html:
+            '<div id="body">'
+            '<p class="juan">測試經1卷第一</p>'
+            '<span class="lb" id="t0001n0001_p0001a01"></span>'
+            '<span class="t">般若波羅蜜多心經改過了</span>'
+            '</div>',
+      ),
+    );
+    final passages = await expandOfflineWork(
+      work: group.work,
+      hits: outcome.groups.first.hits,
+      query: '波羅蜜多',
+    );
+    expect(passages.single.text, contains('改過了'));
+  });
+
+  test('清除索引再重建：不用重下經文也回到就位狀態', () async {
+    await seedVolumes(4);
+    final targets = await targetsFor(4);
+    expect(await buildOfflineIndexBatch(targets), 4);
+    final maintenance = ScriptureIndexMaintenance(
+      indexStore: ScriptureIndexStore(directoryProvider: () async => tempDir),
+      volumeStore: scriptureVolumeStore,
+    );
+    expect(await maintenance.countIndexes(), 4);
+
+    expect(await maintenance.clearAllIndexes(), 4);
+    expect(await maintenance.countIndexes(), 0);
+
+    final steps = <int>[];
+    expect(
+      await maintenance.rebuildIndexes(
+        onProgress: (done, total) => steps.add(done),
+      ),
+      4,
+    );
+    expect(steps.last, 4);
+    expect(await maintenance.countIndexes(), 4);
+    expect((await runOfflineScan(requestFor('波羅蜜', targets))).builtIndexes, 0);
+  });
+
+  test('背景 worker 池真的跑通：建索引、掃描與展開', () async {
+    offlineScanIsolateOverride = true;
+    addTearDown(() => offlineScanIsolateOverride = null);
+    addTearDown(releaseSharedOfflineScanPool);
+    await seedVolumes(24);
+    final targets = await targetsFor(24);
+
+    final queue = OfflineIndexQueue();
+    for (final target in targets) {
+      await queue.add(target.work, target.juan, target.path);
+    }
+    await queue.flush();
+    // worker 真的落盤了：再建一次應該一卷也不需要動。
+    expect(await buildOfflineIndexBatch(targets), 0);
+
+    final session = OfflineScanSession('般若波羅蜜');
+    addTearDown(session.dispose);
+    await session.prepare();
+    session.start();
+    await _waitFor(() => session.finished);
+    expect(session.current.results, hasLength(24));
+    expect(session.current.termHits, 24);
+
+    final work = session.current.results.first.workId;
+    final passages = await expandOfflineWork(
+      work: work,
+      hits: session.pendingHitsFor(work),
+      query: '般若波羅蜜',
+      availableJuans: session.juansFor(work),
+    );
+    expect(passages, isNotEmpty);
+    expect(passages.first.text, contains('般若波羅蜜多心經'));
   });
 }

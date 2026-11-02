@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -128,13 +129,18 @@ class ScriptureIndexStore {
 
   final Future<Directory> Function() _directoryProvider;
 
+  /// 目錄路徑推導一次就固定；`pathFor` 每卷從搜尋到幾次，不該每次都 `create`。
+  String? _directoryPath;
+
   Future<String> directoryPath() async {
+    final cached = _directoryPath;
+    if (cached != null) return cached;
     final support = await _directoryProvider();
     final directory = Directory(
       '${support.path}${Platform.pathSeparator}cbeta_sidx',
     );
     await directory.create(recursive: true);
-    return directory.path;
+    return _directoryPath = directory.path;
   }
 
   /// 索引檔一律放在 `cbeta_sidx/`（與經卷 `cbeta_scripture/` 同層），讀寫刪
@@ -149,6 +155,8 @@ class ScriptureIndexStore {
     final path = await pathFor(work: volume.work, juan: volume.juan);
     if (path == null) return;
     await File(path).writeAsBytes(encodeSidx(volume), flush: true);
+    // 派生物換了內容，記憶體裡那份舊的必須一起作廢。
+    _forget(path);
   }
 
   /// 讀出可用的索引；戳記不符、損毀或不存在時回傳 null（呼叫端重建）。
@@ -159,6 +167,8 @@ class ScriptureIndexStore {
   }) async {
     final path = await pathFor(work: work, juan: juan);
     if (path == null) return null;
+    final cached = _rememberVolume(path, _volumeCache[path]);
+    if (cached != null && cached.sourceStamp == sourceStamp) return cached;
     try {
       final file = File(path);
       if (!await file.exists()) return null;
@@ -169,6 +179,7 @@ class ScriptureIndexStore {
         juan: juan,
       );
       if (volume == null || volume.sourceStamp != sourceStamp) return null;
+      _cacheVolume(path, volume);
       return volume;
     } catch (_) {
       return null;
@@ -182,6 +193,11 @@ class ScriptureIndexStore {
   }) async {
     final path = await pathFor(work: work, juan: juan);
     if (path == null) return null;
+    final cached = _skipCache.remove(path) ?? _skipCache[path];
+    if (cached != null) {
+      _skipCache[path] = cached;
+      return cached;
+    }
     RandomAccessFile? file;
     try {
       final source = File(path);
@@ -195,10 +211,12 @@ class ScriptureIndexStore {
       // 截斷的字符集會讓該卷看起來「沒有這些字」進而誤跳，寧可回傳 null
       // 讓呼叫端從 HTML 重建。
       if (charset.length != parsed.charsetLength) return null;
-      return SidxSkipInfo(
+      final info = SidxSkipInfo(
         charSet: decodeRuneSet(charset),
         sourceStamp: parsed.sourceStamp,
       );
+      _cacheSkip(path, info);
+      return info;
     } catch (_) {
       return null;
     } finally {
@@ -210,6 +228,7 @@ class ScriptureIndexStore {
     try {
       final path = await pathFor(work: work, juan: juan);
       if (path == null) return;
+      _forget(path);
       final file = File(path);
       if (await file.exists()) await file.delete();
     } catch (_) {
@@ -218,6 +237,9 @@ class ScriptureIndexStore {
   }
 
   Future<void> clearAll() async {
+    _volumeCache.clear();
+    _volumeCacheBytes = 0;
+    _skipCache.clear();
     if (kIsWeb) return;
     try {
       final directory = Directory(await directoryPath());
@@ -242,6 +264,60 @@ var scriptureIndexStore = ScriptureIndexStore();
 /// 測試計數：讀過幾次 `.sidx` 全文。跳卷過濾生效時不該增加——
 /// 字符集沒有查詢用的碼位，這一卷連正文都不該讀。
 int debugSidxBodyReads = 0;
+
+/// 每 isolate 一份的 `.sidx` 記憶體快取（計價以正規化正文位元組數）。
+///
+/// 常駐 worker 池跨搜尋重用，所以這一層真正的收益是「第二次搜常用字時不必再
+/// 逐卷讀檔」。從 HTML 重建的那一轮**不**進快取：否則同一次掃描的
+/// [debugSidxBodyReads] 會被掩掉，測試就看不出跳卷過濾有沒有生效。
+final LinkedHashMap<String, SidxVolume> _volumeCache = LinkedHashMap();
+int _volumeCacheBytes = 0;
+const int _volumeCacheBudgetBytes = 24 * 1024 * 1024;
+
+/// 字符集比正文小得多，全藏的標頭資訊值得放更長清單；戳記存在值裡，
+/// 呼叫端自己比對，所以內容換了的卷也不會讀到過期判斷。
+final LinkedHashMap<String, SidxSkipInfo> _skipCache = LinkedHashMap();
+const int _skipCacheEntryLimit = 4096;
+
+SidxVolume? _rememberVolume(String path, SidxVolume? entry) {
+  if (entry == null) return null;
+  // LinkedHashMap 保留插入順序：移除再插一次就是把它推到最近使用端。
+  _volumeCache.remove(path);
+  _volumeCache[path] = entry;
+  return entry;
+}
+
+void _cacheVolume(String path, SidxVolume volume) {
+  final size = volume.bytes.length + volume.lines.length * 32;
+  final replaced = _volumeSizes.remove(path);
+  if (replaced != null) _volumeCacheBytes -= replaced;
+  _volumeCache.remove(path);
+  _volumeCache[path] = volume;
+  _volumeSizes[path] = size;
+  _volumeCacheBytes += size;
+  while (_volumeCacheBytes > _volumeCacheBudgetBytes &&
+      _volumeCache.isNotEmpty) {
+    final eldest = _volumeCache.keys.first;
+    _volumeCache.remove(eldest);
+    _volumeCacheBytes -= _volumeSizes.remove(eldest) ?? 0;
+  }
+}
+
+final Map<String, int> _volumeSizes = {};
+
+void _cacheSkip(String path, SidxSkipInfo info) {
+  _skipCache.remove(path);
+  _skipCache[path] = info;
+  while (_skipCache.length > _skipCacheEntryLimit && _skipCache.isNotEmpty) {
+    _skipCache.remove(_skipCache.keys.first);
+  }
+}
+
+void _forget(String path) {
+  _volumeCacheBytes -= _volumeSizes.remove(path) ?? 0;
+  _volumeCache.remove(path);
+  _skipCache.remove(path);
+}
 
 /// 來源經卷 `.json` 的「大小 + 修改時間」→ 32 位元戳記。
 ///

@@ -110,6 +110,14 @@ class ScriptureVolumeStore {
     return volume;
   }
 
+  /// 經卷檔案的预期路徑（不保證存在）。背景索引工作只需要字串路徑，
+  /// 不該為了找一卷的檔案而把整個目錄列一遍。
+  Future<String> pathFor(String work, String juan) async {
+    final fileKey = _validateKey(work, juan);
+    final directory = await _cacheDirectory();
+    return '${directory.path}${Platform.pathSeparator}$fileKey.json';
+  }
+
   /// 只列出已儲存經卷的識別碼，不讀取經文內容，供大量經卷搜尋使用。
   Future<List<ScriptureVolumeRef>> listRefs() async {
     if (kIsWeb) {
@@ -167,7 +175,9 @@ class ScriptureVolumeStore {
     return ScriptureVolumeRef(work: work, juan: juan);
   }
 
-  Future<void> write(CachedScriptureVolume volume) async {
+  /// 寫入經卷並回傳檔案路徑（網頁版回傳空字串）；下載流程用它把索引工作
+  /// 直接交給背景建置佇列，不必再推一次路徑。
+  Future<String> write(CachedScriptureVolume volume) async {
     final fileKey = _validateKey(volume.work, volume.juan);
     final stored = jsonEncode(volume.toJson());
     if (kIsWeb) {
@@ -176,15 +186,17 @@ class ScriptureVolumeStore {
         stored,
       );
       if (!saved) throw StateError('無法儲存離線經文：${volume.key}');
-      return;
+      return '';
     }
     final directory = await _cacheDirectory();
     final file = File(
       '${directory.path}${Platform.pathSeparator}$fileKey.json',
     );
     await file.writeAsString(stored, flush: true);
-    // 經卷是真相源，`.sidx` 只是派生物；內容換了就丟，下次掃描重建。
+    // 經卷是真相源，`.sidx` 只是派生物；內容換了就丟（含記憶體裡那一份），
+    // 下次掃描或建置佇列會重建。
     await scriptureIndexStore.deleteAt(work: volume.work, juan: volume.juan);
+    return file.path;
   }
 
   Future<List<CachedScriptureVolume>> list() async {

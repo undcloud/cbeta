@@ -14,6 +14,8 @@
 - 长文渲染：正文按段落拆成 `ReaderPassageBlock`，标题/脚注/偈颂各有分支；
   悉曇/蘭札字区间的字体替换逻辑在 `scripture/parser.dart` 产出的
   `ScriptureLine.scriptRuns`，此页负责套用；
+- 相鄰正文段落之间加一行间距；该段落边界同时进入搜尋文字与位移換算，
+  不在偈頌段落前重複插入間距；
 - 长按/选择文字：复制、引文格式化、分享、全选（见 reader_citations）。
 
 ## reader_layout.dart
