@@ -14,6 +14,7 @@ migrate_working_dir/
 todo.md
 .ssh
 /font
+/CBReader
 
 # IntelliJ related
 *.iml

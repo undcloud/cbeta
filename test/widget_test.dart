@@ -2434,6 +2434,50 @@ void main() {
     }, () => client);
   });
 
+  testWidgets('offline Goto of a finer line opens the nearest paragraph', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    // 下載壓縮檔只有段落級錨點：兩段都標在 a01，引文卻是段中的 a03。
+    await scriptureVolumeStore.write(
+      const CachedScriptureVolume(
+        work: 'T0001',
+        juan: '1',
+        html:
+            '<div id="body">'
+            '<span class="lb" id="T01n0001_p0001a01"></span>'
+            '<span class="t">第一段經文</span>'
+            '<span class="lb" id="T01n0001_p0001a01"></span>'
+            '<span class="t">第二段目標句所在</span>'
+            '<span class="lb" id="T01n0001_p0001a05"></span>'
+            '<span class="t">第五行開始的段落</span>'
+            '</div>',
+      ),
+    );
+    final client = MockClient((request) async {
+      throw const SocketException('offline');
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(const CbetaSearchApp());
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.byType(TextField).first,
+        'CBETA 2026.R2, T01, no. 1, p. 1a3',
+      );
+      await tester.testTextInput.receiveAction(TextInputAction.search);
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Goto 查詢失敗'), findsNothing);
+      expect(readerFirstBlockSpan(tester)!.toPlainText(), contains('第二段目標句所在'));
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+    }, () => client);
+  });
+
   testWidgets('homepage Goto search opens a passage without keyword search', (
     tester,
   ) async {

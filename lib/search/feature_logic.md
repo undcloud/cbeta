@@ -519,6 +519,8 @@ Future<String> resolveSearchQuery(
 - 「选择佛经 → Goto 查询」是独立入口，使用普通 `TextField`，始终规范化并请求 `/juans/goto`，不做简繁候选；
 - 卷内搜索、经目查询、作译者查询、词典查询、AI 页面都不会把输入自动解释为 Goto；
 - 但 `buildSearchChoices` 对所有 `SearchInput` 都检查 Goto 表达式，因此这些入口输入 Goto 形状的文字时不会显示候选面板，提交后按普通关键字/元数据处理。
+- **行號比本地錨點更細時落在之前最近的錨點**：下載壓縮檔的 HTML 只有段落級 `lineInfo` 錨點（《七佛經》卷一只有 `0150a05/0150a07/0150a11/…`），而 CBETA 引文是逐行行號（`p. 150a9` 的錨點根本不在檔內）。`passage_resolver.dart` 的 `nearestLocalLinehead` 先在每一卷取「目標之前最近的錨點」，`findLocalVolumeForLinehead` 據此選出該卷；送給閱讀器的仍是**原始逐行行號**，讓閱讀器的 `_resolveArchiveAnchorTarget` 在同一卷內再挑一次最近錨點——同一個段落錨點可能領頭好幾段（`0150a07` 出現兩次），帶細行號才能選到「共坐思惟」那一段而不是第一段。改成本地直接換成段落錨點會讓位置退回該錨點的第一段。
+- 只有本地完全沒有任何 ≤ 目標的錨點（該經沒下載或目標在第一個錨點之前）才回報 `離線模式下，本地尚未儲存「…」所在的經卷`。
 
 示例：
 

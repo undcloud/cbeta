@@ -275,6 +275,55 @@ ScripturePassage localPassage({
   );
 }
 
+/// 下載壓縮檔只保留段落級錨點（如 0150a07），而 CBETA 引文是逐行行號
+/// （如 0150a09）；取目標行號之前最近的錨點，Goto 才不會因為行號比本檔更細而失敗。
+String? nearestLocalLinehead(List<ScriptureLine> lines, String linehead) {
+  final split = linehead.lastIndexOf('_p');
+  if (split <= 0) return null;
+  final prefix = linehead.substring(0, split);
+  final target = linehead.substring(split + 2);
+  String? nearest;
+  for (final line in lines) {
+    final head = line.linehead;
+    if (head == null || !head.startsWith('${prefix}_p')) continue;
+    final value = head.substring(prefix.length + 2);
+    if (value.compareTo(target) > 0) continue;
+    if (nearest == null || value.compareTo(nearest) > 0) nearest = value;
+  }
+  return nearest == null ? null : '${prefix}_p$nearest';
+}
+
+typedef LocalAnchorHit = ({
+  CachedScriptureVolume volume,
+  List<ScriptureLine> lines,
+});
+
+/// 在本地已儲存的經卷中找出目標行號所在的卷：先找精確錨點，
+/// 沒有就拿「行號之前最近錨點」所在的那一卷（跨卷時取最接近目標的一卷）。
+Future<LocalAnchorHit?> findLocalVolumeForLinehead(
+  List<ScriptureVolumeRef> workRefs,
+  String linehead,
+) async {
+  LocalAnchorHit? nearest;
+  String? nearestAnchor;
+  for (final ref in workRefs) {
+    final volume = await scriptureVolumeStore.readRef(ref);
+    if (volume == null) continue;
+    final lines = tryParseLocalVolume(volume);
+    if (lines == null) continue;
+    final anchor = nearestLocalLinehead(lines, linehead);
+    if (anchor == null) continue;
+    if (anchor == linehead) {
+      return (volume: volume, lines: lines);
+    }
+    if (nearestAnchor == null || anchor.compareTo(nearestAnchor) > 0) {
+      nearestAnchor = anchor;
+      nearest = (volume: volume, lines: lines);
+    }
+  }
+  return nearest;
+}
+
 /// 以本地已儲存的離線經卷建立可開啟的經卷位置，
 /// 供離線經目點擊與 Goto 使用。
 Future<ScripturePassage?> localWorkPassage(
@@ -288,20 +337,15 @@ Future<ScripturePassage?> localWorkPassage(
   sortRefsByJuan(workRefs);
   final juans = cachedJuansForRefs(allRefs, work);
   if (targetLinehead != null) {
-    for (final ref in workRefs) {
-      final volume = await scriptureVolumeStore.readRef(ref);
-      if (volume == null) continue;
-      final lines = tryParseLocalVolume(volume);
-      if (lines != null &&
-          lines.any((line) => line.linehead == targetLinehead)) {
-        return localPassage(
-          work: work,
-          volume: volume,
-          lines: lines,
-          juans: juans,
-          linehead: targetLinehead,
-        );
-      }
+    final hit = await findLocalVolumeForLinehead(workRefs, targetLinehead);
+    if (hit != null) {
+      return localPassage(
+        work: work,
+        volume: hit.volume,
+        lines: hit.lines,
+        juans: juans,
+        linehead: targetLinehead,
+      );
     }
   }
   final target = await scriptureVolumeStore.readRef(workRefs.first);
@@ -311,29 +355,26 @@ Future<ScripturePassage?> localWorkPassage(
 }
 
 /// 離線時依行號在本地已儲存的經卷中尋找對應位置。
+///
+/// 本地行號比目标粗（下載檔只有段落級錨點）時也要能開啟，所以保留引文的
+/// 逐行行號交給閱讀器，由閱讀器的段落錨點回退選出正確的那一段。
 Future<ScripturePassage?> resolveGotoPassageLocally(String linehead) async {
   final work = lineheadWorkId(linehead);
   if (work.isEmpty) return null;
   final refs = await scriptureVolumeStore.listRefs();
   final workRefs = refs.where((ref) => ref.work == work).toList();
   sortRefsByJuan(workRefs);
+  if (workRefs.isEmpty) return null;
   final juans = cachedJuansForRefs(refs, work);
-  for (final ref in workRefs) {
-    final volume = await scriptureVolumeStore.readRef(ref);
-    if (volume == null) continue;
-    final lines = tryParseLocalVolume(volume);
-    if (lines == null || !lines.any((line) => line.linehead == linehead)) {
-      continue;
-    }
-    return localPassage(
-      work: work,
-      volume: volume,
-      lines: lines,
-      juans: juans,
-      linehead: linehead,
-    );
-  }
-  return null;
+  final hit = await findLocalVolumeForLinehead(workRefs, linehead);
+  if (hit == null) return null;
+  return localPassage(
+    work: work,
+    volume: hit.volume,
+    lines: hit.lines,
+    juans: juans,
+    linehead: linehead,
+  );
 }
 
 /// 離線時以本地已儲存經卷的經名／作譯者進行經目查詢。

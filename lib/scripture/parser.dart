@@ -314,6 +314,9 @@ List<ScriptureLine> parseScriptureHtml(String source) {
       return;
     }
     if (node is html_dom.Element && node.classes.contains('lg-row')) {
+      if (text.isNotEmpty || images.isNotEmpty || tableRows.isNotEmpty) {
+        flushLine();
+      }
       verseCells = [];
       for (final cell in node.children.where(
         (child) => child.classes.contains('lg-cell'),
