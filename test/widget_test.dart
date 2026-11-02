@@ -258,6 +258,7 @@ void main() {
       ('東晉罽賓三藏瞿曇僧伽提婆譯\n', ScriptureLineRole.byline),
       ('正文（夾注）\n', ScriptureLineRole.regular),
     ]);
+    expect(lines.first.headingLevel, 2);
     expect(lines.last.inlineNotes.single.length, '（夾注）'.length);
   });
 
@@ -275,7 +276,9 @@ void main() {
     expect(lines, hasLength(2));
     expect(lines.first.role, ScriptureLineRole.volumeTitle);
     expect(lines.first.text, '毘婆尸佛經卷上\n');
+    expect(lines.first.headingLevel, 2);
     expect(lines.last.role, ScriptureLineRole.navigationAnchor);
+    expect(lines.last.headingLevel, 0);
     expect(lines.last.linehead, 'T01n0003_p0156c08');
     expect(lines.last.text, '毘婆尸佛經卷上\n');
     expect(
@@ -836,7 +839,7 @@ void main() {
     }, () => client);
   });
 
-  testWidgets('reader distinguishes opening and closing title hits', (
+  testWidgets('reader scrolls to opening and closing title hits in the body', (
     tester,
   ) async {
     SharedPreferences.setMockInitialValues({});
@@ -926,13 +929,12 @@ void main() {
     }
 
     await http.runWithClient(() async {
-      // 開頭經題（標題列）：回到卷首，只在標題列高亮。
+      // 卷首經題現在是正文標題，命中時停在卷首並在正文高亮。
       final opening = await openHit(openingTitleHit);
       expect(opening.pixels, 0);
-      expect(opening.bodyHighlights, isEmpty);
+      expect(opening.bodyHighlights, contains('五蘊'));
 
-      // 卷末重複經題：滑到它在正文中的實際位置並在正文高亮，
-      // 不會和標題列重複高亮。
+      // 卷末重複經題：滑到它在正文中的實際位置並在正文高亮。
       final closing = await openHit(closingTitleHit);
       expect(closing.bodyHighlights, contains('五蘊'));
       expect(closing.pixels, greaterThan(0));
@@ -1088,92 +1090,128 @@ void main() {
     );
   });
 
-  testWidgets('reader styles volume titles, bylines, and inline notes', (
-    tester,
-  ) async {
-    SharedPreferences.setMockInitialValues({});
-    await scriptureDisplaySettings.load();
-    const scriptureHtml =
-        '<html><body><div id="body">'
-        '<p class="juan">中阿含經卷第五</p>'
-        '<p class="byline">東晉罽賓三藏瞿曇僧伽提婆譯</p>'
-        '<span class="lb" id="T01n0026_p0448c11"></span>'
-        '<p>正文<small class="inline-note">夾注</small></p>'
-        '</div></body></html>';
-    final client = MockClient((request) async {
-      if (request.url.path == '/stable/juans') {
-        return http.Response(
-          jsonEncode({
-            'results': [scriptureHtml],
-          }),
-          200,
-          headers: {'content-type': 'application/json'},
-        );
-      }
-      return http.Response('{}', 404);
-    });
-
-    await http.runWithClient(() async {
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: ScriptureReaderPage(
-            passage: ScripturePassage(
-              title: '中阿含經',
-              reference: '卷 5',
-              text: '',
-              linehead: 'T01n0026_p0448c11',
-              juan: '5',
-              work: 'T0026',
-            ),
-            query: '',
-            searchHits: [],
-            initialHitIndex: 0,
-          ),
-        ),
-      );
-      await tester.pumpAndSettle();
-
-      bool containsStyledSpan(
-        InlineSpan span, {
-        required String text,
-        required Color color,
-      }) {
-        if (span is! TextSpan) return false;
-        if (span.style?.color == color && span.toPlainText().contains(text)) {
-          return true;
+  testWidgets(
+    'reader shows the volume title as a body heading and byline in header',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await scriptureDisplaySettings.load();
+      const scriptureHtml =
+          '<html><body><div id="body">'
+          '<p class="juan">中阿含經卷第五</p>'
+          '<p class="byline">東晉罽賓三藏瞿曇僧伽提婆譯</p>'
+          '<span class="lb" id="T01n0026_p0448c11"></span>'
+          '<p>正文<small class="inline-note">夾注</small></p>'
+          '</div></body></html>';
+      final client = MockClient((request) async {
+        if (request.url.path == '/stable/juans') {
+          return http.Response(
+            jsonEncode({
+              'results': [scriptureHtml],
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
         }
-        return span.children?.any(
-              (child) => containsStyledSpan(child, text: text, color: color),
-            ) ??
-            false;
-      }
+        return http.Response('{}', 404);
+      });
 
-      expect(
-        containsStyledSpan(
-          readerFirstBlockSpan(tester)!,
-          text: '中阿含經卷第五',
-          color: const Color(0xFF007564),
-        ),
-        isTrue,
-      );
-      expect(
-        containsStyledSpan(
-          readerFirstBlockSpan(tester)!,
-          text: '東晉罽賓三藏瞿曇僧伽提婆譯',
-          color: const Color(0xFF8C7B66),
-        ),
-        isTrue,
-      );
+      await http.runWithClient(() async {
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: ScriptureReaderPage(
+              passage: ScripturePassage(
+                title: '中阿含經',
+                reference: '卷 5',
+                text: '',
+                linehead: 'T01n0026_p0448c11',
+                juan: '5',
+                work: 'T0026',
+              ),
+              query: '',
+              searchHits: [],
+              initialHitIndex: 0,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
 
-      bool containsMutedInlineNote(InlineSpan span) {
-        if (span is! TextSpan) return false;
-        return span.style?.color == const Color(0xFF9C8B78) ||
-            (span.children?.any(containsMutedInlineNote) ?? false);
-      }
+        bool containsStyledSpan(
+          InlineSpan span, {
+          required String text,
+          required Color color,
+        }) {
+          if (span is! TextSpan) return false;
+          if (span.style?.color == color && span.toPlainText().contains(text)) {
+            return true;
+          }
+          return span.children?.any(
+                (child) => containsStyledSpan(child, text: text, color: color),
+              ) ??
+              false;
+        }
 
-      expect(containsMutedInlineNote(readerFirstBlockSpan(tester)!), isTrue);
-    }, () => client);
-  });
+        bool hasHeadingStyle(InlineSpan span, String text) {
+          if (span is! TextSpan) return false;
+          if (span.style?.fontWeight == FontWeight.w700 &&
+              span.toPlainText().contains(text)) {
+            return true;
+          }
+          return span.children?.any((child) => hasHeadingStyle(child, text)) ??
+              false;
+        }
+
+        final firstBlock = readerFirstBlockSpan(tester)!;
+        final bodySpan = readerBlockBodySpan(readerFirstBlockText(tester))!;
+        expect(bodySpan.toPlainText(), contains('中阿含經卷第五'));
+        expect(hasHeadingStyle(bodySpan, '中阿含經卷第五'), isTrue);
+        expect(
+          containsStyledSpan(
+            firstBlock,
+            text: '中阿含經卷第五',
+            color: const Color(0xFF007564),
+          ),
+          isTrue,
+        );
+        // 段前空行 + 標題行首的置中留白，標題後再留一空行。
+        expect(bodySpan.toPlainText(), startsWith('\n\uFFFC中阿含經卷第五\n\n'));
+        final bodyChildren = (bodySpan as TextSpan).children!;
+        expect(bodyChildren[1], isA<WidgetSpan>());
+        expect(
+          ((bodyChildren[1] as WidgetSpan).child as SizedBox).width,
+          greaterThan(0),
+        );
+        // 實際排版位置也要居中，不能只靠 span 結構。
+        final paragraph = readerParagraphWith(tester, '中阿含經卷第五');
+        final plain = paragraph.text.toPlainText();
+        final titleAt = plain.indexOf('中阿含經卷第五');
+        final titleLeft = readerCaretRect(paragraph, titleAt).left;
+        final titleRight = readerCaretRect(
+          paragraph,
+          titleAt + '中阿含經卷第五'.length,
+        ).left;
+        expect(
+          ((titleLeft + titleRight) / 2 - paragraph.size.width / 2).abs(),
+          lessThan(1.5),
+        );
+        expect(
+          containsStyledSpan(
+            firstBlock,
+            text: '東晉罽賓三藏瞿曇僧伽提婆譯',
+            color: const Color(0xFF8C7B66),
+          ),
+          isTrue,
+        );
+
+        bool containsMutedInlineNote(InlineSpan span) {
+          if (span is! TextSpan) return false;
+          return span.style?.color == const Color(0xFF9C8B78) ||
+              (span.children?.any(containsMutedInlineNote) ?? false);
+        }
+
+        expect(containsMutedInlineNote(readerFirstBlockSpan(tester)!), isTrue);
+      }, () => client);
+    },
+  );
 
   testWidgets('reader keeps collation markers on byline lines', (
     WidgetTester tester,

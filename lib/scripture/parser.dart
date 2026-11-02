@@ -370,7 +370,11 @@ List<ScriptureLine> parseScriptureHtml(String source) {
         (node.classes.contains('head') ||
             node.attributes.containsKey('data-head-level'));
     if ((isHeading || isStyledLine) && text.isNotEmpty) flushLine();
-    if (isVolumeTitle) lineRole = ScriptureLineRole.volumeTitle;
+    if (isVolumeTitle) {
+      lineRole = ScriptureLineRole.volumeTitle;
+      // 卷題在網頁模式下是正文裡的次級標題，不再上移到閱讀器頁首。
+      headingLevel = 2;
+    }
     if (isByline) lineRole = ScriptureLineRole.byline;
     if (isHeading) {
       headingLevel =
@@ -423,7 +427,8 @@ List<ScriptureLine> parseScriptureHtml(String source) {
         footnotes: line.footnotes,
         inlineNotes: line.inlineNotes,
         scriptRuns: line.scriptRuns,
-        headingLevel: line.headingLevel,
+        // 卷末重複題只保留正文位置，不再套次級標題樣式。
+        headingLevel: 0,
         role: ScriptureLineRole.navigationAnchor,
         paragraphEnd: line.paragraphEnd,
       );

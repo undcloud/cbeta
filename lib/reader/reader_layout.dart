@@ -113,6 +113,26 @@ const headerFootnoteStyle = TextStyle(
 bool _isWidgetOnlyScriptureLine(ScriptureLine line) =>
     line.tableRows.isNotEmpty || (line.images.isNotEmpty && line.text.isEmpty);
 
+/// 偈頌注所屬的格號。
+///
+/// 解析器已記錄 `verseCellIndex` 時以它為準；舊資料沒有時用位移推導。
+/// 位移正好等於格尾時歸前一格，避免同一注在相鄰兩格各渲染一次。
+int _verseCellIndexForNote(ScriptureLine line, ScriptureFootnote note) {
+  final cellCount = line.verseCells.length;
+  if (cellCount == 0) return 0;
+  final explicit = note.verseCellIndex;
+  if (explicit != null && explicit >= 0 && explicit < cellCount) {
+    return explicit;
+  }
+  var cellStart = 0;
+  for (var cellIndex = 0; cellIndex < cellCount; cellIndex++) {
+    final cellEnd = cellStart + line.verseCells[cellIndex].length;
+    if (note.offset <= cellEnd) return cellIndex;
+    cellStart = cellEnd;
+  }
+  return cellCount - 1;
+}
+
 /// 偈頌每一格在畫面上的文字（含校勘標記）。
 ///
 /// 這個結果同時供 layout 位移計算與實際渲染使用，兩者必須完全一致，
@@ -129,11 +149,7 @@ List<String> _verseCellRenderedTexts(
     final buffer = StringBuffer();
     var cursor = 0;
     for (final note in line.footnotes) {
-      if (note.verseCellIndex != null
-          ? note.verseCellIndex != cellIndex
-          : note.offset < cellStart || note.offset > cellEnd) {
-        continue;
-      }
+      if (_verseCellIndexForNote(line, note) != cellIndex) continue;
       final local = (note.offset - cellStart).clamp(cursor, cell.length);
       buffer.write(cell.substring(cursor, local));
       if (showCollation) {
@@ -159,6 +175,12 @@ String _scriptureLineBeginningPrefix(
     ? '[${line.linehead!.split('_p').last}] '
     : '';
 
+/// 正文卷題的置中留白 placeholder 加段前換行，共佔 2 個純文字字元。
+const int _volumeTitleLeadingLength = 2;
+
+bool _isBodyVolumeTitle(ScriptureLine line) =>
+    line.role == ScriptureLineRole.volumeTitle && line.headingLevel > 0;
+
 /// 每個閱讀區塊第一個字元在整卷 layout 純文字中的起始位移。
 ///
 /// `lineStarts` 記錄在行首標記之後，偈頌段首的補換行也在區塊內，
@@ -177,6 +199,9 @@ List<int> scriptureBlockOffsetBases(
       lines[start],
       showLineBeginnings,
     ).length;
+    if (_isBodyVolumeTitle(lines[start])) {
+      base -= _volumeTitleLeadingLength;
+    }
     if (start > 0 &&
         lines[start].verseCells.isNotEmpty &&
         lines[start - 1].verseCells.isEmpty &&
@@ -213,6 +238,12 @@ ScriptureTextLayout buildScriptureTextLayout(
       // 偈頌段落前只需要一個換行；前一行若已自帶換行就不再重複。
       buffer.write('\n');
       offset += 1;
+    }
+    final isBodyVolumeTitle = _isBodyVolumeTitle(line);
+    if (isBodyVolumeTitle) {
+      // 段前換行 + 置中留白 placeholder（留白必須與標題同一個換行後）。
+      buffer.write('\n\uFFFC');
+      offset += _volumeTitleLeadingLength;
     }
     final prefix = _scriptureLineBeginningPrefix(line, showLineBeginnings);
     if (prefix.isNotEmpty) {
@@ -281,6 +312,11 @@ ScriptureTextLayout buildScriptureTextLayout(
       buffer.write('\n');
       offset += 1;
     }
+    if (isBodyVolumeTitle) {
+      // 段後再留一空行。
+      buffer.write('\n');
+      offset += 1;
+    }
     sourceOffset += scriptureSourceAdvance(line);
   }
   return ScriptureTextLayout(
@@ -319,7 +355,8 @@ int layoutEditableOffsetForSource(
                 ? line.footnotes
                       .where(
                         (note) =>
-                            note.offset >= consumed && note.offset <= inLine,
+                            _verseCellIndexForNote(line, note) == c &&
+                            note.offset <= inLine,
                       )
                       .fold<int>(
                         0,
@@ -393,11 +430,12 @@ resolveSearchTargetOffset(
   final source = buildScriptureSearchSource(bodyLines);
   final storedOffset = passage.sourceOffset;
   if (storedOffset != null) {
-    final located = _locateSnippetOffset(
-      source,
-      storedOffset - headerAdvance,
-      passage.snippet,
-    );
+    // 作譯者等 header 行可能在卷題之前或之後；兩個候選都先用 snippet 驗證。
+    int? located;
+    for (final candidate in {storedOffset - headerAdvance, storedOffset}) {
+      located = _locateSnippetOffset(source, candidate, passage.snippet);
+      if (located != null) break;
+    }
     if (located != null) {
       final layoutOffset = layoutEditableOffsetForSource(
         layout,
@@ -421,7 +459,7 @@ resolveSearchTargetOffset(
   if (linehead == null) return empty;
   if (headerLines.any((line) => line.linehead == linehead)) {
     return (
-      offset: layout.text.length,
+      offset: 0,
       lineStart: 0,
       inHeader: true,
       sourceOffset: null,
@@ -972,7 +1010,7 @@ TextSpan interactivePassageText(
     showCollation: settings.showCollation,
   );
 
-  TextStyle headingStyle(int level) {
+  TextStyle headingStyle(int level, {bool volumeTitle = false}) {
     final scale = switch (level) {
       1 => 1.35,
       2 => 1.25,
@@ -985,6 +1023,11 @@ TextSpan interactivePassageText(
       fontSize: settings.fontSize * scale,
       fontWeight: level <= 2 ? FontWeight.w700 : FontWeight.w600,
       letterSpacing: 0,
+      color: volumeTitle
+          ? (settings.isDark
+                ? const Color(0xFF72C5B2)
+                : const Color(0xFF007564))
+          : null,
     );
   }
 
@@ -992,7 +1035,13 @@ TextSpan interactivePassageText(
     final content = contentSpans(line, offset, sourceOffset);
     if (line.headingLevel > 0) {
       children.add(
-        TextSpan(style: headingStyle(line.headingLevel), children: content),
+        TextSpan(
+          style: headingStyle(
+            line.headingLevel,
+            volumeTitle: _isBodyVolumeTitle(line),
+          ),
+          children: content,
+        ),
       );
     } else {
       children.addAll(content);
@@ -1021,6 +1070,56 @@ TextSpan interactivePassageText(
       // 與 `buildScriptureTextLayout` 一致：前一行沒有換行才補一個。
       children.add(const TextSpan(text: '\n'));
       offset += 1;
+    }
+    if (_isBodyVolumeTitle(line)) {
+      final prefixText = _scriptureLineBeginningPrefix(
+        line,
+        settings.showLineBeginnings,
+      );
+      final prefixSpan = prefixText.isEmpty
+          ? null
+          : TextSpan(
+              text: prefixText,
+              style: const TextStyle(
+                color: Color(0xFF9A7A42),
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            );
+      final contentOffset =
+          offset + _volumeTitleLeadingLength + prefixText.length;
+      final content = contentSpans(line, contentOffset, sourceOffset);
+      final style = headingStyle(line.headingLevel, volumeTitle: true);
+      final painter = TextPainter(
+        text: TextSpan(style: style, children: [?prefixSpan, ...content]),
+        textDirection: Directionality.of(context),
+        textScaler: MediaQuery.textScalerOf(context),
+        maxLines: 1,
+      )..layout();
+      final pad = ((width - painter.width) / 2).clamp(0.0, double.infinity);
+      painter.dispose();
+      children.add(const TextSpan(text: '\n'));
+      children.add(
+        WidgetSpan(
+          alignment: PlaceholderAlignment.middle,
+          child: SizedBox(width: pad, height: 0),
+        ),
+      );
+      offset += _volumeTitleLeadingLength;
+      if (prefixSpan != null) {
+        children.add(prefixSpan);
+        offset += prefixText.length;
+      }
+      children.add(TextSpan(style: style, children: content));
+      offset += visibleLineLength(line);
+      sourceOffset += scriptureSourceAdvance(line);
+      if (line.paragraphEnd) {
+        children.add(const TextSpan(text: '\n'));
+        offset += 1;
+      }
+      children.add(const TextSpan(text: '\n'));
+      offset += 1;
+      continue;
     }
     if (settings.showLineBeginnings &&
         line.linehead != null &&
@@ -1158,9 +1257,7 @@ TextSpan interactivePassageText(
             text: cellText,
             footnotes: line.footnotes
                 .where(
-                  (note) => note.verseCellIndex != null
-                      ? note.verseCellIndex == cellIndex
-                      : note.offset >= sourceCursor && note.offset <= cellEnd,
+                  (note) => _verseCellIndexForNote(line, note) == cellIndex,
                 )
                 .map(
                   (note) => ScriptureFootnote(

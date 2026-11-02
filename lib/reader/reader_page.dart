@@ -994,15 +994,12 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
                 if (lines.isEmpty) {
                   return const NoResults(message: '找不到此行的經文內容');
                 }
+                // 卷題已經留在正文裡當次級標題；頁首只保留作譯者等 metadata。
                 final headerLines = lines
-                    .where(
-                      (line) =>
-                          line.role == ScriptureLineRole.volumeTitle ||
-                          line.role == ScriptureLineRole.byline,
-                    )
+                    .where((line) => line.role == ScriptureLineRole.byline)
                     .toList();
                 final headerPrefixLength = () {
-                  // 每個卷題／作譯者行都有一個對齊用的 WidgetSpan，
+                  // 每個作譯者行都有一個對齊用的 WidgetSpan，
                   // 且校勘標記必須跟實際渲染一致。
                   final showCollation = scriptureDisplaySettings.showCollation;
                   var len = 0;
@@ -1019,11 +1016,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
                   return len;
                 }();
                 final scriptureLines = lines
-                    .where(
-                      (line) =>
-                          line.role != ScriptureLineRole.volumeTitle &&
-                          line.role != ScriptureLineRole.byline,
-                    )
+                    .where((line) => line.role != ScriptureLineRole.byline)
                     .toList();
                 final settings = scriptureDisplaySettings;
                 final layout = buildScriptureTextLayout(
@@ -1385,7 +1378,7 @@ class _ReaderPassageBlock extends StatefulWidget {
 }
 
 class ReaderPassageBlockState extends State<_ReaderPassageBlock> {
-  /// 卷題／作譯者行的文字片段，校勘標記與正文一致。
+  /// 作譯者行的文字片段，校勘標記與正文一致。
   List<InlineSpan> _headerLineSpans(ScriptureLine line) {
     final query = widget.query.trim();
     final showCollation = scriptureDisplaySettings.showCollation;
@@ -1458,17 +1451,9 @@ class ReaderPassageBlockState extends State<_ReaderPassageBlock> {
 
         for (final line in widget.headerLines) {
           final isNight = settings.isDark;
-          final isVolumeTitle = line.role == ScriptureLineRole.volumeTitle;
           final lineStyle = scriptureTextStyle(settings).copyWith(
-            color: isNight
-                ? (isVolumeTitle
-                      ? const Color(0xFF72C5B2)
-                      : const Color(0xFFA99A85))
-                : (isVolumeTitle
-                      ? const Color(0xFF007564)
-                      : const Color(0xFF8C7B66)),
-            fontSize: settings.fontSize * (isVolumeTitle ? 1.05 : 0.8),
-            fontWeight: isVolumeTitle ? FontWeight.w600 : null,
+            color: isNight ? const Color(0xFFA99A85) : const Color(0xFF8C7B66),
+            fontSize: settings.fontSize * 0.8,
           );
           final contentSpans = _headerLineSpans(line);
           final painter = TextPainter(
@@ -1479,13 +1464,7 @@ class ReaderPassageBlockState extends State<_ReaderPassageBlock> {
           )..layout();
           final textWidth = painter.width;
           painter.dispose();
-          headerChildren.add(
-            leadingSpacer(
-              isVolumeTitle
-                  ? (constraints.maxWidth - textWidth) / 2
-                  : constraints.maxWidth - textWidth,
-            ),
-          );
+          headerChildren.add(leadingSpacer(constraints.maxWidth - textWidth));
           headerChildren.add(
             TextSpan(
               style: lineStyle,
@@ -1523,6 +1502,9 @@ class ReaderPassageBlockState extends State<_ReaderPassageBlock> {
           combinedSpan,
           key: widget.blockKey,
           style: scriptureTextStyle(settings),
+          // 區塊用滿可用寬度，行內留白才能按父寬精確置中；
+          // 否則短段落會先縮成內容寬，再被外層 Center 二次置中。
+          textWidthBasis: TextWidthBasis.parent,
         );
       },
     );

@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:xuefo/reader/reader_layout.dart';
 import 'package:xuefo/scripture/models.dart';
 import 'package:xuefo/scripture/parser.dart';
+import 'package:xuefo/scripture/reader_blocks.dart';
 import 'package:xuefo/scripture/source_text.dart';
 
 void main() {
@@ -91,7 +92,7 @@ void main() {
     expect(layout.text, contains('過九十一劫，'));
   });
 
-  test('retains the juan title at line 0001b08 for the reader header', () {
+  test('retains the juan title at line 0001b08 as a body heading', () {
     final lines = parseScriptureHtml(
       '<div id="body"><p class="head">長阿含經序</p>'
       '<p class="byline">後秦譯者</p><p>序文。</p>'
@@ -105,6 +106,7 @@ void main() {
     );
 
     expect(title.role, ScriptureLineRole.volumeTitle);
+    expect(title.headingLevel, 2);
     expect(
       visibleScriptureLine(
         title,
@@ -128,11 +130,7 @@ void main() {
       '校勘</div></div>',
     );
     final bodyLines = lines
-        .where(
-          (line) =>
-              line.role != ScriptureLineRole.volumeTitle &&
-              line.role != ScriptureLineRole.byline,
-        )
+        .where((line) => line.role != ScriptureLineRole.byline)
         .toList();
     final layout = buildScriptureTextLayout(
       bodyLines,
@@ -140,7 +138,11 @@ void main() {
       showCollation: true,
     );
 
+    expect(bodyLines.first.role, ScriptureLineRole.volumeTitle);
+    expect(bodyLines.first.headingLevel, 2);
     expect(bodyLines.last.role, ScriptureLineRole.navigationAnchor);
+    expect(bodyLines.last.headingLevel, 0);
+    expect(layout.text, contains('長阿含經序'));
     expect(layout.text, contains('佛說[11]長阿含經卷第一'));
   });
 
@@ -184,6 +186,93 @@ void main() {
 
     expect('[6]'.allMatches(layout.text), hasLength(1));
     expect(layout.text, contains('[6]東西隨風[A5]逝；'));
+  });
+
+  test('verse-cell boundary footnote does not shift later cell offsets', () {
+    final lines = parseScriptureHtml(
+      '<div id="body"><div class="lg-row">'
+      '<div class="lg-cell">左格<a class="noteAnchor" '
+      'href="#n0008001"></a></div>'
+      '<div class="lg-cell">右格</div>'
+      '</div></div>'
+      '<div id="back"><div class="footnote" id="n0008001">校勘</div></div>',
+    );
+    final layout = buildScriptureTextLayout(
+      lines,
+      showLineBeginnings: false,
+      showCollation: true,
+    );
+
+    expect(layout.text, '\uFFFC左格[1]\uFFFC右格\n');
+    expect('[1]'.allMatches(layout.text), hasLength(1));
+    expect(
+      layoutEditableOffsetForSource(layout, lines, 3, showCollation: true),
+      8,
+    );
+  });
+
+  test('offline volume title hit resolves inside the body layout', () {
+    final lines = parseScriptureHtml(
+      '<div id="body"><p class="byline">後秦譯者</p><p>序文。</p>'
+      '<p class="juan">佛說長阿含經卷第一</p><p>正文。</p></div>',
+    );
+    final headerLines = lines
+        .where((line) => line.role == ScriptureLineRole.byline)
+        .toList();
+    final bodyLines = lines
+        .where((line) => line.role != ScriptureLineRole.byline)
+        .toList();
+    final layout = buildScriptureTextLayout(
+      bodyLines,
+      showLineBeginnings: false,
+      showCollation: true,
+    );
+    final sourceOffset = buildScriptureSearchSource(lines).indexOf('佛說長阿含經卷第一');
+    final passage = ScripturePassage(
+      title: '長阿含經',
+      reference: '卷 1',
+      text: '',
+      juan: '1',
+      work: 'T0001',
+      sourceOffset: sourceOffset,
+      snippet: '佛說長阿含經卷第一',
+    );
+
+    final target = resolveSearchTargetOffset(
+      layout,
+      bodyLines,
+      headerLines,
+      passage,
+      '佛說長阿含經卷第一',
+      0,
+    );
+
+    expect(target.inHeader, isFalse);
+    expect(target.sourceOffset, sourceOffset);
+    expect(layout.text.substring(target.offset), startsWith('佛說長阿含經卷第一'));
+  });
+
+  test('centered volume title keeps layout and block offsets aligned', () {
+    final lines = parseScriptureHtml(
+      '<div id="body"><span class="lb" id="T01n0001_p0001b08"></span>'
+      '<p class="juan">佛說長阿含經卷第一</p><p>正文。</p></div>',
+    );
+    final layout = buildScriptureTextLayout(
+      lines,
+      showLineBeginnings: true,
+      showCollation: false,
+    );
+    final blocks = buildScriptureReaderBlocks(lines);
+    final bases = scriptureBlockOffsetBases(blocks, lines, layout, true);
+
+    // 段前換行 + 標題行首的置中 placeholder，其後才是行首標記與標題。
+    expect(layout.text, startsWith('\n\uFFFC[0001b08] 佛說長阿含經卷第一\n\n'));
+    expect(layout.lineStarts.first, 12);
+    expect(bases.first, 0);
+    expect(
+      layoutEditableOffsetForSource(layout, lines, 0, showCollation: false),
+      12,
+    );
   });
 
   testWidgets('interactive reader spans show each footnote once', (

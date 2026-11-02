@@ -358,18 +358,23 @@ class SidxSource {
   final Set<int> charSet;
   final String title;
 
-  /// 不進索引的原文區間（卷題、作譯者、校勘夾注…），摘要取上下文時要停在邊界。
+  /// 摘要取上下文時不跨越的原文邊界（卷題、作譯者、校勘夾注…）。
+  ///
+  /// 卷題本身仍會進索引，只是摘要不要跨到卷題另一側。
   final List<Int32List> excluded;
 }
 
 /// 由已解析的經文行算出正規化表示與定位表。
 ///
-/// 卷題與作譯者整行跳過；校勘夾注（`inlineNotes`）的區間也跳過，否則無標點
+/// 作譯者整行跳過；校勘夾注（`inlineNotes`）的區間也跳過，否則無標點
 /// 的正文會與注文黏成新詞。卷首的 `No. xxxx [cf. ...]` 提示行也在 `#body` 裡，
 /// 同樣要排除，否則 cf 引用會污染正文結果。
+///
+/// 卷題不再排除：它在網頁模式是正文裡的次級標題，必須能被離線搜尋命中。
 SidxSource normalizeScriptureLines(List<ScriptureLine> lines) {
   final source = buildScriptureSearchSource(lines);
   final skipRanges = <Int32List>[];
+  final boundaryRanges = <Int32List>[];
   var seenVolumeTitle = false;
   var advance = 0;
   final included = <({int start, int end, ScriptureLine line})>[];
@@ -377,32 +382,35 @@ SidxSource normalizeScriptureLines(List<ScriptureLine> lines) {
     final lineStart = advance;
     advance += scriptureSourceAdvance(line);
     final lineEnd = lineStart + line.text.length;
-    if (line.role == ScriptureLineRole.volumeTitle) seenVolumeTitle = true;
-    final excluded =
-        line.role == ScriptureLineRole.volumeTitle ||
+    final lineRange = Int32List.fromList(<int>[
+      lineStart,
+      lineEnd.clamp(lineStart, source.length),
+    ]);
+    if (line.role == ScriptureLineRole.volumeTitle) {
+      seenVolumeTitle = true;
+      boundaryRanges.add(lineRange);
+    }
+    final excludedFromIndex =
         line.role == ScriptureLineRole.byline ||
         (!seenVolumeTitle && _leadingNumberPattern.hasMatch(line.text));
-    if (excluded) {
-      skipRanges.add(
-        Int32List.fromList(<int>[
-          lineStart,
-          lineEnd.clamp(lineStart, source.length),
-        ]),
-      );
+    if (excludedFromIndex) {
+      skipRanges.add(lineRange);
+      boundaryRanges.add(lineRange);
       continue;
     }
     for (final note in line.inlineNotes) {
-      skipRanges.add(
-        Int32List.fromList(<int>[
-          lineStart + note.offset,
-          (lineStart + note.offset + note.length).clamp(0, source.length),
-        ]),
-      );
+      final noteRange = Int32List.fromList(<int>[
+        lineStart + note.offset,
+        (lineStart + note.offset + note.length).clamp(0, source.length),
+      ]);
+      skipRanges.add(noteRange);
+      boundaryRanges.add(noteRange);
     }
     included.add((start: lineStart, end: lineEnd, line: line));
   }
   final charSet = <int>{};
   final excluded = mergeSourceRanges(skipRanges, source.length);
+  final boundaries = mergeSourceRanges(boundaryRanges, source.length);
   final normed = normalizeScriptureSource(
     source,
     skipRanges: excluded,
@@ -451,7 +459,7 @@ SidxSource normalizeScriptureLines(List<ScriptureLine> lines) {
     runs: runRecords,
     charSet: charSet,
     title: localWorkTitle(lines),
-    excluded: excluded,
+    excluded: boundaries,
   );
 }
 

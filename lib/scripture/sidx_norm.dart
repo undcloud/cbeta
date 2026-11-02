@@ -17,7 +17,8 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 const int sidxFormatVersion = 1;
-const int sidxNormVersion = 1;
+// v2: 卷題納入索引（正文次級標題）。
+const int sidxNormVersion = 2;
 
 /// 正規化實際套用過的步驟，寫進索引標頭；與標頭不符就要重建。
 const int sidxFlagDropWhitespace = 0x01;

@@ -81,6 +81,25 @@ void main() {
     targets: targets,
   );
 
+  test('卷題留在正文，離線掃描與展開都能命中', () async {
+    await seedVolumes(1);
+    final targets = await targetsFor(1);
+    final outcome = await runOfflineScan(requestFor('測試經1卷第一', targets));
+
+    expect(outcome.termHits, 1);
+    final group = outcome.groups.single;
+    final passages = await expandOfflineWork(
+      work: group.work,
+      hits: group.hits,
+      query: '測試經1卷第一',
+      availableJuans: const [1],
+    );
+    expect(passages, hasLength(1));
+    expect(passages.single.snippet.trim(), '測試經1卷第一');
+    expect(passages.single.linehead, isNull);
+    expect(passages.single.sourceOffset, 0);
+  });
+
   test('離線掃描自行連續推進到掃完，結果先只有行號', () async {
     await seedVolumes(25);
     final session = OfflineScanSession('般若波羅蜜');

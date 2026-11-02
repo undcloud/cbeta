@@ -170,13 +170,16 @@ void main() {
         '</div>',
       ),
     );
-    expect(source.normed.normSlice(0, source.normed.byteLength), '般若蜜多心經');
+    expect(
+      source.normed.normSlice(0, source.normed.byteLength),
+      '測試經卷第一般若蜜多心經',
+    );
     expect(hitsWith(source.normed.bytes, '波羅'), isEmpty);
     expect(hitsWith(source.normed.bytes, '般若波羅'), isEmpty);
     expect(hitsWith(source.normed.bytes, '般若蜜多'), hasLength(1));
   });
 
-  test('卷首經號提示行、卷題與作譯者不進索引', () {
+  test('卷首經號提示行與作譯者不進索引，卷題仍可搜尋', () {
     final source = normalizeScriptureLines(
       parseScriptureHtml(
         '<div id="body">'
@@ -188,9 +191,13 @@ void main() {
         '</div>',
       ),
     );
-    expect(source.normed.normSlice(0, source.normed.byteLength), '色即是空空即是色');
+    expect(
+      source.normed.normSlice(0, source.normed.byteLength),
+      '佛說心經卷第一色即是空空即是色',
+    );
     expect(source.title, '佛說心經');
-    expect(source.records.map((line) => line.linehead), ['T0001_p0001a01']);
+    expect(source.records.map((line) => line.linehead), ['', 'T0001_p0001a01']);
+    expect(hitsWith(source.normed.bytes, '佛說心經卷第一'), hasLength(1));
     expect(hitsWith(source.normed.bytes, '玄奘'), isEmpty);
   });
 
