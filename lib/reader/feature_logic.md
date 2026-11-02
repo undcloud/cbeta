@@ -21,7 +21,26 @@
   layout 端必须同步计入这 2 个字元（placeholder + 段前换行）；
 - 相鄰正文段落之间加一行间距；该段落边界同时进入搜尋文字与位移換算，
   不在偈頌段落前重複插入間距；
-- 长按/选择文字：复制、引文格式化、分享、全选（见 reader_citations）。
+- 长按/选择文字：复制、引文格式化、分享、全选（见 reader_citations）；
+- 阅读位置记录（「上次阅读位置」/「最近阅读」用）：
+  - 除进入时的搜索命中位置外，也会在「使用者自己捲动后停下」时，把
+    当下**视窗顶端那一行**记为阅读锚点（`_updateReadingAnchorFromViewportTop`
+    经 `_layoutOffsetAtGlobalPoint` → `_lineIndexForLayoutOffset` →
+    `scriptureLineheadAtLayoutOffset`，再依 `lineSourceStarts` 加上卷首
+    前进量算出整卷来源位移，取该行前 24 字作 `snippet`）；
+  - 只在 `UserScrollNotification`（真正的拖拽／惯性滑动）之后才触发，
+    程序化的 `jumpTo`（跳到搜索命中、切卷）不算「换了阅读位置」；
+    `ScrollEndNotification` 后延迟 400ms 才写一次，避免惯性滑动每一格
+    都存取；
+  - 应用切到背景／非活动（`didChangeAppLifecycleState`）时也会立刻记下
+    当前位置，不必等防抖计时器；`dispose` 只取消防抖计时器，不再补写
+    （同步生命周期里排 unawaited 的异步存檔，回调会在 widget 销毁后才
+    跑到，反而污染下一笔测试）；
+  - 切换命中、切卷、换经（`_goToHit`/`_changeJuan`/`_selectJuan`/
+    `_openBookmark`/`_selectWork`）都会先清除旧锚点，重新以进入位置计算；
+  - 重新进入时不需要新逻辑：`_positionedPassage()` 存的还是
+    `linehead`/`sourceOffset`/`snippet`，走的仍是
+    `resolveSearchTargetOffset` 里已有的「先验 snippet、再退回行号」路径。
 
 ## reader_layout.dart
 
@@ -63,4 +82,6 @@
 - `ReaderBookmark` 与 SharedPreferences 持久化：key `reader_bookmarks`、
   `reading_history`（**保留旧格式**）；
 - `loadBookmarks` / `saveBookmarks`（首页历史区共用）、
-  `recordRecentReading`（阅读器打开经卷时回写）。
+  `recordRecentReading`（进入经卷、使用者捲动停下、应用切到背景时都会
+  回写，见「阅读位置记录」）；`reading_history` 上限
+  `maximumReadingHistory = 50` 笔，同一部经重复写入只保留最新一筆。

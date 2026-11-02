@@ -2,7 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart' as flutter_material;
 import 'package:flutter/material.dart' hide Text;
 import 'package:flutter/gestures.dart';
-import 'package:flutter/rendering.dart' show RenderParagraph;
+import 'package:flutter/rendering.dart' show RenderParagraph, ScrollDirection;
 import 'package:flutter/services.dart';
 import 'package:share_plus/share_plus.dart';
 import '../scripture/cache.dart';
@@ -40,7 +40,8 @@ class ScriptureReaderPage extends StatefulWidget {
   State<ScriptureReaderPage> createState() => ScriptureReaderPageState();
 }
 
-class ScriptureReaderPageState extends State<ScriptureReaderPage> {
+class ScriptureReaderPageState extends State<ScriptureReaderPage>
+    with WidgetsBindingObserver {
   final readerScrollController = ScrollController();
   final List<GlobalKey> _blockKeys = [];
   List<int> _blockOffsetBases = const [];
@@ -53,6 +54,22 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
   int? _currentSourceOffset;
   String _currentSnippet = '';
   String? _historyPositionKey;
+
+  /// 目前畫面的整卷 layout 與卷首前置資訊，捲動結束後用來換算「視窗頂端」
+  /// 實際落在哪一行；只有 `build` 會更新，其他時刻只讀。
+  ScriptureTextLayout? _currentLayout;
+  List<ScriptureLine> _currentBodyLines = const [];
+  int _currentHeaderPrefixLength = 0;
+  int _currentHeaderAdvance = 0;
+
+  /// 使用者捲動後視窗頂端所在行的錨點；沒有手動捲動過時為 null，
+  /// 此时「最近閱讀」記錄的是進入经文時的那個位置。
+  String? _anchorLinehead;
+  int? _anchorSourceOffset;
+  String _anchorSnippet = '';
+  bool _userScrollActive = false;
+  Timer? _anchorFlushTimer;
+
   bool didScrollToMatch = false;
   bool showSearchNavigation = true;
   bool showLocalSearch = false;
@@ -74,16 +91,33 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
     _refreshBookmarkState();
     _persistReadingHistory();
     scriptureDisplaySettings.addListener(_onDisplaySettingsChanged);
+    WidgetsBinding.instance.addObserver(this);
   }
 
   bool _preferOnlineFor(ScripturePassage passage) =>
       passage.fromOnlineIndex && passage.sourceOffset == null;
 
   ScripturePassage _positionedPassage() => currentPassage.copyWith(
-    linehead: currentPassage.linehead,
-    sourceOffset: _currentSourceOffset ?? currentPassage.sourceOffset,
-    snippet: _currentSnippet.isEmpty ? currentPassage.snippet : _currentSnippet,
+    linehead: _anchorLinehead ?? currentPassage.linehead,
+    sourceOffset:
+        _anchorSourceOffset ??
+        _currentSourceOffset ??
+        currentPassage.sourceOffset,
+    snippet: _anchorSnippet.isNotEmpty
+        ? _anchorSnippet
+        : (_currentSnippet.isEmpty ? currentPassage.snippet : _currentSnippet),
   );
+
+  /// 最近閱讀／上次閱讀位置寫入時用的位置戳記：優先使用使用者實際看到的
+  /// 視窗頂端行，其次才是進入當下解析到的搜尋命中位置。
+  String _currentPositionKey() {
+    final position =
+        _anchorLinehead ??
+        _currentSourceOffset?.toString() ??
+        currentPassage.linehead ??
+        '';
+    return '${currentPassage.work}:${currentPassage.juan}:$position';
+  }
 
   Future<void> _persistReadingHistory() async {
     try {
@@ -238,6 +272,13 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
     );
   }
 
+  void _resetReadingAnchor() {
+    _anchorFlushTimer?.cancel();
+    _anchorLinehead = null;
+    _anchorSourceOffset = null;
+    _anchorSnippet = '';
+  }
+
   void _openBookmark(ReaderBookmark bookmark) {
     final passage = bookmark.toPassage();
     setState(() {
@@ -250,6 +291,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
       didScrollToMatch = false;
       linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
     });
+    _resetReadingAnchor();
     _refreshBookmarkState();
     _persistReadingHistory();
   }
@@ -267,6 +309,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
       didScrollToMatch = false;
       linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
     });
+    _resetReadingAnchor();
     _refreshBookmarkState();
     _persistReadingHistory();
   }
@@ -396,6 +439,85 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
         delta: paragraph.localToGlobal(caretOffset).dy - viewportTop,
       );
       return;
+    }
+  }
+
+  /// 找出 `layoutOffset` 落在正文哪一行（`lineStarts` 依序排列，二分查找，
+  /// 長卷逐線掃描會在每次捲動結束時都變成明顯的卡頓來源）。
+  int? _lineIndexForLayoutOffset(ScriptureTextLayout layout, int layoutOffset) {
+    final starts = layout.lineStarts;
+    if (starts.isEmpty) return null;
+    var lo = 0;
+    var hi = starts.length - 1;
+    while (lo < hi) {
+      final mid = (lo + hi + 1) >> 1;
+      if (starts[mid] <= layoutOffset) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return lo;
+  }
+
+  /// 把目前視窗頂端那一行記成閱讀錨點；找不到可量測的排版節點時不更新。
+  bool _updateReadingAnchorFromViewportTop() {
+    final layout = _currentLayout;
+    final lines = _currentBodyLines;
+    if (layout == null || lines.isEmpty || _blockOffsetBases.isEmpty) {
+      return false;
+    }
+    if (!readerScrollController.hasClients) return false;
+    final viewport = readerScrollController.position.context.storageContext
+        .findRenderObject();
+    if (viewport is! RenderBox) return false;
+    final viewportTop = viewport.localToGlobal(Offset.zero).dy;
+    final layoutOffset = _layoutOffsetAtGlobalPoint(
+      Offset(0, viewportTop),
+      _currentHeaderPrefixLength,
+    );
+    if (layoutOffset == null) return false;
+    final lineIndex = _lineIndexForLayoutOffset(layout, layoutOffset);
+    if (lineIndex == null) return false;
+    final linehead = scriptureLineheadAtLayoutOffset(
+      layout,
+      lines,
+      currentPassage.linehead,
+      layoutOffset,
+    );
+    final sourceOffset =
+        layout.lineSourceStarts[lineIndex] + _currentHeaderAdvance;
+    final lineText = lines[lineIndex].text;
+    final snippetLength = lineText.length < 24 ? lineText.length : 24;
+    _anchorLinehead = linehead;
+    _anchorSourceOffset = sourceOffset;
+    _anchorSnippet = lineText.substring(0, snippetLength);
+    return true;
+  }
+
+  /// 捲動停止後延遲一段时间再記錄，避免慣性滑動期間每格都觸發寫入。
+  void _scheduleReadingAnchorFlush() {
+    _anchorFlushTimer?.cancel();
+    _anchorFlushTimer = Timer(const Duration(milliseconds: 400), () {
+      if (!mounted) return;
+      _flushReadingAnchor();
+    });
+  }
+
+  void _flushReadingAnchor() {
+    if (!_updateReadingAnchorFromViewportTop()) return;
+    final positionKey = _currentPositionKey();
+    if (_historyPositionKey == positionKey) return;
+    _historyPositionKey = positionKey;
+    unawaited(_persistReadingHistory());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      _anchorFlushTimer?.cancel();
+      _flushReadingAnchor();
     }
   }
 
@@ -847,6 +969,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
       didScrollToMatch = false;
       linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
     });
+    _resetReadingAnchor();
     _refreshBookmarkState();
     _persistReadingHistory();
   }
@@ -880,6 +1003,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
       didScrollToMatch = false;
       linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
     });
+    _resetReadingAnchor();
     _refreshBookmarkState();
     _persistReadingHistory();
   }
@@ -899,12 +1023,18 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
       didScrollToMatch = false;
       linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
     });
+    _resetReadingAnchor();
     _refreshBookmarkState();
     _persistReadingHistory();
   }
 
   @override
   void dispose() {
+    // 位置記錄在「使用者真的捲動停下」與「App 退到背景」時就會寫入；
+    // dispose 是同步呼叫，沒辦法在這裡等非同步寫入完成，硬排一個 unawaited
+    // 的存檔反而會在 widget 已銷毀後才回呼、污染下一筆測試，所以只取消計時器。
+    _anchorFlushTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     scriptureDisplaySettings.removeListener(_onDisplaySettingsChanged);
     readerScrollController.dispose();
     localSearchController.dispose();
@@ -1025,6 +1155,13 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
                   showCollation: settings.showCollation,
                 );
                 final text = layout.text;
+                _currentLayout = layout;
+                _currentBodyLines = scriptureLines;
+                _currentHeaderPrefixLength = headerPrefixLength;
+                _currentHeaderAdvance = headerLines.fold<int>(
+                  0,
+                  (sum, line) => sum + scriptureSourceAdvance(line),
+                );
                 // 行號可能屬於其他卷或該卷已改版；找不到時退回卷首，
                 // 不要讓整卷內容因錨點失效而無法閱讀。
                 final hitOccurrence = hitOccurrenceAtIndex(
@@ -1108,10 +1245,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
                           _blockOffsetBases = blockOffsetBases;
                           if (!didScrollToMatch) {
                             didScrollToMatch = true;
-                            final positionKey =
-                                '${currentPassage.work}:'
-                                '${currentPassage.juan}:'
-                                '${_currentSourceOffset ?? currentPassage.linehead ?? ''}';
+                            final positionKey = _currentPositionKey();
                             final anchor = _pendingScrollAnchor;
                             _pendingScrollAnchor = null;
                             // 命中字元置中；卷首或卷末由 clamp 自然貼邊。
@@ -1178,90 +1312,109 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage> {
                                       layout: layout,
                                       headerPrefixLength: headerPrefixLength,
                                     ),
-                            child: ListView.builder(
-                              controller: readerScrollController,
-                              padding: const EdgeInsets.fromLTRB(0, 4, 0, 40),
-                              itemCount: blocks.length + 2,
-                              itemBuilder: (context, index) {
-                                final Widget child;
-                                if (index == 0) {
-                                  // 卷數調整按鈕放在捲動內容頂端，需固定區域下方靠右。
-                                  child = currentPassage.availableJuans.isEmpty
-                                      ? const SizedBox.shrink()
-                                      : Align(
-                                          alignment: Alignment.centerRight,
-                                          child: Padding(
-                                            padding: const EdgeInsets.only(
-                                              bottom: 4,
-                                            ),
-                                            child: _JuanSelector(
-                                              currentJuan: int.tryParse(
-                                                currentPassage.juan ?? '',
-                                              ),
-                                              availableJuans:
-                                                  currentPassage.availableJuans,
-                                              onChanged: _selectJuan,
-                                            ),
-                                          ),
-                                        );
-                                } else if (index > blocks.length) {
-                                  child = Padding(
-                                    padding: const EdgeInsets.only(top: 32),
-                                    child: _JuanNavigation(
-                                      currentJuan: int.tryParse(
-                                        currentPassage.juan ?? '',
-                                      ),
-                                      availableJuans:
-                                          currentPassage.availableJuans,
-                                      onPrevious: () => _changeJuan(-1),
-                                      onNext: () => _changeJuan(1),
-                                    ),
-                                  );
-                                } else {
-                                  final blockIndex = index - 1;
-                                  final block = blocks[blockIndex];
-                                  child = _ReaderPassageBlock(
-                                    blockKey: _blockKeys[blockIndex],
-                                    passage: passage,
-                                    headerLines: blockIndex == 0
-                                        ? headerLines
-                                        : const [],
-                                    layoutLineStarts: layout.lineStarts,
-                                    query: showLocalSearch
-                                        ? localSearchQuery
-                                        : widget.query,
-                                    localSearchRange: showLocalSearch
-                                        ? localSearchRange
-                                        : null,
-                                    queryRanges: queryRanges,
-                                    headerQuery: hitTarget.inHeader
-                                        ? widget.query
-                                        : '',
-                                    sourceLines: scriptureLines,
-                                    firstLineIndex: block.startLine,
-                                    lineCount: block.lineCount,
-                                    offsetBase: blockOffsetBases[blockIndex],
-                                    sourceOffsetBase: layout
-                                        .lineSourceStarts[block.startLine],
-                                    highlightStart: showLocalSearch
-                                        ? null
-                                        : targetOffset,
-                                  );
+                            child: NotificationListener<ScrollNotification>(
+                              onNotification: (notification) {
+                                // 只在使用者真的拖動／慣性捲動後記錄視窗頂端；
+                                // 程式化的 jumpTo 不算「換了一個閱讀位置」。
+                                if (notification is UserScrollNotification) {
+                                  if (notification.direction !=
+                                      ScrollDirection.idle) {
+                                    _userScrollActive = true;
+                                  }
+                                } else if (notification
+                                        is ScrollEndNotification &&
+                                    _userScrollActive) {
+                                  _userScrollActive = false;
+                                  _scheduleReadingAnchorFlush();
                                 }
-                                return Center(
-                                  child: ConstrainedBox(
-                                    constraints: const BoxConstraints(
-                                      maxWidth: 680,
-                                    ),
-                                    child: Padding(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 16,
-                                      ),
-                                      child: child,
-                                    ),
-                                  ),
-                                );
+                                return false;
                               },
+                              child: ListView.builder(
+                                controller: readerScrollController,
+                                padding: const EdgeInsets.fromLTRB(0, 4, 0, 40),
+                                itemCount: blocks.length + 2,
+                                itemBuilder: (context, index) {
+                                  final Widget child;
+                                  if (index == 0) {
+                                    // 卷數調整按鈕放在捲動內容頂端，需固定區域下方靠右。
+                                    child =
+                                        currentPassage.availableJuans.isEmpty
+                                        ? const SizedBox.shrink()
+                                        : Align(
+                                            alignment: Alignment.centerRight,
+                                            child: Padding(
+                                              padding: const EdgeInsets.only(
+                                                bottom: 4,
+                                              ),
+                                              child: _JuanSelector(
+                                                currentJuan: int.tryParse(
+                                                  currentPassage.juan ?? '',
+                                                ),
+                                                availableJuans: currentPassage
+                                                    .availableJuans,
+                                                onChanged: _selectJuan,
+                                              ),
+                                            ),
+                                          );
+                                  } else if (index > blocks.length) {
+                                    child = Padding(
+                                      padding: const EdgeInsets.only(top: 32),
+                                      child: _JuanNavigation(
+                                        currentJuan: int.tryParse(
+                                          currentPassage.juan ?? '',
+                                        ),
+                                        availableJuans:
+                                            currentPassage.availableJuans,
+                                        onPrevious: () => _changeJuan(-1),
+                                        onNext: () => _changeJuan(1),
+                                      ),
+                                    );
+                                  } else {
+                                    final blockIndex = index - 1;
+                                    final block = blocks[blockIndex];
+                                    child = _ReaderPassageBlock(
+                                      blockKey: _blockKeys[blockIndex],
+                                      passage: passage,
+                                      headerLines: blockIndex == 0
+                                          ? headerLines
+                                          : const [],
+                                      layoutLineStarts: layout.lineStarts,
+                                      query: showLocalSearch
+                                          ? localSearchQuery
+                                          : widget.query,
+                                      localSearchRange: showLocalSearch
+                                          ? localSearchRange
+                                          : null,
+                                      queryRanges: queryRanges,
+                                      headerQuery: hitTarget.inHeader
+                                          ? widget.query
+                                          : '',
+                                      sourceLines: scriptureLines,
+                                      firstLineIndex: block.startLine,
+                                      lineCount: block.lineCount,
+                                      offsetBase: blockOffsetBases[blockIndex],
+                                      sourceOffsetBase: layout
+                                          .lineSourceStarts[block.startLine],
+                                      highlightStart: showLocalSearch
+                                          ? null
+                                          : targetOffset,
+                                    );
+                                  }
+                                  return Center(
+                                    child: ConstrainedBox(
+                                      constraints: const BoxConstraints(
+                                        maxWidth: 680,
+                                      ),
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 16,
+                                        ),
+                                        child: child,
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
                             ),
                           );
                         },

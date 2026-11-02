@@ -22,6 +22,7 @@ import 'package:xuefo/main.dart';
 import 'package:xuefo/download/api_rate_limiter.dart';
 import 'package:xuefo/download/catalog_cache.dart';
 import 'package:xuefo/search/candidates.dart';
+import 'package:xuefo/search/history.dart';
 import 'package:xuefo/search/search_input.dart';
 import 'package:xuefo/scripture/source_text.dart';
 
@@ -1404,6 +1405,42 @@ void main() {
     },
   );
 
+  test('recordRecentReading dedupes by work and caps history', () async {
+    SharedPreferences.setMockInitialValues({});
+    ScripturePassage passage(String work) => ScripturePassage(
+      title: work,
+      reference: '',
+      text: '',
+      work: work,
+      juan: '1',
+    );
+
+    await recordRecentReading(passage('T0001'));
+    final history =
+        jsonDecode(
+              (await SharedPreferences.getInstance()).getString(
+                'reading_history',
+              )!,
+            )
+            as List<dynamic>;
+    expect(history.single['work'], 'T0001');
+
+    // 同一部經重複寫入只留最新一筆，換一部經才變成新的一列。
+    await recordRecentReading(passage('T0001'));
+    await recordRecentReading(passage('T0002'));
+
+    for (var i = 0; i < 60; i++) {
+      await recordRecentReading(passage('W$i'));
+    }
+
+    final preferences = await SharedPreferences.getInstance();
+    final capped =
+        jsonDecode(preferences.getString('reading_history')!) as List<dynamic>;
+    expect(capped, hasLength(maximumReadingHistory));
+    final works = capped.map((item) => (item as Map<String, dynamic>)['work']);
+    expect(works.toSet().length, capped.length, reason: '不應重複記錄同一部經');
+  });
+
   test('selected passage formats chapter title and CBETA line range', () {
     const passage = ScripturePassage(
       title: '大智度論',
@@ -1799,6 +1836,63 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
     controller.dispose();
     displayMode.dispose();
+  });
+
+  group('matchHistoricalSelection 只接受精確匹配', () {
+    setUp(() async {
+      SharedPreferences.setMockInitialValues({});
+      await SimplifiedTraditionalConverter.load();
+    });
+
+    test('輸入與歷史 key 完全相同時才回傳對應查詢詞', () {
+      final selections = {'发': '髮', '厂丑': '廠醜'};
+      expect(matchHistoricalSelection('发', selections), '髮');
+      expect(matchHistoricalSelection(' 厂丑 ', selections), '廠醜');
+    });
+
+    test('包含關係不再被視為匹配', () {
+      final selections = {'般若波羅蜜': '般若波羅蜜'};
+      expect(matchHistoricalSelection('般若', selections), isNull);
+      expect(matchHistoricalSelection('般若波羅蜜多心經', selections), isNull);
+    });
+
+    test('編輯距離相近的輸入不再被視為匹配', () {
+      final selections = {'五蘊': '五蘊'};
+      expect(matchHistoricalSelection('五蕴', selections), isNull);
+      expect(matchHistoricalSelection('五蕴經', selections), isNull);
+    });
+
+    test('空白輸入或空查询詞回傳 null', () {
+      final selections = {'': 'x', 'a': ''};
+      expect(matchHistoricalSelection('', selections), isNull);
+      expect(matchHistoricalSelection('a', selections), isNull);
+    });
+
+    test('resolveSearchQuery 依明確選取 > 精確歷史 > 簡繁轉換的順序', () async {
+      final selections = {'发': '髮'};
+      expect(
+        await resolveSearchQuery(
+          '发',
+          selectedQuery: '頭髮',
+          selections: selections,
+        ),
+        '頭髮',
+      );
+      expect(await resolveSearchQuery('发', selections: selections), '髮');
+      expect(
+        await resolveSearchQuery('佛', selections: selections),
+        (await resolveSearchQuery('佛', selections: const {})),
+      );
+    });
+
+    test('preferredQueryFor 沒有精確歷史命中時改用簡繁轉換', () {
+      final selections = {'五蘊': '五蘊'};
+      expect(preferredQueryFor('五蘊', selections), '五蘊');
+      expect(
+        preferredQueryFor('五蕴', selections),
+        preferredQueryFor('五蕴', const {}),
+      );
+    });
   });
 
   testWidgets('CBETA search page is shown', (WidgetTester tester) async {
@@ -3922,6 +4016,104 @@ void main() {
     final bookmark = saved.single as Map<String, dynamic>;
     expect(bookmark['sourceOffset'], targetSourceOffset);
     expect(bookmark['snippet'], '五蘊');
+  });
+
+  testWidgets('reading history records the line at the top of the viewport', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    final buffer = StringBuffer('<div id="body">');
+    for (var i = 0; i < 40; i++) {
+      final lineNumber = (i + 1).toString().padLeft(2, '0');
+      buffer.write(
+        '<span class="lb" id="T01n0003_p0155a$lineNumber"></span>'
+        '<p>第$lineNumber行經文內容，用來測試退出前視窗頂端的位置記錄。</p>',
+      );
+    }
+    buffer.write('</div>');
+    await scriptureVolumeStore.write(
+      CachedScriptureVolume(
+        work: 'T0003',
+        juan: '1',
+        contentVersion: 'stored-version',
+        html: buffer.toString(),
+      ),
+    );
+
+    const entry = ScripturePassage(
+      title: '毘婆尸佛經',
+      reference: '卷 1',
+      text: '',
+      linehead: 'T01n0003_p0155a01',
+      juan: '1',
+      work: 'T0003',
+      availableJuans: [1],
+    );
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: ScriptureReaderPage(
+          passage: entry,
+          query: '',
+          searchHits: [],
+          initialHitIndex: 0,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final preferences = await SharedPreferences.getInstance();
+    Map<String, dynamic> historyEntry() =>
+        (jsonDecode(preferences.getString('reading_history')!) as List<dynamic>)
+                .single
+            as Map<String, dynamic>;
+    expect(historyEntry()['linehead'], 'T01n0003_p0155a01');
+
+    // 手動捲動到中段後停下，應該把視窗頂端那一行記成最近閱讀位置，
+    // 而不是停留在進入時的第 1 行。
+    await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+    await tester.pumpAndSettle();
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump();
+
+    final afterScroll = historyEntry();
+    final scrolledLinehead = afterScroll['linehead'] as String;
+    expect(scrolledLinehead, isNot('T01n0003_p0155a01'));
+
+    // 用「最近閱讀」儲存的那筆位置重新進入：頂端應該落在同一行。
+    final reopened = ReaderBookmark.fromJson(afterScroll).toPassage();
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ScriptureReaderPage(
+          passage: reopened,
+          query: '',
+          searchHits: const [],
+          initialHitIndex: 0,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final targetLineNumber = int.parse(
+      scrolledLinehead.substring(scrolledLinehead.length - 2),
+    );
+    final paragraph = readerParagraphWith(
+      tester,
+      '第${targetLineNumber.toString().padLeft(2, '0')}行經文內容',
+    );
+    final viewport = tester.renderObject<RenderBox>(
+      find.byType(ListView).first,
+    );
+    final viewportTop = viewport.localToGlobal(Offset.zero).dy;
+    final paragraphTop = paragraph.localToGlobal(Offset.zero).dy;
+    expect((paragraphTop - viewportTop).abs(), lessThan(80));
   });
 
   testWidgets(

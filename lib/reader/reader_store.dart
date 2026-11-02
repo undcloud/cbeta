@@ -103,11 +103,16 @@ Future<void> saveBookmarks(List<ReaderBookmark> bookmarks) async {
   if (!saved) throw StateError('無法儲存書籤');
 }
 
+const maximumReadingHistory = 50;
+
 Future<void> recordRecentReading(ScripturePassage passage) async {
   final history = await loadBookmarkRecords(readingHistoryKey);
   final current = ReaderBookmark.fromPassage(passage);
   history.removeWhere((item) => item.work == current.work);
   history.insert(0, current);
+  if (history.length > maximumReadingHistory) {
+    history.removeRange(maximumReadingHistory, history.length);
+  }
   final preferences = await SharedPreferences.getInstance();
   final saved = await preferences.setString(
     readingHistoryKey,

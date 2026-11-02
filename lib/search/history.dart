@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:math' as math;
 
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -79,58 +78,14 @@ String? matchHistoricalSelection(
 ) {
   final raw = rawInput.trim();
   if (raw.isEmpty || selections.isEmpty) return null;
-  if (selections.containsKey(raw)) return selections[raw];
-
-  final lower = raw.toLowerCase();
-  final entries = selections.entries.toList().reversed.toList();
-  String? best;
-  var bestScore = 0.0;
-  for (final entry in entries) {
-    final key = entry.key.toLowerCase();
-    if (key.isEmpty) continue;
-    final overlap =
-        math.min(key.length, lower.length) / math.max(key.length, lower.length);
-    final contains =
-        (key.contains(lower) || lower.contains(key)) &&
-        math.min(key.length, lower.length) >= 2;
-    final similarity = _textSimilarity(key, lower);
-    final score = contains
-        ? math.max(0.9, overlap)
-        : (similarity >= 0.8 ? similarity : 0.0);
-    if (score > bestScore) {
-      bestScore = score;
-      best = entry.value;
-    }
-  }
-  return bestScore > 0 ? best : null;
-}
-
-double _textSimilarity(String left, String right) {
-  if (left == right) return 1;
-  if (left.isEmpty || right.isEmpty) return 0;
-  final previous = List<int>.generate(right.length + 1, (index) => index);
-  for (var leftIndex = 1; leftIndex <= left.length; leftIndex++) {
-    final current = <int>[leftIndex];
-    for (var rightIndex = 1; rightIndex <= right.length; rightIndex++) {
-      final cost = left[leftIndex - 1] == right[rightIndex - 1] ? 0 : 1;
-      final insertion = current[rightIndex - 1] + 1;
-      final deletion = previous[rightIndex] + 1;
-      final substitution = previous[rightIndex - 1] + cost;
-      current.add(math.min(insertion, math.min(deletion, substitution)));
-    }
-    previous.setAll(0, current);
-    if (current.length < previous.length) {
-      previous.removeRange(current.length, previous.length);
-    }
-  }
-  final distance = previous[right.length];
-  return 1 - distance / math.max(left.length, right.length);
+  final query = selections[raw]?.trim();
+  return query == null || query.isEmpty ? null : query;
 }
 
 typedef KeyMatchCounter =
     Future<Map<String, int>> Function(List<String> candidates);
 
-/// 依「選中候選 → 歷史選擇 → 首選候選＋字典命中數」決定實際查詢詞。
+/// 依「選中候選 → 精確歷史選擇 → 首選候選＋字典命中數」決定實際查詢詞。
 Future<String> resolveSearchQuery(
   String rawInput, {
   String? selectedQuery,

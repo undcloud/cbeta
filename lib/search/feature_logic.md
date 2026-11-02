@@ -170,7 +170,7 @@ python3 tool/check_hanzi_tables.py --strict  # 顺序/覆盖/往返提示也视�
 
 ## 三、候选生成
 
-入口：`SimplifiedTraditionalConverter.convertCandidates(input)`。函数不再接收 `historicalQuery`，历史只影响面板标记和最终查询词解析。
+入口：`SimplifiedTraditionalConverter.convertCandidates(input)`。函数不再接收 `historicalQuery`，精确历史只影响面板标记和最终查询词解析。
 
 ### 3.1 分段：双向词组优先，单字兜底
 
@@ -254,7 +254,7 @@ Future<String> preferredQueryForInput(String rawInput);
 ```
 
 - `convertPreferred` 不读取历史，只按词表顺序返回第一个候选；
-- `preferredQueryFor` **先查历史选择**，命中则直接返回历史选中的查询词；否则返回 `convertCandidates(...).candidates.first`；
+- `preferredQueryFor` **先查精确历史选择**，只有原始输入与 `search_selections` key 完全相同时才返回历史选中的查询词；否则返回 `convertCandidates(...).candidates.first`；
 - `preferredQueryForInput` 读取 `search_selections` 后调用 `preferredQueryFor`，读取失败时忽略历史；
 - 首页和词典的最终查询词由 `resolveSearchQuery` 决定（见 5.5），它还会比较词典 key 命中数；
 - 「选择佛经 → 经目查询」按钮使用 `preferredQueryForInput`；
@@ -301,13 +301,13 @@ Future<String> preferredQueryForInput(String rawInput);
 `buildSearchChoices` 的行顺序：
 
 1. `conversion.candidates` 的全部候选（首选第一、原始输入第二、全简体候选与组合随后）；
-2. 历史匹配到的查询词如果不在候选中，追加一行并标记为历史。
+2. 精确历史匹配到的查询词如果不在候选中，追加一行并标记为历史。
 
 标记规则：
 
 - `isDefault`：`conversion.candidates.first`；
 - `isOriginal`：候选等于当前输入框原文；
-- `isHistory`：候选等于 `matchHistoricalSelection` 的结果；
+- `isHistory`：候选等于精确 `matchHistoricalSelection` 的结果；
 - `isSimplified`：候选等于 `fullSimplified` 且不等于原文；
 - 相同文字合并为一行，并合并标记；
 - **固定候选**（`isPinned`）只包括 `isDefault` 和 `isOriginal`。历史候选不固定，可以参与词典命中数排序。
@@ -415,27 +415,23 @@ Future<String> preferredQueryForInput(String rawInput);
 因此：
 
 - 首页的「最近搜索」列表来自 `search_history`，主要由首页搜索和词典查询产生；
-- 其他入口的输入会进入 `search_selections`，可以参与历史匹配，但不会出现在首页最近搜索列表；
+- 其他入口的输入会进入 `search_selections`，只有输入与历史 key 完全相同时才参与历史匹配，但不会出现在首页最近搜索列表；
 - 词典查询写入的是 `raw -> actualQuery`：用户明确点选候选时，`actualQuery` 就是所选文字，不再做简繁回退；只有未明确选择时才可能因字体回退而变化（见 9.3），输入框随后也会显示该实际查询词；
 - AI 页面内部的搜索（从首页进入后再次修改问题）目前不写入任何记录；
 - 历史行显示的文字是 `search_history` 中的原始输入；实际搜索词从 `search_selections` 取，取不到时等于原文。
 
 ### 5.3 历史匹配
 
-`matchHistoricalSelection(rawInput, selections)`：
+`matchHistoricalSelection(rawInput, selections)` 只接受精确匹配：
 
-1. 如果 `rawInput` 精确等于某个历史 key，直接返回对应 `selectedQuery`；
-2. 否则遍历 `search_selections`（最近插入的在前），计算：
-   - 包含关系：任一方向包含，且较短一方长度 ≥ 2，得分 `max(0.9, 长度重叠率)`；
-   - 否则计算归一化编辑距离相似度，相似度 ≥ 0.8 时取该相似度；
-3. 取得分最高的一项；同分时保留最近插入的一项；
-4. 没有匹配则返回 `null`。
-
-当前实现**没有使用使用频率**，同分时依据插入顺序（最近者优先）。
+1. 对 `rawInput` 做 `trim()`；
+2. 只在 `search_selections` 的 key 与它完全相同时返回对应 `selectedQuery`；
+3. 不再使用包含关系、编辑距离、长度重叠率或最近插入顺序做模糊匹配；
+4. 空值或空查询词返回 `null`。
 
 历史匹配只用于两处：
 
-- `buildSearchChoices` 把历史查询词追加到候选面板（不再显示「歷史」标签）；
+- `buildSearchChoices` 把精确历史查询词追加到候选面板（不再显示「歷史」标签）；
 - `resolveSearchQuery` / `preferredQueryFor` 在没有用户选中候选时决定实际查询词。
 
 历史查询词**不再**由 `convertCandidates` 置顶；候选的固定顺序只由「首选 + 原始输入」决定。
@@ -456,7 +452,7 @@ Future<String> resolveSearchQuery(
 优先级：
 
 1. `selectedQuery` 非空：直接使用（用户点击候选/历史后产生的选择）；
-2. 历史匹配命中：使用 `search_selections` 中的值；
+2. 精确历史匹配命中：使用 `search_selections` 中与原始输入完全相同 key 对应的值；
 3. 否则取 `convertCandidates(rawInput).candidates.first`；
 4. 如果传入了 `keyMatchCounter` 且候选多于 1 个，统计全部候选的词典 key 命中数：
    - 繁体／混排候选整体优先于简体／中性候选（与 4.4 的重排一致）；
@@ -465,7 +461,7 @@ Future<String> resolveSearchQuery(
 
 首页只在「非 AI 模式且 `_fodictBaseDir != null`」时传入计数器（统计范围为全部可用词典，见 9.2）；词典查询始终传入。其他 `SearchInput` 入口没有计数器，因此只执行第 1～3 步。
 
-`preferredQueryFor` 是第 1～3 步的同步版本（无用户选择、先历史后首选），供经目查询等入口使用。
+`preferredQueryFor` 是第 1～3 步的同步版本（无用户选择、先精确历史后首选），供经目查询等入口使用。
 
 ---
 
@@ -473,14 +469,14 @@ Future<String> resolveSearchQuery(
 
 | 入口 | 输入组件 | 候选面板 | 实际查询 | 记录 | Goto |
 |---|---|---|---|---|---|
-| 首页关键字搜索 | `SearchInput` | 有，实时，含词典 key 命中数 | 选中候选 / 历史 / 首选 + key 命中统计 | history + selection | 转换前先判断并执行 |
+| 首页关键字搜索 | `SearchInput` | 有，实时，含词典 key 命中数 | 选中候选 / 精确历史 / 首选 + key 命中统计 | history + selection | 转换前先判断并执行 |
 | 首页 AI 模式 | 首页 `SearchInput` + AI 页面 `TextField` | 首页非空时关闭；AI 页无 | 首页把原始输入交给 AI 页；AI 页用 `convert` 首选 | 首页写 raw/raw | 首页在进入 AI 前判断 |
-| 首页全文/经目结果 | 同上 | 有，实时 | 选中候选 / 历史 / 首选 + key 命中统计 | 同上 | 同上 |
-| 卷内搜索 | `SearchInput` | 有，实时 | 选中候选 / 历史 / 首选 | 仅 selection | 不执行；Goto 形状输入也会抑制候选 |
+| 首页全文/经目结果 | 同上 | 有，实时 | 选中候选 / 精确历史 / 首选 + key 命中统计 | 同上 | 同上 |
+| 卷内搜索 | `SearchInput` | 有，实时 | 选中候选 / 精确历史 / 首选 | 仅 selection | 不执行；Goto 形状输入也会抑制候选 |
 | 经目查询（选择佛经） | `SearchInput` | 有，实时 | 选中候选 / 历史 / `preferredQueryForInput` | 仅 selection | 不执行 |
 | 作译者查询（选择佛经） | `SearchInput` | 有，实时 | 选中候选；输入时用 `convertPreferred` 过滤列表 | 仅 selection | 不执行 |
 | Goto 查询（选择佛经） | 普通 `TextField` | 无 | `normalizeCbetaGotoLinehead` + `/juans/goto` | 不记录 | 始终执行 |
-| 词典查询（选择佛经） | `SearchInput` | 有，实时，含词典 key 命中数 | 选中候选 / 历史 / `resolveSearchQuery` + key 命中统计 | history + selection | 不执行 |
+| 词典查询（选择佛经） | `SearchInput` | 有，实时，含词典 key 命中数 | 选中候选 / 精确历史 / `resolveSearchQuery` + key 命中统计 | history + selection | 不执行 |
 | 离线全文搜索 | 首页搜索框 | 与在线相同 | 与在线相同 | 与首页相同 | 同首页 |
 
 补充：
@@ -633,7 +629,7 @@ return scriptureDisplaySettings.showSimplifiedText
 提交时按以下优先级决定查询词：
 
 1. 用户选中的候选（`SearchSelection.query`）；
-2. `search_selections` 的历史匹配；
+2. `search_selections` 的精确历史匹配；
 3. `resolveSearchQuery` 用首选 + 词典 key 命中数选出更优候选。
 
 如果用户**明确点选**了候选（`SearchSelection.isExplicit == true`），词典查询只使用所选文字本身，不再尝试简繁变体；即使该写法没有 key 命中，也不会静默改用另一种写法。这样「云 → 雲」的明确选择不会被回退成简体「云」，记录和输入框也保持「雲」。
@@ -864,7 +860,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - `homepage toggles persisted simplified text display`：`convert`、`convertCandidates`、`toSimplified`/`toSimplifiedAll`、`toTraditionalDisplay` 的典型结果与简繁显示切换；
 - `live search input shows history and candidate choices`：空输入历史、实时候选、原始输入标记、标签随显示模式转换、点击候选立即提交、光标变化后按搜索键仍提交原始输入；
 - `candidate rows show and sort by dictionary key hits`：词典命中数显示、固定候选保持前两位、其余按次数排序；
-- `search query resolution prioritizes selection, history, and hits`：选中候选 > 历史 > 首选；命中数更高时覆盖首选；统计异常退回首选；全简体候选标记；
+- `search query resolution prioritizes selection, exact history, and hits`：选中候选 > 精确历史 > 首选；命中数更高时覆盖首选；统计异常退回首选；全简体候选标记；
 - `searches are saved and can be selected again`：首页写入 `search_history`、清空后重新聚焦显示历史、点击历史立即再次搜索；
 - `homepage ambiguous simplified input offers candidates`：多候选面板、点击候选立即搜索；
 - `multi-character ambiguous input offers cross-product candidates`：`厂丑` 的四个组合与延迟提交；
@@ -892,7 +888,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 ### 12.2 尚未覆盖或建议补充
 
-- 历史匹配的包含/编辑距离阈值与同分规则；
+- 历史匹配只做精确输入相同，不再做包含或编辑距离模糊匹配；
 - 混合输入原文置顶与历史候选不固定；
 - 50 个组合上限、20 行面板上限、8 行历史上限；
 - AI 页面使用首选候选而非原始输入；
@@ -910,7 +906,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - 词典 key 命中统计、180 ms 防抖、缓存、面板排序与「字典 N」显示；
 - 共享 `SearchInput` 实时候选浮层、历史列表、标记合并、点击只填充、提交/输入法处理；
 - 首页、卷内搜索、经目查询、作译者查询、词典查询的候选接入；
-- 首页与词典查询使用「选中候选 / 历史 / 首选 + key 命中统计」；
+- 首页与词典查询使用「选中候选 / 精确历史 / 首选 + key 命中统计」；
 - 首页结果分为经目 / 字典 / 正文三个可折叠分区；经目与字典初始各 1 条，可分别展开全部；正文分区按作品（一级，默认折叠且懒惰渲染）→ 卷（二级）分组；
 - 词典查询记录 history + selection，且不执行 Goto；
 - 用户明确点选的词典候选不再做简繁字体回退；
@@ -925,7 +921,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - Trie / Aho-Corasick 词表匹配；
 - 整卷转换缓存；
 - 正文的简繁显示转换（当前只转换界面文字）；
-- 按使用频率排序的历史匹配；
+- 按使用频率或模糊相似度排序的历史匹配；
 - 候选生成中的任何本地经文统计。
 
 ### 12.4 与早期方案的差异
@@ -935,14 +931,14 @@ return scriptureDisplaySettings.showSimplifiedText
 | 按字组合并统计本地经文命中 | 候选生成不扫描经文；首页/词典只统计词典 key |
 | 等待计数后再排序 | 候选立即展示；命中数异步返回后只重排非固定候选 |
 | 纯繁体/共用字不生成候选 | 任何非空输入都生成候选，并提供全简体候选 |
-| 历史选择参与候选置顶 | 历史只作为候选标记与查询词优先级，固定项只有首选和原文 |
+| 历史选择参与候选置顶 | 精确历史只作为候选标记与查询词优先级，固定项只有首选和原文 |
 | 点击候选只填充，必须再按搜索按钮/搜索键 | 点击候选立即提交搜索，与按搜索按钮等价 |
 | 文本编辑下拉框 | 根 Overlay 中的只读 Material 列表 |
 | 只判断“全简体/全繁体” | 增加 mixed / neutral 与共用字处理 |
 | 所有入口都做 Goto | 只有首页自动判断；另有独立 Goto 查询标签页 |
 | 卷内/经目/作译者使用首选转换 | 三者都接入共享候选面板 |
 | 经目/作译者搜索正文 | 只查经目/作译者元数据 |
-| 历史按使用频率优先 | 按匹配得分，同分取最近插入 |
+| 历史按使用频率优先 | 只允许原始输入完全相同的精确历史匹配 |
 | 整卷简繁转换 | 只转换界面文字；正文保持原文 |
 | 词典查询用候选对话框 | 词典页直接使用 `SearchInput` 实时候选面板 |
 | 首页结果混排 | 经目 / 字典 / 正文三个可折叠分区，前两者初始各 1 条，正文一级作品默认折叠并懒惰渲染，展开后显示卷分组与命中片段 |
@@ -953,7 +949,7 @@ return scriptureDisplaySettings.showSimplifiedText
 1. 让正文跟随简繁显示切换：先补转换缓存与词表匹配性能，再改阅读器渲染；
 2. 修正纯共用字词组（如「以后」）的显示转换触发问题；
 3. 根据实际搜索记录补充词组表；
-4. 为历史匹配阈值、候选上限、AI/词典交互补充测试；
+4. 为精确历史匹配、候选上限、AI/词典交互补充测试；
 5. 清理未接线的 `_FullTextSearchPage` / `DictionarySearchPage`，或重新接入并补测试。
 
 ---
