@@ -389,6 +389,10 @@ SidxSource normalizeScriptureLines(List<ScriptureLine> lines) {
     if (line.role == ScriptureLineRole.volumeTitle) {
       seenVolumeTitle = true;
       boundaryRanges.add(lineRange);
+    } else if (line.role == ScriptureLineRole.volumeTailTitle) {
+      // 卷末尾題同樣是摘要的邊界，但不算卷首題：它不該解除
+      // 「卷首經號提示行不進索引」的限制。
+      boundaryRanges.add(lineRange);
     }
     final excludedFromIndex =
         line.role == ScriptureLineRole.byline ||

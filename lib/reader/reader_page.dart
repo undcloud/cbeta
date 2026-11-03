@@ -59,8 +59,6 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
   /// 實際落在哪一行；只有 `build` 會更新，其他時刻只讀。
   ScriptureTextLayout? _currentLayout;
   List<ScriptureLine> _currentBodyLines = const [];
-  int _currentHeaderPrefixLength = 0;
-  int _currentHeaderAdvance = 0;
 
   /// 使用者捲動後視窗頂端所在行的錨點；沒有手動捲動過時為 null，
   /// 此时「最近閱讀」記錄的是進入经文時的那個位置。
@@ -472,10 +470,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
         .findRenderObject();
     if (viewport is! RenderBox) return false;
     final viewportTop = viewport.localToGlobal(Offset.zero).dy;
-    final layoutOffset = _layoutOffsetAtGlobalPoint(
-      Offset(0, viewportTop),
-      _currentHeaderPrefixLength,
-    );
+    final layoutOffset = _layoutOffsetAtGlobalPoint(Offset(0, viewportTop));
     if (layoutOffset == null) return false;
     final lineIndex = _lineIndexForLayoutOffset(layout, layoutOffset);
     if (lineIndex == null) return false;
@@ -485,8 +480,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
       currentPassage.linehead,
       layoutOffset,
     );
-    final sourceOffset =
-        layout.lineSourceStarts[lineIndex] + _currentHeaderAdvance;
+    final sourceOffset = layout.lineSourceStarts[lineIndex];
     final lineText = lines[lineIndex].text;
     final snippetLength = lineText.length < 24 ? lineText.length : 24;
     _anchorLinehead = linehead;
@@ -555,27 +549,22 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
 
   /// 選取範圍 → 整卷 layout 位移。`SelectionArea` 只公開選取兩端的畫面座標，
   /// 因此把兩端分別回推到所屬區塊的局部位移。
-  ({int start, int end})? _selectedLayoutRange(
-    SelectableRegionState state,
-    int headerPrefixLength,
-  ) {
+  ({int start, int end})? _selectedLayoutRange(SelectableRegionState state) {
     final endpoints = state.selectionEndpoints;
     if (endpoints.isEmpty) return null;
     final box = state.context.findRenderObject();
     if (box is! RenderBox) return null;
     final start = _layoutOffsetAtGlobalPoint(
       box.localToGlobal(endpoints.first.point),
-      headerPrefixLength,
     );
     final end = _layoutOffsetAtGlobalPoint(
       box.localToGlobal(endpoints.last.point),
-      headerPrefixLength,
     );
     if (start == null || end == null) return null;
     return start <= end ? (start: start, end: end) : (start: end, end: start);
   }
 
-  int? _layoutOffsetAtGlobalPoint(Offset global, int headerPrefixLength) {
+  int? _layoutOffsetAtGlobalPoint(Offset global) {
     RenderParagraph? nearest;
     var nearestIndex = -1;
     var nearestDistance = double.infinity;
@@ -597,9 +586,8 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
     final position = nearest.getPositionForOffset(
       nearest.globalToLocal(global),
     );
-    final header = nearestIndex == 0 ? headerPrefixLength : 0;
-    final bodyLength = nearest.text.toPlainText().length - header;
-    final bodyOffset = (position.offset - header).clamp(0, bodyLength).toInt();
+    final bodyLength = nearest.text.toPlainText().length;
+    final bodyOffset = position.offset.clamp(0, bodyLength).toInt();
     final base = nearestIndex < _blockOffsetBases.length
         ? _blockOffsetBases[nearestIndex]
         : 0;
@@ -614,14 +602,13 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
     required ScripturePassage passage,
     required List<ScriptureLine> lines,
     required ScriptureTextLayout layout,
-    required int headerPrefixLength,
   }) {
     String selectedText() =>
         _selectedContentText.replaceAll('\uFFFC', '').trimRight();
 
     ({String? start, String? end}) selectedLineheads() {
       final fallback = passage.linehead ?? firstScriptureLinehead(lines);
-      final range = _selectedLayoutRange(state, headerPrefixLength);
+      final range = _selectedLayoutRange(state);
       if (range == null) {
         return (start: fallback, end: fallback);
       }
@@ -723,7 +710,6 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
   /// 跳過去之後下一次 frame 目標塊已掛載，再用量到的實際位置校正。
   void _scheduleReaderScrollTo({
     required int? layoutOffset,
-    required int headerPrefixLength,
     required List<ScriptureReaderBlock> blocks,
     required List<int> blockOffsetBases,
     required List<ScriptureLine> lines,
@@ -734,12 +720,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
       blockOffsetBases,
       layoutOffset,
     );
-    // 卷題／作譯者與正文共用第一個區塊的 SelectableText，
-    // 位移要加上這一段前置文字。
-    final localOffset =
-        layoutOffset -
-        blockOffsetBases[blockIndex] +
-        (blockIndex == 0 ? headerPrefixLength : 0);
+    final localOffset = layoutOffset - blockOffsetBases[blockIndex];
     _scheduleReaderScroll(
       _ReaderScrollRequest(
         blockIndex: blockIndex,
@@ -1120,34 +1101,11 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                 if (snapshot.hasError) {
                   return NoResults(message: '無法載入經文：${snapshot.error}');
                 }
-                final lines = snapshot.data ?? const <ScriptureLine>[];
-                if (lines.isEmpty) {
+                // 卷題與作譯者都留在正文原位：卷題置中變色、作譯者靠右字小。
+                final scriptureLines = snapshot.data ?? const <ScriptureLine>[];
+                if (scriptureLines.isEmpty) {
                   return const NoResults(message: '找不到此行的經文內容');
                 }
-                // 卷題已經留在正文裡當次級標題；頁首只保留作譯者等 metadata。
-                final headerLines = lines
-                    .where((line) => line.role == ScriptureLineRole.byline)
-                    .toList();
-                final headerPrefixLength = () {
-                  // 每個作譯者行都有一個對齊用的 WidgetSpan，
-                  // 且校勘標記必須跟實際渲染一致。
-                  final showCollation = scriptureDisplaySettings.showCollation;
-                  var len = 0;
-                  for (final line in headerLines) {
-                    final text = line.text.trim();
-                    final markerLength = showCollation
-                        ? line.footnotes.fold<int>(
-                            0,
-                            (length, note) => length + note.label.length + 2,
-                          )
-                        : 0;
-                    len += 1 + text.length + markerLength + 1;
-                  }
-                  return len;
-                }();
-                final scriptureLines = lines
-                    .where((line) => line.role != ScriptureLineRole.byline)
-                    .toList();
                 final settings = scriptureDisplaySettings;
                 final layout = buildScriptureTextLayout(
                   scriptureLines,
@@ -1157,11 +1115,6 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                 final text = layout.text;
                 _currentLayout = layout;
                 _currentBodyLines = scriptureLines;
-                _currentHeaderPrefixLength = headerPrefixLength;
-                _currentHeaderAdvance = headerLines.fold<int>(
-                  0,
-                  (sum, line) => sum + scriptureSourceAdvance(line),
-                );
                 // 行號可能屬於其他卷或該卷已改版；找不到時退回卷首，
                 // 不要讓整卷內容因錨點失效而無法閱讀。
                 final hitOccurrence = hitOccurrenceAtIndex(
@@ -1171,7 +1124,6 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                 final hitTarget = resolveSearchTargetOffset(
                   layout,
                   scriptureLines,
-                  headerLines,
                   currentPassage,
                   widget.query,
                   hitOccurrence,
@@ -1276,21 +1228,8 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                                 );
                                 return;
                               }
-                              if (hitTarget.inHeader) {
-                                _scheduleReaderScroll(
-                                  _ReaderScrollRequest(
-                                    blockIndex: 0,
-                                    localOffset: 0,
-                                    blocks: blocks,
-                                    lines: scriptureLines,
-                                    contentWidth: contentWidth,
-                                  ),
-                                );
-                                return;
-                              }
                               _scheduleReaderScrollTo(
                                 layoutOffset: targetLayoutOffset,
-                                headerPrefixLength: headerPrefixLength,
                                 blocks: blocks,
                                 blockOffsetBases: blockOffsetBases,
                                 lines: scriptureLines,
@@ -1310,7 +1249,6 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                                       passage: passage,
                                       lines: scriptureLines,
                                       layout: layout,
-                                      headerPrefixLength: headerPrefixLength,
                                     ),
                             child: NotificationListener<ScrollNotification>(
                               onNotification: (notification) {
@@ -1375,9 +1313,6 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                                     child = _ReaderPassageBlock(
                                       blockKey: _blockKeys[blockIndex],
                                       passage: passage,
-                                      headerLines: blockIndex == 0
-                                          ? headerLines
-                                          : const [],
                                       layoutLineStarts: layout.lineStarts,
                                       query: showLocalSearch
                                           ? localSearchQuery
@@ -1386,9 +1321,6 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                                           ? localSearchRange
                                           : null,
                                       queryRanges: queryRanges,
-                                      headerQuery: hitTarget.inHeader
-                                          ? widget.query
-                                          : '',
                                       sourceLines: scriptureLines,
                                       firstLineIndex: block.startLine,
                                       lineCount: block.lineCount,
@@ -1493,10 +1425,8 @@ class _ReaderPassageBlock extends StatefulWidget {
     required this.offsetBase,
     required this.sourceOffsetBase,
     this.layoutLineStarts = const [],
-    this.headerLines = const [],
     this.localSearchRange,
     this.queryRanges = const [],
-    this.headerQuery = '',
     this.highlightStart,
   });
 
@@ -1520,10 +1450,8 @@ class _ReaderPassageBlock extends StatefulWidget {
   final int sourceOffsetBase;
 
   final List<int> layoutLineStarts;
-  final List<ScriptureLine> headerLines;
   final ({int start, int end})? localSearchRange;
   final List<({int start, int end})> queryRanges;
-  final String headerQuery;
   final int? highlightStart;
 
   @override
@@ -1531,104 +1459,12 @@ class _ReaderPassageBlock extends StatefulWidget {
 }
 
 class ReaderPassageBlockState extends State<_ReaderPassageBlock> {
-  /// 作譯者行的文字片段，校勘標記與正文一致。
-  List<InlineSpan> _headerLineSpans(ScriptureLine line) {
-    final query = widget.query.trim();
-    final showCollation = scriptureDisplaySettings.showCollation;
-    final text = line.text.trim();
-    if (!showCollation || line.footnotes.isEmpty) {
-      return [highlightedPassageText(text, query)];
-    }
-    final spans = <InlineSpan>[];
-    var cursor = 0;
-    for (final note in line.footnotes) {
-      final noteOffset = note.offset.clamp(cursor, text.length);
-      if (noteOffset > cursor) {
-        spans.add(
-          highlightedPassageText(text.substring(cursor, noteOffset), query),
-        );
-        cursor = noteOffset;
-      }
-      final marker = '[${note.label}]';
-      if (note.content.isNotEmpty) {
-        final recognizer = TapGestureRecognizer()
-          ..onTap = () => _showFootnote(note);
-        noteRecognizers.add(recognizer);
-        spans.add(
-          TextSpan(
-            text: marker,
-            style: headerFootnoteStyle,
-            recognizer: recognizer,
-          ),
-        );
-      } else {
-        spans.add(TextSpan(text: marker, style: headerFootnoteStyle));
-      }
-    }
-    if (cursor < text.length) {
-      spans.add(highlightedPassageText(text.substring(cursor), query));
-    }
-    return spans;
-  }
-
-  void _showFootnote(ScriptureFootnote note) {
-    showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(note.label.startsWith('A') ? 'CBETA 修訂註解' : '校勘記'),
-        content: DisplaySelectableText(note.content),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('關閉'),
-          ),
-        ],
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     ScriptDisplayScope.dependOn(context);
     final settings = scriptureDisplaySettings;
     return LayoutBuilder(
       builder: (context, constraints) {
-        // 用不可見的 WidgetSpan 補齊左側空白，讓單一段落可以置中或靠右，
-        // 同時保留文字本身的選取能力。
-        WidgetSpan leadingSpacer(double pad) => WidgetSpan(
-          alignment: PlaceholderAlignment.middle,
-          child: SizedBox(width: pad < 0 ? 0 : pad, height: 0),
-        );
-
-        final headerChildren = <InlineSpan>[];
-
-        for (final line in widget.headerLines) {
-          final isNight = settings.isDark;
-          final lineStyle = scriptureTextStyle(settings).copyWith(
-            color: isNight ? const Color(0xFFA99A85) : const Color(0xFF8C7B66),
-            fontSize: settings.fontSize * 0.8,
-          );
-          final contentSpans = _headerLineSpans(line);
-          final painter = TextPainter(
-            text: TextSpan(style: lineStyle, children: contentSpans),
-            textDirection: Directionality.of(context),
-            textScaler: MediaQuery.textScalerOf(context),
-            maxLines: 1,
-          )..layout();
-          final textWidth = painter.width;
-          painter.dispose();
-          headerChildren.add(leadingSpacer(constraints.maxWidth - textWidth));
-          headerChildren.add(
-            TextSpan(
-              style: lineStyle,
-              children: [
-                ...contentSpans,
-                const TextSpan(text: '\n'),
-              ],
-            ),
-          );
-        }
-
         final bodySpan = displayInlineSpan(
           interactivePassageText(
             context,
@@ -1647,12 +1483,8 @@ class ReaderPassageBlockState extends State<_ReaderPassageBlock> {
           ),
         );
 
-        final combinedSpan = flutter_material.TextSpan(
-          children: [...headerChildren, bodySpan],
-        );
-
         return flutter_material.Text.rich(
-          combinedSpan,
+          bodySpan,
           key: widget.blockKey,
           style: scriptureTextStyle(settings),
           // 區塊用滿可用寬度，行內留白才能按父寬精確置中；

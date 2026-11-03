@@ -79,11 +79,25 @@ Iterable<material.Text> readerBlockTexts(WidgetTester tester) => tester
     )
     .where((text) => text.textSpan != null && text.key is GlobalKey);
 
-/// 區塊根節點的最後一個子節點是正文，前面可能掛著卷題／作譯者。
-InlineSpan? readerBlockBodySpan(material.Text text) {
-  final span = text.textSpan;
-  final children = span is TextSpan ? span.children : null;
-  return children?.lastOrNull ?? span;
+/// 卷題與作譯者都在正文區塊原位排版，區塊根節點就是正文。
+InlineSpan? readerBlockBodySpan(material.Text text) => text.textSpan;
+
+/// 取得包含 `needle` 的最內層文字樣式（已合併父層樣式）。
+TextStyle? readerStyleForText(InlineSpan root, String needle) {
+  TextStyle? found;
+  void walk(InlineSpan span, TextStyle? inherited) {
+    if (span is! TextSpan) return;
+    final merged = span.style == null
+        ? inherited
+        : (inherited ?? const TextStyle()).merge(span.style);
+    if ((span.text ?? '').contains(needle)) found = merged;
+    for (final child in span.children ?? const <InlineSpan>[]) {
+      walk(child, merged);
+    }
+  }
+
+  walk(root, null);
+  return found;
 }
 
 material.Text readerFirstBlockText(WidgetTester tester) =>
@@ -278,8 +292,8 @@ void main() {
     expect(lines.first.role, ScriptureLineRole.volumeTitle);
     expect(lines.first.text, '毘婆尸佛經卷上\n');
     expect(lines.first.headingLevel, 2);
-    expect(lines.last.role, ScriptureLineRole.navigationAnchor);
-    expect(lines.last.headingLevel, 0);
+    expect(lines.last.role, ScriptureLineRole.volumeTailTitle);
+    expect(lines.last.headingLevel, 2);
     expect(lines.last.linehead, 'T01n0003_p0156c08');
     expect(lines.last.text, '毘婆尸佛經卷上\n');
     expect(
@@ -1092,7 +1106,7 @@ void main() {
   });
 
   testWidgets(
-    'reader shows the volume title as a body heading and byline in header',
+    'reader shows the volume title as a body heading and byline in place',
     (tester) async {
       SharedPreferences.setMockInitialValues({});
       await scriptureDisplaySettings.load();
@@ -1173,8 +1187,11 @@ void main() {
           ),
           isTrue,
         );
-        // 段前空行 + 標題行首的置中留白，標題後再留一空行。
-        expect(bodySpan.toPlainText(), startsWith('\n\uFFFC中阿含經卷第五\n\n'));
+        // 段前空行 + 標題行首的置中留白；作譯者緊接在卷題下一行。
+        expect(
+          bodySpan.toPlainText(),
+          startsWith('\n\uFFFC中阿含經卷第五\n\uFFFC東晉罽賓三藏瞿曇僧伽提婆譯\n'),
+        );
         final bodyChildren = (bodySpan as TextSpan).children!;
         expect(bodyChildren[1], isA<WidgetSpan>());
         expect(
@@ -1202,6 +1219,18 @@ void main() {
           ),
           isTrue,
         );
+        // 作譯者在正文原位靠右、字小：行尾貼著區塊右緣，且排在卷題之後。
+        const bylineText = '東晉罽賓三藏瞿曇僧伽提婆譯';
+        final bylineAt = plain.indexOf(bylineText);
+        expect(bylineAt, greaterThan(titleAt));
+        expect(
+          readerCaretRect(paragraph, bylineAt + bylineText.length).left,
+          closeTo(paragraph.size.width, 1.5),
+        );
+        expect(
+          readerStyleForText(firstBlock, bylineText)?.fontSize,
+          closeTo(scriptureDisplaySettings.fontSize * 0.8, 0.01),
+        );
 
         bool containsMutedInlineNote(InlineSpan span) {
           if (span is! TextSpan) return false;
@@ -1213,6 +1242,82 @@ void main() {
       }, () => client);
     },
   );
+
+  testWidgets('reader centers the title repeated at the end of a juan', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    // 卷首與卷末都用 <p class="juan">，卷末那道是重複題。
+    const scriptureHtml =
+        '<html><body><div id="body">'
+        '<p class="juan">六度集經卷第一</p>'
+        '<p class="byline">吳康居國沙門康僧會譯</p>'
+        '<span class="lb" id="T03n0152_p0001a06"></span>'
+        '<p>菩薩慈惠度無極。</p>'
+        '<span class="lb" id="T03n0152_p0006a20"></span>'
+        '<p class="juan">六度集經卷第一</p>'
+        '</div></body></html>';
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'results': [scriptureHtml],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '六度集經',
+              reference: '卷 1',
+              text: '',
+              linehead: 'T03n0152_p0001a06',
+              juan: '1',
+              work: 'T0152',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      const titleText = '六度集經卷第一';
+      final paragraph = readerParagraphWith(tester, titleText);
+      final plain = paragraph.text.toPlainText();
+      expect(plain.contains(titleText), isTrue);
+      final tailAt = plain.lastIndexOf(titleText);
+      expect(tailAt, greaterThan(plain.indexOf(titleText)));
+
+      double centerOf(int start) =>
+          (readerCaretRect(paragraph, start).left +
+              readerCaretRect(paragraph, start + titleText.length).left) /
+          2;
+
+      // 卷末尾題與卷首題一樣置中，不再是靠左的普通正文行。
+      expect(
+        (centerOf(tailAt) - paragraph.size.width / 2).abs(),
+        lessThan(1.5),
+      );
+      expect(
+        (centerOf(plain.indexOf(titleText)) - paragraph.size.width / 2).abs(),
+        lessThan(1.5),
+      );
+      expect(
+        readerStyleForText(readerFirstBlockSpan(tester)!, titleText)?.color,
+        const Color(0xFF007564),
+      );
+    }, () => client);
+  });
 
   testWidgets('reader keeps collation markers on byline lines', (
     WidgetTester tester,
@@ -1278,6 +1383,158 @@ void main() {
       showLineBeginnings: false,
       backgroundTheme: 'default',
     );
+  });
+
+  testWidgets('styles the byline of a downloaded volume', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    // 下載器把離線壓縮檔的 <span class='lineInfo' line='0001a05'></span> 改寫成
+    // 段落內的 <span class="lb">…</span>，而這個錨點排在 byline 文字之前；
+    // 它不能把段落的 role 吞掉，否則離線經卷的作譯者會變回普通正文行。
+    const archiveHtml =
+        '<div id="body"><p class="juan">六度集經卷第一</p>'
+        '<p class="byline"><span class="lb" id="T03n0152_p0001a05">'
+        'T03n0152_p0001a05</span>吳<a class="noteAnchor" href="#n0001001"></a>'
+        '康居國沙門康僧會譯</p>'
+        '<span class="lb" id="T03n0152_p0001a07"></span><p>聞如是：</p>'
+        '<span class="lb" id="T03n0152_p0006a20"></span>'
+        '<p class="juan">六度集經卷第一</p></div>'
+        '<div id="back"><div class="footnote" id="n0001001">吳【康】</div></div>';
+    await scriptureVolumeStore.write(
+      const CachedScriptureVolume(
+        work: 'T0152',
+        juan: '1',
+        html: archiveHtml,
+        contentVersion: 'test',
+      ),
+    );
+    final client = MockClient((request) async => http.Response('{}', 404));
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '六度集經',
+              reference: '卷 1',
+              text: '',
+              linehead: 'T03n0152_p0001a07',
+              juan: '1',
+              work: 'T0152',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      const bylineText = '吳康居國沙門康僧會譯';
+      final paragraph = readerParagraphWith(tester, bylineText);
+      final plain = paragraph.text.toPlainText();
+      expect(plain.contains(bylineText), isTrue);
+      // 靠右：行尾落在段落右緣；字小、淡色。
+      expect(
+        readerCaretRect(
+          paragraph,
+          plain.indexOf(bylineText) + bylineText.length,
+        ).left,
+        closeTo(paragraph.size.width, 1.5),
+      );
+      final style = readerStyleForText(paragraph.text, '康居國沙門康僧會譯');
+      expect(style?.color, const Color(0xFF8C7B66));
+      // 校勘標記把 `吳` 與後文切成兩個 span，兩段都要是小字淡色。
+      expect(
+        readerStyleForText(paragraph.text, '吳')?.color,
+        const Color(0xFF8C7B66),
+      );
+      expect(
+        style?.fontSize,
+        closeTo(scriptureDisplaySettings.fontSize * 0.8, 0.01),
+      );
+
+      // 卷末尾題同樣在正文裡置中（與卷首題同一套樣式）。
+      const titleText = '六度集經卷第一';
+      final tailBlock = readerBlockTexts(
+        tester,
+      ).lastWhere((text) => text.textSpan!.toPlainText().contains(titleText));
+      final tailParagraph = tester.renderObject<RenderParagraph>(
+        find
+            .descendant(
+              of: find.byWidget(tailBlock),
+              matching: find.byType(RichText),
+            )
+            .first,
+      );
+      final tailAt = tailParagraph.text.toPlainText().lastIndexOf(titleText);
+      final tailCenter =
+          (readerCaretRect(tailParagraph, tailAt).left +
+              readerCaretRect(tailParagraph, tailAt + titleText.length).left) /
+          2;
+      expect((tailCenter - tailParagraph.size.width / 2).abs(), lessThan(1.5));
+      expect(
+        readerStyleForText(tailParagraph.text, titleText)?.color,
+        const Color(0xFF007564),
+      );
+
+      // 窄畫面＋最大字級：作譯者行只差十幾個像素就塞滿行寬，補齊留白只要往
+      // 上取整一個設備像素，最後幾個字就被換到下一行（使用者回報的
+      // 「明明沒螢幕寬卻換行」）。留白必須向下取整並確認不溢位。
+      await scriptureVolumeStore.write(
+        const CachedScriptureVolume(
+          work: 'T0153',
+          juan: '1',
+          html: archiveHtml,
+          contentVersion: 'test',
+        ),
+      );
+      const narrowByline = '康居國沙門康僧會譯';
+      await scriptureDisplaySettings.update(fontSize: 32);
+      tester.view.devicePixelRatio = 1.0;
+      await tester.binding.setSurfaceSize(const Size(320, 1200));
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '六度集經',
+              reference: '卷 1',
+              text: '',
+              linehead: 'T03n0152_p0001a07',
+              juan: '1',
+              work: 'T0153',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final narrowParagraph = readerParagraphWith(tester, narrowByline);
+      final narrowAt = narrowParagraph.text.toPlainText().indexOf(narrowByline);
+      final narrowEnd = readerCaretRect(
+        narrowParagraph,
+        narrowAt + narrowByline.length,
+      );
+      expect(
+        narrowEnd.top,
+        readerCaretRect(narrowParagraph, narrowAt).top,
+        reason: '作譯者結尾被擠到下一行',
+      );
+      // 不溢位的同時仍要貼住右緣：可行寬 = min(320, 680) − 32 = 288。
+      expect(narrowEnd.left, closeTo(288.0, 3.0));
+      tester.view.reset();
+      await tester.binding.setSurfaceSize(null);
+      await scriptureDisplaySettings.update(fontSize: 19);
+    }, () => client);
   });
 
   testWidgets('verse blocks keep one break before and a blank line after', (

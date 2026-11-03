@@ -132,16 +132,18 @@ void main() {
     final bodyLines = lines
         .where((line) => line.role != ScriptureLineRole.byline)
         .toList();
+    // 作譯者也在正文 layout 內，整卷行的位移才與離線索引一致。
     final layout = buildScriptureTextLayout(
-      bodyLines,
+      lines,
       showLineBeginnings: false,
       showCollation: true,
     );
 
     expect(bodyLines.first.role, ScriptureLineRole.volumeTitle);
     expect(bodyLines.first.headingLevel, 2);
-    expect(bodyLines.last.role, ScriptureLineRole.navigationAnchor);
-    expect(bodyLines.last.headingLevel, 0);
+    // 卷末（或序後）重複的卷題仍是卷題樣式，只是不再當作卷名 metadata。
+    expect(bodyLines.last.role, ScriptureLineRole.volumeTailTitle);
+    expect(bodyLines.last.headingLevel, 2);
     expect(layout.text, contains('長阿含經序'));
     expect(layout.text, contains('佛說[11]長阿含經卷第一'));
   });
@@ -216,14 +218,10 @@ void main() {
       '<div id="body"><p class="byline">後秦譯者</p><p>序文。</p>'
       '<p class="juan">佛說長阿含經卷第一</p><p>正文。</p></div>',
     );
-    final headerLines = lines
-        .where((line) => line.role == ScriptureLineRole.byline)
-        .toList();
-    final bodyLines = lines
-        .where((line) => line.role != ScriptureLineRole.byline)
-        .toList();
+    // 作譯者與卷題都在正文原位排版，layout 覆蓋整卷，
+    // 離線索引的整卷來源位移可以直接換算成畫面位移。
     final layout = buildScriptureTextLayout(
-      bodyLines,
+      lines,
       showLineBeginnings: false,
       showCollation: true,
     );
@@ -240,14 +238,12 @@ void main() {
 
     final target = resolveSearchTargetOffset(
       layout,
-      bodyLines,
-      headerLines,
+      lines,
       passage,
       '佛說長阿含經卷第一',
       0,
     );
 
-    expect(target.inHeader, isFalse);
     expect(target.sourceOffset, sourceOffset);
     expect(layout.text.substring(target.offset), startsWith('佛說長阿含經卷第一'));
   });
@@ -317,5 +313,23 @@ void main() {
     final rendered = readerSpan.toPlainText(includePlaceholders: true);
     expect('[6]'.allMatches(rendered), hasLength(1));
     expect(rendered, contains('[6]東西隨風[A5]逝；'));
+  });
+
+  test('keeps the paragraph role when a line anchor heads the paragraph', () {
+    // 下載器把壓縮檔的段落級 lineInfo 改寫成段落內的 <span class="lb">。
+    // 這個錨點不產生任何行，卻也不能把段落開頭的 role／標題層級重置掉，
+    // 否則離線經卷的卷題與作譯者會退化成普通正文行。
+    final lines = parseScriptureHtml(
+      '<div id="body"><p class="juan"><span class="lb" id="T03n0152_p0001a03">'
+      'T03n0152_p0001a03</span>六度集經卷第一</p>'
+      '<p class="byline"><span class="lb" id="T03n0152_p0001a05">'
+      'T03n0152_p0001a05</span>吳康居國沙門康僧會譯</p></div>',
+    );
+
+    expect(lines.first.role, ScriptureLineRole.volumeTitle);
+    expect(lines.first.headingLevel, 2);
+    expect(lines.first.linehead, 'T03n0152_p0001a03');
+    expect(lines.last.role, ScriptureLineRole.byline);
+    expect(lines.last.linehead, 'T03n0152_p0001a05');
   });
 }

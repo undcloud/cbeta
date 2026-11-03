@@ -698,17 +698,17 @@ return scriptureDisplaySettings.showSimplifiedText
 - `_buildScriptureTextLayout` 依 `scriptureLines`、行首标记、校勘标记与直排/表格换行规则，产生实际渲染的文字与每行起始位移；
 - 搜索结果与阅读页来源一一对应：**线上索引结果打开线上经卷，离线索引结果打开本地经卷**，两批结果不会合并，因此不需要去重。`ScripturePassage.fromOnlineIndex` 标示结果来源，`sourceOffset` 保存离线命中在整卷来源文字中的位移（含卷题／作译者行），`snippet` 保存命中字元本身；
 - 线上结果以 `linehead` 定位；线上 `/stable/juans` 每行都有逐行锚点，因此行号能精确找到目标行。同一行号可能有多笔命中，以「同行第 N 笔」区分（`_hitOccurrenceAtIndex` + 行内 `indexOf`）；
-- 离线扫描逐行比对时同时累计 `scriptureSourceAdvance`，把命中直接换算成整卷来源位移；阅读器只需减去页首作译者的前进量，再用 `_layoutEditableOffsetForSource` 映射到画面位移，不依赖段落锚点猜测，长段落内的重复词也能精确命中；卷题已留在正文里，不再算页首前进量；
+- 离线扫描逐行比对时同时累计 `scriptureSourceAdvance`，把命中直接换算成整卷来源位移；卷题与作译者都留在正文原位，layout 覆盖整卷，所以命中位移不需要再减任何页首前进量，直接用 `_layoutEditableOffsetForSource` 映射到画面位移，不依赖段落锚点猜测，长段落内的重复词也能精确命中；
 - 阅读前会以 `snippet` 验证 `sourceOffset`（`_locateSnippetOffset`）：原位移对得上就直接使用；对不上时优先在 ±600 字内找最近的相同字串，再退回全文最近命中。因此经卷改版、下载覆盖线上备份或书签旧位移都不会跳到错误位置；
 - 离线／已下载经卷的 HTML 只带段落级 `lineInfo` 锚点（如 `0154c14`），若线上索引结果因断网退回本地、行号不存在，才使用 `_resolveArchiveAnchorTarget`：取目标之前最近的锚点，只在该锚点到下一个锚点的范围内比对关键词，并用 kwic 前文挑出段落内正确的那一处。简体查询会再用 `toTraditionalDisplay` 比对繁体正文；
 - 找不到位移、行号且无法用段落锚点定位时退回卷首，不再阻止整卷阅读；
 - 跳转后直接把**命中字元**置中（卷内搜索、线上行号命中、离线位移命中一致），长段落不会只显示行首而把命中推到画面外；`clamp(0, maxScrollExtent)` 会让卷首命中自动滑到最开头、卷末命中滑到最后面；
-- 卷首卷题（`volumeTitle`）与卷末重复经题（`navigationAnchor`）都留在正文：`volumeTitle` 带次级标题样式并命中正文高亮；`navigationAnchor` 保留文字、不显示行首标记，也按正文命中处理；两者都滑到各自在正文中的实际位置，避免与页首 metadata 重复高亮。只有 `byline` 命中算页首命中（回到卷首、在顶部作译者列高亮）；
+- 卷首卷题（`volumeTitle`）与卷末重复经题（`volumeTailTitle`）都留在正文，两者都带置中绿色次级标题样式并命中正文高亮；差别只在 `volumeTailTitle` 透过 `ScriptureLine.suppressesLineBeginning` 不显示行首标记（它的行号属于卷末，排在卷首标记之后会让校勘与行号读序错乱），也不被当成卷名 metadata。`byline`（作译者）同样按正文命中，靠右小字淡色渲染；
 - 线上阅读时 `_cachedJuan` 先用 `/stable/juans` 取得线上全文；本地已有该卷就不写入、也不覆盖，本地没有才把线上内容留作离线备份。下载同一部经时，下载器写入压缩档内容并注册版本，自然覆盖线上备份；书签与最近阅读仍以本地优先打开，并用 `sourceOffset + snippet` 回位；
 - 表格与图片仍以 `WidgetSpan` 呈现，在区块 `Text.rich` 的纯文字中各占 1 个 placeholder；`_buildScriptureTextLayout` 与渲染端必须使用相同的前进量，否则锚点与卷内搜索会整段偏移；
 - 偈颂（`lg-row`）改以纯文字呈现（每格之间以不可见的 `WidgetSpan` 补足等宽置中间距），因此可以逐字选取；`_verseCellRenderedTexts` 同时供 layout 与渲染使用，两端的格内文字、校勘标记与 placeholder 数量必须一致；
 - 偈颂段落前只在上一行没有自带换行时补一个换行（不额外留空行）；段落後补一个空行；偈字使用较大的行高。这些换行字符也必须同时写进 `_buildScriptureTextLayout` 与渲染端，`lineStarts` 以偈颂列本身为起点，搜索锚点才不会偏移；
-- 阅读页顶端只固定作译者等 metadata；作译者行靠右是用不可见的 `WidgetSpan` 留白达成（同一段文字才能选取）；该 placeholder 也算一个字符，reader 端的 `headerPrefixLength` 与 span 的 `toPlainText().length` 必须一致，作译者行的校勘标记也要一起渲染并计入长度。卷题不再进页首，而是正文里居中的绿色次级标题（段前段后各留一空行）；置中留白同样占 1 个 placeholder 字符，`lineStarts` 必须把它与段前换行一起计入；
+- 阅读页不再抽取页首 metadata 行：卷题（置中）与作译者（靠右、`0.8×`、淡色）都在正文区块原位排版。两者都用不可见 `WidgetSpan` 留白达成对齐（同一段文字才能整段选取），留白与可能存在的段前换行都由 `_alignedBlockLeadingLength`（卷题 2、作译者 2 或 1）统一计数，`buildScriptureTextLayout` 的 `lineStarts` 与 `interactivePassageText` 必须用同一个函数，否则位移会整段偏一位；卷题与作译者相邻时不插空行（`_isFollowedByByline` → `_needsParagraphBreak`／`_needsVolumeTitleBreak`），两端规则也要一致。量测用的 spans 与真正渲染的 spans 同源，因此简繁显示模式下都会经 `displayInlineSpan` 转换且宽度不会量错；
 - `WidgetSpan` 内的文字（当前主要是表格）不在纯文字位移系统中，改用 `highlightedWidget` 直接字符串比对来高亮（卷内搜索使用黄色、全局搜索使用绿色）；
 - 关键字高亮以 `_matchRangesIn(layout.text, query)` 先算出所有命中范围，再与每个文字片段求交集；因此跨经文行、跨校勘标记的命中（如「四大五｜蕴迁变」的「五蕴」）也能正确高亮。
 
@@ -717,7 +717,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - `lib/scripture/reader_blocks.dart` 的 `buildScriptureReaderBlocks` 把整卷切成区块（正文 4000 字 / 表格 12 行 / 偈颂 24 行为上限，表格与偈颂不跨块），阅读器用 `ListView.builder` 只构建画面内的块，大部头经卷首屏不再整卷排版；
 - 全卷只有**一个** `SelectionArea` 包住 `ListView.builder`，块内用 `Text.rich`（不是 `SelectableText`）渲染，因此选取、复制、查词典与复制引文都能跨块；每块带 `GlobalKey`，`_blockParagraph` 从元素的子树取出真正排版的 `RenderParagraph`（`Text` 元素本身的 renderObject 是外层 `RenderMouseRegion`）；
 - 选中文字来自 `SelectionArea.onSelectionChanged` 的 `SelectedContent.plainText`（存进 `_selectedContentText`），工具列按钮在**触发时**才读取，避免工具列重建时机决定到选不到的文字；
-- 选取范围换算回整卷 layout 位移：`_selectedLayoutRange` 读 `SelectableRegionState.selectionEndpoints`（只有画面座标），用 `_layoutOffsetAtGlobalPoint` 找最近的块段落 `getPositionForOffset`，再加该块的 `offsetBase`（`_scriptureBlockOffsetBases`，即 `layout.lineStarts[startLine]` 扣掉行首标记前缀）与块 0 的 `headerPrefixLength`；引文起止行号由 `_scriptureLineheadAtLayoutOffset` 依 `layout.lineStarts` 还原；
+- 选取范围换算回整卷 layout 位移：`_selectedLayoutRange` 读 `SelectableRegionState.selectionEndpoints`（只有画面座标），用 `_layoutOffsetAtGlobalPoint` 找最近的块段落 `getPositionForOffset`，再加该块的 `offsetBase`（`_scriptureBlockOffsetBases`，即 `layout.lineStarts[startLine]` 扣掉行首标记前缀与卷题／作译者的对齐留白）；引文起止行号由 `_scriptureLineheadAtLayoutOffset` 依 `layout.lineStarts` 还原；
 - 滚动定位同样改成区块制：`_scheduleReaderScroll` 以 `_estimateBlockExtent` 估算目标块位置，块被构建后再用 `RenderParagraph.getOffsetForCaret` 校正，`_scrollRequestId` 让新请求作废旧的重试链；设定改变（字体、简繁）先用 `_captureReaderScrollAnchor` 记下画面顶端的那一块与局部位移，回位时保持顶端文字。
 
 ---

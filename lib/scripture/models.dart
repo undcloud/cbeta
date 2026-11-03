@@ -24,9 +24,24 @@ class ScriptureLine {
   final int headingLevel;
   final ScriptureLineRole role;
   final bool paragraphEnd;
+
+  /// 卷末尾題與純導航錨點行不顯示行號標記：前者的行號屬於卷末，
+  /// 排在卷首標記之後會讓校勘與行號的讀序錯亂。
+  bool get suppressesLineBeginning =>
+      role == ScriptureLineRole.navigationAnchor ||
+      role == ScriptureLineRole.volumeTailTitle;
 }
 
-enum ScriptureLineRole { regular, volumeTitle, byline, navigationAnchor }
+enum ScriptureLineRole {
+  regular,
+  volumeTitle,
+  byline,
+  navigationAnchor,
+
+  /// 卷末重複出現的卷題：與卷首題同樣置中、變色，但不當作卷名 metadata。
+  /// 新增的值只能加在末尾——離線索引以 `index` 儲存角色。
+  volumeTailTitle,
+}
 
 enum ScriptureScriptFamily { siddam, ranjana }
 

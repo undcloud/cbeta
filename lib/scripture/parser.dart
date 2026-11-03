@@ -26,7 +26,7 @@ String visibleScriptureLine(
   final result = StringBuffer();
   if (showLineBeginnings &&
       line.linehead != null &&
-      line.role != ScriptureLineRole.navigationAnchor) {
+      !line.suppressesLineBeginning) {
     result
       ..write('[')
       ..write(line.linehead!.split('_p').last)
@@ -80,6 +80,17 @@ List<ScriptureLine> parseScriptureHtml(String source) {
     // 夾注跨行(lb 在 small 內)時：本行末補上右括號並記錄本段的樣式範圍，
     // 下一行以左括號續接，使每行括號成對、小字範圍不錯位。
     final continuesInlineNotes = activeInlineNotes.isNotEmpty;
+    final emittedLine =
+        linehead != null ||
+        text.isNotEmpty ||
+        images.isNotEmpty ||
+        tableRows.isNotEmpty;
+    // 離線壓縮檔經下載器改寫後，行錨點會變成段落內的 <span class="lb">，
+    // 緊接在 `<p class="byline">` 等標記之後。這次 flush 不產生任何行，
+    // 若連行屬性一起重置，段落開頭的 role／標題層級就會被吞掉。
+    final pendingRole = lineRole;
+    final pendingHeadingLevel = headingLevel;
+    final pendingParagraphEnd = paragraphEnd;
     if (continuesInlineNotes) {
       if (text.toString() == '（') {
         text.clear();
@@ -92,10 +103,7 @@ List<ScriptureLine> parseScriptureHtml(String source) {
         }
       }
     }
-    if (linehead != null ||
-        text.isNotEmpty ||
-        images.isNotEmpty ||
-        tableRows.isNotEmpty) {
+    if (emittedLine) {
       final rawText = text.toString();
       final leadingMatch = _leadingSpacePattern.firstMatch(rawText);
       final leadingWhitespace = leadingMatch?.end ?? 0;
@@ -165,9 +173,9 @@ List<ScriptureLine> parseScriptureHtml(String source) {
     footnotes = [];
     inlineNotes = [];
     scriptRuns.clear();
-    headingLevel = 0;
-    lineRole = ScriptureLineRole.regular;
-    paragraphEnd = false;
+    headingLevel = emittedLine ? 0 : pendingHeadingLevel;
+    lineRole = emittedLine ? ScriptureLineRole.regular : pendingRole;
+    paragraphEnd = emittedLine ? false : pendingParagraphEnd;
     if (continuesInlineNotes) {
       text.write('（');
       activeCell?.write('（');
@@ -418,8 +426,9 @@ List<ScriptureLine> parseScriptureHtml(String source) {
     final normalizedTitle = line.text
         .replaceAll(_whitespacePattern, '')
         .replaceAll(_bracketNumberPattern, '');
-    // 正文开始后再出现的卷名是卷末尾题：按网页模式留在原位显示，
-    // 不再上移到标题区（否则其校勘标号会排到卷首标号之前）。
+    // 正文开始后再出现的卷名是卷末尾题：留在原位，仍套用卷題樣式
+    // （置中、變色），但不會被當成卷名 metadata，行號標記也不顯示，
+    // 否則其校勘標號會排到卷首標號之前。
     if (enteredBody || !seenVolumeTitles.add(normalizedTitle)) {
       return ScriptureLine(
         text: line.text,
@@ -427,9 +436,8 @@ List<ScriptureLine> parseScriptureHtml(String source) {
         footnotes: line.footnotes,
         inlineNotes: line.inlineNotes,
         scriptRuns: line.scriptRuns,
-        // 卷末重複題只保留正文位置，不再套次級標題樣式。
-        headingLevel: 0,
-        role: ScriptureLineRole.navigationAnchor,
+        headingLevel: line.headingLevel,
+        role: ScriptureLineRole.volumeTailTitle,
         paragraphEnd: line.paragraphEnd,
       );
     }

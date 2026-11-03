@@ -14,11 +14,23 @@
 - 长文渲染：正文按段落拆成 `ReaderPassageBlock`，标题/脚注/偈颂各有分支；
   悉曇/蘭札字区间的字体替换逻辑在 `scripture/parser.dart` 产出的
   `ScriptureLine.scriptRuns`，此页负责套用；
-- 页首只固定作译者等 metadata；`volumeTitle` 留在正文，以
-  `headingLevel: 2` 呈现居中的绿色次级标题，段前、段后各留一空行；
-  卷末重复题 `navigationAnchor` 保留文字但不套标题样式。因此正文 layout、
-  卷内搜索与离线摘要都包含卷题；置中靠行首不可见 placeholder 达成，
-  layout 端必须同步计入这 2 个字元（placeholder + 段前换行）；
+- 卷题与作译者都留在正文原位排版，页首不再抽取 metadata 行：`volumeTitle` 与卷末重复题
+  `volumeTailTitle`（都是 `headingLevel: 2`）呈居中的绿色次级标题，`byline` 靠右、`0.8×` 字号、淡色；
+  对齐都靠在行首插一个不可见 placeholder 达成（同一段文字才可整段选取）。`volumeTailTitle` 与
+  `navigationAnchor` 依 `ScriptureLine.suppressesLineBeginning` **不显示行号标记**（卷末行号排在卷首
+  标记之后会让校勘读序错乱），`volumeTailTitle` 也不当作卷名 metadata。layout 端由
+  `_alignedBlockLeadingLength` 计入前导长度（卷题固定 2＝换行＋placeholder；作译者 2，
+  若前一行已自带换行则只有 1），渲染端 `interactivePassageText` 必须调用同一函数；
+  placeholder 宽度**不能刚好等于剩余宽度**：它会先被排版引擎换算，一进到设备像素就超过行宽，
+  而 CJK 每个字都是断行点，作译者最后几个字会被挤到下一行。因此留白先向下取整到
+  `1/devicePixelRatio`，再用 `RenderParagraph` 本身那条排版路径（带 `maxWidth` 约束、
+  `maxLines: 1` 的 `TextPainter`，placeholder 尺寸用 `setPlaceholderDimensions` 喂进去）问一次
+  会不会换行，会换行就按 1、2、4、8… 个设备像素一步步收回留白（最多 6 次）；收到 0 仍换行
+  说明文字本身就放不下，退回自然换行。两个 TextPainter 都要先过 `displayInlineSpan()`，
+  因为渲染端在 `interactivePassageText` 之后还会做一次简繁转换，量的必须是最终画出来的文字；
+  卷题与作译者相邻时不再插空行（`_isFollowedByByline` → `_needsParagraphBreak`／
+  `_needsVolumeTitleBreak`）。因此正文 layout 覆盖整卷，卷内搜索、离线摘要与书签位移
+  都不需要再加减页首前进量；
 - 相鄰正文段落之间加一行间距；该段落边界同时进入搜尋文字与位移換算，
   不在偈頌段落前重複插入間距；
 - 长按/选择文字：复制、引文格式化、分享、全选（见 reader_citations）；
@@ -26,8 +38,7 @@
   - 除进入时的搜索命中位置外，也会在「使用者自己捲动后停下」时，把
     当下**视窗顶端那一行**记为阅读锚点（`_updateReadingAnchorFromViewportTop`
     经 `_layoutOffsetAtGlobalPoint` → `_lineIndexForLayoutOffset` →
-    `scriptureLineheadAtLayoutOffset`，再依 `lineSourceStarts` 加上卷首
-    前进量算出整卷来源位移，取该行前 24 字作 `snippet`）；
+    `scriptureLineheadAtLayoutOffset`，再依 `lineSourceStarts` 算出整卷来源位移，取该行前 24 字作 `snippet`）；
   - 只在 `UserScrollNotification`（真正的拖拽／惯性滑动）之后才触发，
     程序化的 `jumpTo`（跳到搜索命中、切卷）不算「换了阅读位置」；
     `ScrollEndNotification` 后延迟 400ms 才写一次，避免惯性滑动每一格
@@ -49,10 +60,12 @@
 - `ScriptureTextLayout` / `buildScriptureTextLayout`：把 `ScriptureLine`
   列表拼成单一可搜索字符串，记录每段 offset 基址
   （`scriptureBlockOffsetBases`）、行首前缀、偈颂格渲染文本；
-- `resolveSearchTargetOffset` / `locateSnippetOffset` /
-  `resolveArchiveAnchorTarget`：把搜索命中或引文锚点定位回 layout offset；
-  来源位移会先按「减去页首前进量」与「不減」两个候选用 `snippet` 验证，
-  因为作译者行可能位于卷题之前或之后；作译者命中回卷首，卷题按正文定位；
+- `resolveSearchTargetOffset` / `resolveArchiveAnchorTarget`：把搜索命中或引文锚点定位回
+  layout offset。layout 覆盖整卷（卷题与作译者都在正文内），所以來源位移不必再加减页首
+  前进量：先以 `_locateSnippetOffset` 驗證 `sourceOffset`（原位對上就用，對不上先在
+  ±600 字範圍找最近的相同文字，再退回全文最近命中），換算走
+  `layoutEditableOffsetForSource`；沒有來源位移時才用逐行行號，行號也找不到才退回
+  段落錨點搭配 kwic 比對。卷题、卷末尾题与作译者都按正文定位；
 - `highlightedPassageText` / `interactivePassageText` / `matchRangesIn`：
   关键字高亮（跨折叠符号、跨行）与可交互 span；
 - 偈颂校勘注统一由 `_verseCellIndexForNote` 归属到唯一一格：优先用解析器

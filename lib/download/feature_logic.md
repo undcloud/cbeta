@@ -49,3 +49,20 @@
   产生假标记；因此离线阅读、离线索引都只呈现压缩档实际带有的内容。
 - 若以后需要离线星号，只能依赖 CBETA 在压缩档里补回 `<app type="star">`，
   或改走逐卷 `/stable/juans`；后者会批量请求 CBETA 服务，不采用。
+
+### `normalizeArchiveHtml()` 會改寫離線 HTML 的存儲形態
+
+下載器把壓縮檔內每一卷的 HTML 存進 `ScriptureVolumeStore` 之前做兩件事：
+
+- `<span class='lineInfo' line='X'></span>` → `<span class="lb" id="<prefix>_pX">…</span>`，
+  讓只有段落級錨點的離線檔案也能有行首標記與行號跳轉；
+- 壓掉 `>\s*\n\s*<` 的標籤間空白，避免每個換行都變成多出來的空行。
+
+副作用（改這裡要知道）：原本的 `lineInfo` 常常是 `<p class="byline">` 等段落的**第一個子節點**，
+改寫後就變成段落內部的 `lb`；解析器遇到 `lb` 會先 `flushLine()`，
+所以 `flushLine()` 必須只在「真的產生了行」時才重置 `role`／`headingLevel`／`paragraphEnd`，
+否則離線經卷的卷題與作譯者會退化成普通正文行（靠左、黑色、字同正文）。
+相關回歸：`test/scripture_render_test.dart` 的
+`keeps the paragraph role when a line anchor heads the paragraph`、
+`test/widget_test.dart` 的 `styles the byline of a downloaded volume`；
+樣本與由來登記在 `test/html_conflict_cases.md` 的 C-16。

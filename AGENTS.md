@@ -24,6 +24,9 @@
 - 搜尋：`lib/search/`，包含簡繁轉換、搜尋歷史、Goto、候選排序與共用輸入框。
 - AI：`lib/ai/`，包含 AI 搜尋網路層與 chunk 模型。
 - 測試：`test/widget_test.dart`、`test/ai_service_test.dart`。
+- 改 HTML 解析／渲染（`lib/scripture/parser.dart`、`lib/reader/reader_layout.dart`、`lib/reader/reader_page.dart`）
+  前先讀 `test/html_conflict_cases.md`：線上 `/stable/juans` 與離線 ZIP 標記不等價，
+  歷次「修 A 壞 B」的樣本都登記在該檔，改完照它的第 3 節批量驗證並補新案例。
 - 資產：`assets/`，其中簡繁表與詞組表很大，**不要整份讀取**。
 
 ## 常用命令
