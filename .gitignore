@@ -51,5 +51,6 @@ app.*.map.json
 fodict
 # CBETA crawler cache
 tool/.catalog_cache/
+tool/cbeta_all/
 assets/cbeta_catalog
 /cbeta-fodict/

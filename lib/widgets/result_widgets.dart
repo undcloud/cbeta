@@ -24,7 +24,7 @@ class HomeBrand extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           Image.asset(
-            'assets/cbetaonline.png',
+            'assets/app_icon.png',
             width: 28,
             height: 28,
             semanticLabel: 'CBETA',
