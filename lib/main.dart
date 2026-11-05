@@ -4,6 +4,7 @@ import 'package:flutter/material.dart' hide Text;
 import 'package:flutter_localizations/flutter_localizations.dart';
 
 import 'common/app_nav.dart';
+import 'common/dila_http_client.dart';
 import 'dictionary/fodict_download_manager.dart';
 import 'download/catalog_cache.dart';
 import 'download/catalog_store.dart';
@@ -44,6 +45,7 @@ export 'work_picker/work_picker_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await installDilaTrust();
   await SimplifiedTraditionalConverter.load();
   await scriptureDisplaySettings.load();
   CatalogCache.instance.localFileLoader = catalogStore.read;
