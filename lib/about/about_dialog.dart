@@ -114,7 +114,7 @@ Future<void> showAbout(BuildContext context) {
 }
 
 String _aboutIntroductionText() => [
-  'CBETA 經典全文搜尋 Flutter App',
+  'Fodian 經典全文搜尋 Flutter App',
   '',
   '本 App 是一款基於 CBETA 提供的 API 開發的免費開源佛典閱讀與檢索應用程式，',
   '支援將經卷與 41 部佛學字典下載至本地，離線單機即可完整使用。',

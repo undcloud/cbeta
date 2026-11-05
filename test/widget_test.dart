@@ -2019,7 +2019,7 @@ void main() {
 
     expect(scriptureDisplaySettings.showSimplifiedText, isFalse);
     expect(find.text('繁'), findsOneWidget);
-    expect(find.text('CBETA 閱讀'), findsOneWidget);
+    expect(find.text('Fodian 閱讀'), findsOneWidget);
     expect(find.text('我的書籤'), findsOneWidget);
 
     await tester.tap(find.text('繁'));
@@ -2027,7 +2027,7 @@ void main() {
 
     expect(scriptureDisplaySettings.showSimplifiedText, isTrue);
     expect(find.text('简'), findsOneWidget);
-    expect(find.text('CBETA 阅读'), findsOneWidget);
+    expect(find.text('Fodian 阅读'), findsOneWidget);
     expect(find.text('我的书签'), findsOneWidget);
     final preferences = await SharedPreferences.getInstance();
     final savedSettings =
@@ -2157,8 +2157,8 @@ void main() {
     await scriptureDisplaySettings.load();
     await tester.pumpWidget(const CbetaSearchApp());
 
-    expect(find.text('CBETA 閱讀'), findsOneWidget);
-    expect(find.text('歡迎使用 CBETA 經典閱讀'), findsOneWidget);
+    expect(find.text('Fodian 閱讀'), findsOneWidget);
+    expect(find.text('歡迎使用 Fodian 經典閱讀'), findsOneWidget);
     expect(find.byType(TextField), findsOneWidget);
     expect(
       tester.widget<Scaffold>(find.byType(Scaffold)).backgroundColor,
@@ -2275,7 +2275,7 @@ void main() {
       expect(suggestion, findsOneWidget);
       expect(tester.widget<ListTile>(suggestion).leading, isNull);
 
-      await tester.tap(find.text('歡迎使用 CBETA 經典閱讀'));
+      await tester.tap(find.text('歡迎使用 Fodian 經典閱讀'));
       await tester.pumpAndSettle();
       expect(suggestion, findsNothing);
 
@@ -2642,7 +2642,7 @@ void main() {
       expect(find.textContaining('長阿含經'), findsWidgets);
 
       // 清空後再搜同一個字才算新搜尋:先畫上次留下的結果,不再讓使用者等 API 數秒。
-      await tester.tap(find.text('CBETA 閱讀'));
+      await tester.tap(find.text('Fodian 閱讀'));
       await tester.pumpAndSettle();
       await tester.enterText(find.byType(TextField).first, '般若');
       await tester.tap(find.byTooltip('搜尋經文'));
@@ -3287,12 +3287,12 @@ void main() {
       await tester.tap(find.byTooltip('搜尋經文'));
       await tester.pumpAndSettle();
       expect(find.textContaining('找不到'), findsOneWidget);
-      expect(find.text('歡迎使用 CBETA 經典閱讀'), findsNothing);
+      expect(find.text('歡迎使用 Fodian 經典閱讀'), findsNothing);
 
-      await tester.tap(find.text('CBETA 閱讀'));
+      await tester.tap(find.text('Fodian 閱讀'));
       await tester.pumpAndSettle();
 
-      expect(find.text('歡迎使用 CBETA 經典閱讀'), findsOneWidget);
+      expect(find.text('歡迎使用 Fodian 經典閱讀'), findsOneWidget);
       expect(find.textContaining('找不到'), findsNothing);
       expect(find.byType(TextField).first, findsOneWidget);
       expect(
@@ -3333,7 +3333,7 @@ void main() {
       await tester.binding.handlePopRoute();
       await tester.pumpAndSettle();
 
-      expect(find.text('歡迎使用 CBETA 經典閱讀'), findsOneWidget);
+      expect(find.text('歡迎使用 Fodian 經典閱讀'), findsOneWidget);
       expect(find.textContaining('找不到'), findsNothing);
       expect(
         tester.widget<TextField>(find.byType(TextField).first).controller!.text,
@@ -3464,7 +3464,7 @@ void main() {
       await tester.tapAt(const Offset(700, 40));
       await tester.pumpAndSettle();
       expect(find.text('選擇佛經'), findsNothing);
-      expect(find.text('歡迎使用 CBETA 經典閱讀'), findsOneWidget);
+      expect(find.text('歡迎使用 Fodian 經典閱讀'), findsOneWidget);
 
       await tester.tap(find.byTooltip('選擇佛經'));
       await tester.pumpAndSettle();
@@ -3665,9 +3665,9 @@ void main() {
               .value,
           50,
         );
-        await tester.tap(find.text('CBETA 閱讀'));
+        await tester.tap(find.text('Fodian 閱讀'));
         await tester.pumpAndSettle();
-        expect(find.text('CBETA 閱讀'), findsOneWidget);
+        expect(find.text('Fodian 閱讀'), findsOneWidget);
 
         await tester.tap(find.byTooltip('選擇佛經'));
         await tester.pumpAndSettle();

@@ -27,12 +27,12 @@ class HomeBrand extends StatelessWidget {
             'assets/app_icon.png',
             width: 28,
             height: 28,
-            semanticLabel: 'CBETA',
+            semanticLabel: 'Fodian',
           ),
           const SizedBox(width: 6),
           Flexible(
             child: Text(
-              'CBETA 閱讀',
+              'Fodian 閱讀',
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
                 color: color,
                 fontWeight: FontWeight.w800,

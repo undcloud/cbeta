@@ -435,10 +435,10 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       builder: (dialogContext) => AlertDialog(
         title: const Text('需要安裝權限'),
         content: const Text(
-          '系統目前未允許「CBETA」安裝應用程式。\n\n'
-          '請點「前往設定」，確認設定頁上方顯示的是「CBETA」，'
+          '系統目前未允許「Fodian」安裝應用程式。\n\n'
+          '請點「前往設定」，確認設定頁上方顯示的是「Fodian」，'
           '並開啟「允許安裝未知應用程式」。\n\n'
-          '如果該頁顯示 CBETA 已經允許，可選「仍然嘗試安裝」。',
+          '如果該頁顯示 Fodian 已經允許，可選「仍然嘗試安裝」。',
         ),
         actions: [
           TextButton(
@@ -483,7 +483,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         builder: (dialogContext) => AlertDialog(
           title: const Text('需要安裝權限'),
           content: Text(
-            '${error.message}\n\n請在系統設定中允許「CBETA」安裝未知來源的應用程式，'
+            '${error.message}\n\n請在系統設定中允許「Fodian」安裝未知來源的應用程式，'
             '返回 App 後會自動繼續安裝。',
           ),
           actions: [
@@ -1555,7 +1555,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         ),
         const SizedBox(height: 16),
         Text(
-          '歡迎使用 CBETA 經典閱讀',
+          '歡迎使用 Fodian 經典閱讀',
           style: Theme.of(
             context,
           ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),

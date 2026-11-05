@@ -133,7 +133,7 @@ class _CbetaSearchAppState extends State<CbetaSearchApp>
           child: MaterialApp(
             navigatorKey: navigatorKey,
             debugShowCheckedModeBanner: false,
-            title: 'CBETA 經文搜尋',
+            title: 'Fodian 經文搜尋',
             locale: const Locale('zh', 'TW'),
             supportedLocales: const [Locale('zh', 'TW')],
             localizationsDelegates: GlobalMaterialLocalizations.delegates,
