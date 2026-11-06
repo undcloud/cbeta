@@ -18,7 +18,10 @@
   `DictionaryStickyHeader` 吸顶展示，可下载/删除词库
   （`dictionary/fodict_download_manager.dart`）；
 - 經目查詢 / Goto tab 的线上请求走 `search/search_api.dart` 与
-  `search/passage_resolver.dart`。
+  `search/passage_resolver.dart`；
+- **離線模式**（`search/offline_preference.dart`）下經目查詢只查內建
+  `CatalogCache`，不發 `/stable/search/toc`；Goto 只查本地已下載經卷，找不到
+  直接提示下載或切換聯網，不會先等遠端逾時。
 
 ## creator_collation.dart
 

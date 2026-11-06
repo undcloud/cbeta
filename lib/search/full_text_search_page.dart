@@ -43,16 +43,22 @@ class FullTextSearchSnapshot {
 class FullTextSearchCache {
   static final Map<String, FullTextSearchSnapshot> _snapshots = {};
 
-  static FullTextSearchSnapshot? get(String query) => _snapshots[query];
+  static String _key(String query, bool offline) =>
+      '${offline ? 'offline' : 'online'}:$query';
+
+  static FullTextSearchSnapshot? get(String query, {required bool offline}) =>
+      _snapshots[_key(query, offline)];
+
   static void remember(
     String query, {
+    required bool offline,
     required List<ScriptureSearchResult> results,
     required int nextStart,
     required int totalFound,
     required int totalTermHits,
     bool hasMore = false,
   }) {
-    _snapshots[query] = FullTextSearchSnapshot(
+    _snapshots[_key(query, offline)] = FullTextSearchSnapshot(
       results: List.unmodifiable(results),
       nextStart: nextStart,
       totalFound: totalFound,
@@ -94,7 +100,7 @@ class _FullTextSearchPageState extends State<FullTextSearchPage> {
       final query = SimplifiedTraditionalConverter.convert(
         widget.initialQuery.trim(),
       );
-      final cached = FullTextSearchCache.get(query);
+      final cached = FullTextSearchCache.get(query, offline: offlineMode);
       if (cached != null) {
         submittedQuery = query;
         results = cached.results;
@@ -155,8 +161,8 @@ class _FullTextSearchPageState extends State<FullTextSearchPage> {
       loading = true;
       loadingMore = false;
       error = null;
-      // 「僅離線」開關：不請求線上全文，直接掃本地經卷。
-      offlineMode = offlineKeywordSearchOnly;
+      // 離線模式：不請求線上全文，直接掃本地經卷。
+      offlineMode = offlineModeListenable.value;
       hasMore = false;
       scannedVolumes = 0;
       totalVolumes = 0;
@@ -191,6 +197,7 @@ class _FullTextSearchPageState extends State<FullTextSearchPage> {
         loadingMore = false;
         FullTextSearchCache.remember(
           query,
+          offline: false,
           results: results,
           nextStart: nextStart,
           totalFound: totalFound,
@@ -200,18 +207,10 @@ class _FullTextSearchPageState extends State<FullTextSearchPage> {
       });
     } catch (exception) {
       if (!mounted) return;
-      if (!offlineMode && isNetworkFailure(exception)) {
-        final session = OfflineScanSession(query);
-        offlineSession = session;
-        await session.prepare();
-        await session.scanChunk();
-        if (!mounted) return;
-        setState(() => offlineMode = true);
-        _applyOfflineScanPage(query, session.current);
-        return;
-      }
       setState(() {
-        error = '全文搜尋失敗：$exception';
+        error = isNetworkFailure(exception)
+            ? '無法連接 CBETA 伺服器；請改用離線模式後再搜尋。'
+            : '全文搜尋失敗：$exception';
         loading = false;
         loadingMore = false;
       });
@@ -231,6 +230,7 @@ class _FullTextSearchPageState extends State<FullTextSearchPage> {
       loadingMore = false;
       FullTextSearchCache.remember(
         query,
+        offline: true,
         results: results,
         nextStart: nextStart,
         totalFound: totalFound,

@@ -13,7 +13,9 @@ import '../search/conversion.dart';
 import '../search/goto.dart';
 import '../search/history.dart';
 import '../search/offline_preference.dart';
+import '../common/cbeta_http_client.dart';
 import '../download/catalog_cache.dart';
+import '../download/download_status_ui.dart';
 import '../settings/display_settings.dart';
 import '../feedback/feedback_dialog.dart';
 import '../ai/ai_search_page.dart';
@@ -114,11 +116,18 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   Timer? _offlinePublishTimer;
   OfflineScanProgress? _pendingOfflineProgress;
 
-  /// 线上请求还没回来时，本地扫描可以先跑，但先不抢画面；超过这个延迟
-  /// 才把本地结果亮出来（快取命中或线上很快的查询就不会闪一下）。
-  static const Duration _offlineRevealDelay = Duration(milliseconds: 500);
-  Timer? _offlineRevealTimer;
-  bool _offlinePublishDeferred = false;
+  /// 聯網模式連不上伺服器時的提示；[connectionFailureHasLocal] 決定是否
+  /// 提供「改用離線搜尋」。離線模式下一卷都沒有時用 [offlineVolumesMissing]。
+  bool connectionFailurePrompt = false;
+  bool connectionFailureHasLocal = false;
+  bool offlineVolumesMissing = false;
+
+  /// 連線已建立但伺服器算得比 5 秒久時，提供手動切離線的入口，不中止請求。
+  bool serverSlowHint = false;
+  Timer? _serverSlowTimer;
+
+  bool _lastOfflineMode = false;
+  bool _modeChangePending = false;
   ModalRoute<Object?>? _ownRoute;
   bool _offlineScanPausedByUser = false;
   bool _offlineScanPausedByLifecycle = false;
@@ -150,8 +159,53 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     unawaited(_checkForAppUpdate());
     // 經目查詢改走本地全量目錄,先暖好，第一次搜尋才不用等解析 4 MB JSON。
     unawaited(CatalogCache.instance.load().catchError((_) {}));
-    // 「僅離線」開關要在第一次搜尋前就知道狀態。
-    unawaited(loadOfflineKeywordSearchOnly());
+    // 離線模式要在第一次搜尋前就知道狀態；main() 已先載入，這裡再保險一次。
+    _lastOfflineMode = offlineMode;
+    offlineModeListenable.addListener(_onOfflineModeChanged);
+    unawaited(loadOfflineMode());
+  }
+
+  void _onOfflineModeChanged() {
+    if (!mounted) return;
+    final changed = _lastOfflineMode != offlineMode;
+    _lastOfflineMode = offlineMode;
+    setState(() {});
+    if (!changed || submittedQuery.isEmpty) return;
+    _modeChangePending = true;
+    // 閱讀器可能蓋在首頁上；等轉場結束後再重跑，避免在背景掃描整藏。
+    if (!(_ownRoute?.isCurrent ?? true)) return;
+    _restartKeywordSearchForMode();
+  }
+
+  void _restartKeywordSearchForMode() {
+    if (submittedQuery.isEmpty) return;
+    _modeChangePending = false;
+    final token = ++requestToken;
+    _stopOfflineScan();
+    _serverSlowTimer?.cancel();
+    _serverSlowTimer = null;
+    setState(() {
+      results = const [];
+      keywordSearchError = null;
+      loadMoreError = null;
+      keywordSearchSucceeded = false;
+      offlineSearchActive = false;
+      offlineVolumesMissing = false;
+      connectionFailurePrompt = false;
+      serverSlowHint = false;
+      offlineScannedVolumes = 0;
+      offlineTotalVolumes = 0;
+      isLoading = true;
+      isKeywordSearchPending = true;
+      isLoadingMore = false;
+      hasMore = false;
+      nextStart = 0;
+      totalFound = 0;
+      totalTermHits = 0;
+      keywordVisibleGroups = resultSectionPageSize;
+      _scrollLoadMoreHalted = false;
+    });
+    unawaited(_loadKeywordResults(submittedQuery, token));
   }
 
   @override
@@ -187,6 +241,10 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       if (session != null && !session.finished && !_offlineScanPausedByUser) {
         session.resume();
       }
+    }
+    if (_modeChangePending) {
+      _restartKeywordSearchForMode();
+      return;
     }
     if (_pendingOfflineProgress != null &&
         !(_offlinePublishTimer?.isActive ?? false)) {
@@ -645,6 +703,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         nextStart = 0;
         totalFound = 0;
         totalTermHits = 0;
+        offlineVolumesMissing = false;
+        connectionFailurePrompt = false;
+        serverSlowHint = false;
       });
       return;
     }
@@ -664,6 +725,12 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     }
 
     if (aiMode) {
+      if (offlineMode) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('離線模式下不支援 AI 搜尋，請先切換到聯網模式。')),
+        );
+        return;
+      }
       try {
         await _recordSearchEntry(rawInput, rawInput);
       } catch (error) {
@@ -739,8 +806,12 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   Future<void> _runKeywordSearch(String query, int token) async {
     // 同一個字再搜一次時沿用還在跑（或已掃完）的本地掃描會話：
     // 重建會話要把兩萬多卷從頭再掃一遍，那就是重送搜尋卡住的來源。
-    final reuseOfflineScan = offlineSearchSession?.query == query;
+    // 聯網模式不跑本地掃描，也就沒有會話可重用。
+    final reuseOfflineScan =
+        offlineMode && offlineSearchSession?.query == query;
     if (!reuseOfflineScan) _stopOfflineScan();
+    _serverSlowTimer?.cancel();
+    _serverSlowTimer = null;
     setState(() {
       submittedQuery = query;
       results = const [];
@@ -761,6 +832,10 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       dictionarySectionExpanded = true;
       keywordSectionExpanded = true;
       offlineSearchActive = false;
+      offlineVolumesMissing = false;
+      connectionFailurePrompt = false;
+      connectionFailureHasLocal = false;
+      serverSlowHint = false;
       offlineScannedVolumes = 0;
       offlineTotalVolumes = 0;
       isLoading = true;
@@ -780,10 +855,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       resultsScrollController.jumpTo(0);
     }
     if (reuseOfflineScan) {
-      // 同一個字重送：既有會話的結果直接畫回去，不再延遲。
-      _offlinePublishDeferred = false;
-      _offlineRevealTimer?.cancel();
-      _offlineRevealTimer = null;
+      // 同一個字重送：既有會話的結果直接畫回去。
       _publishOfflineScan(offlineSearchSession!.current);
     }
 
@@ -796,27 +868,64 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     try {
       return (await scriptureVolumeStore.listRefs()).isNotEmpty;
     } catch (_) {
-      // 本地清單讀不到只影響「先亮本地結果」，不能拖累線上搜尋。
+      // 本地清單讀不到只影響能不能提示離線替代方案，不能拖累線上搜尋。
       return false;
     }
   }
 
+  void _scheduleServerSlowHint(int token) {
+    _serverSlowTimer?.cancel();
+    _serverSlowTimer = Timer(cbetaConnectTimeout, () async {
+      if (!mounted || token != requestToken || offlineMode) return;
+      final hasLocal = await _hasLocalVolumes();
+      if (!mounted || token != requestToken || !hasLocal) return;
+      setState(() => serverSlowHint = true);
+    });
+  }
+
   Future<void> _loadKeywordResults(String query, int token) async {
+    _serverSlowTimer?.cancel();
+    _serverSlowTimer = null;
     try {
       if (kIsWeb) {
         throw Exception('CBETA 搜尋服務未開放網頁跨域存取；請使用桌面或行動版 App。');
       }
-      if (offlineKeywordSearchOnly) {
-        // 只掃本地：請求不發出去，也就不必等伺服器那十幾秒。
+      if (offlineMode) {
+        // 離線模式不發任何正文請求；一卷都沒有時直接引導下載或切回聯網。
+        final hasLocal = await _hasLocalVolumes();
+        if (!mounted || token != requestToken) return;
+        if (!hasLocal) {
+          setState(() {
+            offlineSearchActive = true;
+            offlineVolumesMissing = true;
+            connectionFailurePrompt = false;
+            keywordSearchSucceeded = true;
+            keywordSearchError = null;
+            isLoading = false;
+            results = const [];
+            hasMore = false;
+            nextStart = 0;
+            totalFound = 0;
+            totalTermHits = 0;
+          });
+          return;
+        }
+        setState(() {
+          offlineVolumesMissing = false;
+          connectionFailurePrompt = false;
+        });
         await _applyOfflineKeywordResults(query, token);
         return;
       }
-      final cached = FullTextSearchCache.get(query);
+
+      final cached = FullTextSearchCache.get(query, offline: false);
       if (cached != null && mounted && token == requestToken) {
-        // 同一個字再查一次時先用上次的結果頂住畫面,回覆後再整批取代;
+        // 同一個字再查一次時先用上次的線上結果頂住畫面,回覆後再整批取代;
         // 高频單字的 API 要等數秒,不該讓使用者對著轉圈發呆。
         setState(() {
           offlineSearchActive = false;
+          offlineVolumesMissing = false;
+          connectionFailurePrompt = false;
           keywordSearchSucceeded = true;
           isLoading = false;
           results = cached.results;
@@ -826,17 +935,18 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
           hasMore = cached.hasMore;
           _prioritizeSearchResultsByCatalog();
         });
-      } else if (await _hasLocalVolumes()) {
-        // 線上結果可能要好幾秒（常見單字伺服端就要 3.5～15 秒，斷網時連線
-        // 失敗也可能拖上幾秒）。本地先掃，500 ms 後線上還沒回來就先亮本地
-        // 結果；線上成功再整批取代，失敗就留在本地結果上。
-        unawaited(_applyOfflineKeywordResults(query, token, deferred: true));
       }
+      _scheduleServerSlowHint(token);
       final batch = await _searchAllInOne(query, start: 0);
+      _serverSlowTimer?.cancel();
+      _serverSlowTimer = null;
       if (!mounted || token != requestToken) return;
       _stopOfflineScan();
       setState(() {
         offlineSearchActive = false;
+        offlineVolumesMissing = false;
+        connectionFailurePrompt = false;
+        serverSlowHint = false;
         keywordSearchSucceeded = true;
         results = batch.results;
         nextStart = batch.nextStart;
@@ -848,6 +958,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         _prioritizeSearchResultsByCatalog();
         FullTextSearchCache.remember(
           query,
+          offline: false,
           results: results,
           nextStart: nextStart,
           totalFound: totalFound,
@@ -856,21 +967,41 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         );
       });
     } catch (error) {
+      _serverSlowTimer?.cancel();
+      _serverSlowTimer = null;
       if (!mounted || token != requestToken) return;
       if (isRequestTimeout(error)) {
-        // 伺服器只是慢,不代表沒有網路。本地若已有結果就直接亮出來，並保留
-        // 逾時提示；本地也還沒掃到東西時才維持原本的「請重試」畫面。
-        _revealOfflineScan();
-        setState(
-          () => keywordSearchError =
+        // 伺服器只是慢,不代表沒有網路。聯網模式不自動切本地，只提示可手動切換。
+        final hasLocal = await _hasLocalVolumes();
+        if (!mounted || token != requestToken) return;
+        setState(() {
+          serverSlowHint = hasLocal;
+          keywordSearchError =
               '全文搜尋逾時（等待超過 ${keywordSearchTimeout.inSeconds} 秒）：'
-              '常用單字伺服端要跑十幾秒以上，請稍後重試或改用較長的關鍵字。',
-        );
+              '常用單字伺服端要跑十幾秒以上，請稍後重試或改用較長的關鍵字。';
+        });
         return;
       }
       if (isNetworkFailure(error)) {
-        _revealOfflineScan(force: true);
-        await _applyOfflineKeywordResults(query, token);
+        // 連線失敗不自動掃本地：聯網模式的結果必須來自伺服器，由使用者決定
+        // 是否切換離線模式。
+        final hasLocal = await _hasLocalVolumes();
+        if (!mounted || token != requestToken) return;
+        setState(() {
+          connectionFailurePrompt = true;
+          connectionFailureHasLocal = hasLocal;
+          serverSlowHint = false;
+          offlineSearchActive = false;
+          offlineVolumesMissing = false;
+          keywordSearchSucceeded = false;
+          keywordSearchError = null;
+          isLoading = false;
+          results = const [];
+          hasMore = false;
+          nextStart = 0;
+          totalFound = 0;
+          totalTermHits = 0;
+        });
         return;
       }
       setState(() => keywordSearchError = '全文搜尋失敗：$error');
@@ -881,7 +1012,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
           isLoading =
               results.isEmpty &&
               catalogSearchResults.isEmpty &&
-              isCatalogSearchPending;
+              isCatalogSearchPending &&
+              !connectionFailurePrompt &&
+              !offlineVolumesMissing;
           _updateCombinedSearchError();
         });
       }
@@ -971,11 +1104,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     }
   }
 
-  Future<void> _applyOfflineKeywordResults(
-    String query,
-    int token, {
-    bool deferred = false,
-  }) async {
+  Future<void> _applyOfflineKeywordResults(String query, int token) async {
     final existing = offlineSearchSession;
     if (existing != null && existing.query == query) {
       // 這一輪的本地掃描還在跑或已掃完：把進度画回去就好，不要再建第二個會話
@@ -984,10 +1113,6 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       return;
     }
     _stopOfflineScan();
-    if (deferred) {
-      _offlinePublishDeferred = true;
-      _scheduleOfflineReveal();
-    }
     final session = OfflineScanSession(query);
     offlineSearchSession = session;
     session.progress.addListener(_onOfflineScanProgress);
@@ -1015,9 +1140,6 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   void _stopOfflineScan() {
     _offlinePublishTimer?.cancel();
     _offlinePublishTimer = null;
-    _offlineRevealTimer?.cancel();
-    _offlineRevealTimer = null;
-    _offlinePublishDeferred = false;
     _pendingOfflineProgress = null;
     _expandingOfflineWorks.clear();
     _offlineScanPausedByUser = false;
@@ -1045,18 +1167,28 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     });
   }
 
-  /// 「僅離線」開關：把正文搜尋固定在本地經卷上。
+  /// 全域離線模式開關：正文閱讀與正文搜尋一起切換。
   ///
-  /// 切到僅離線時要立刻補一次本地掃描，否則已經在轉圈的畫面還要等線上逾時。
-  void _toggleOfflineKeywordSearch() {
-    final next = !offlineKeywordSearchOnly;
-    unawaited(setOfflineKeywordSearchOnly(next));
-    setState(() {});
-    if (!next || submittedQuery.isEmpty) return;
-    _offlinePublishDeferred = false;
-    _offlineRevealTimer?.cancel();
-    _offlineRevealTimer = null;
-    unawaited(_applyOfflineKeywordResults(submittedQuery, requestToken));
+  /// 真正的重跑交給 `_onOfflineModeChanged`，切回聯網時才會重新請求伺服器。
+  void _toggleOfflineMode() {
+    unawaited(setOfflineMode(!offlineMode));
+  }
+
+  void _switchToOfflineMode() => unawaited(setOfflineMode(true));
+
+  void _retryKeywordSearch() {
+    if (submittedQuery.isEmpty) return;
+    final token = ++requestToken;
+    _serverSlowTimer?.cancel();
+    _serverSlowTimer = null;
+    setState(() {
+      connectionFailurePrompt = false;
+      serverSlowHint = false;
+      keywordSearchError = null;
+      isLoading = true;
+      isKeywordSearchPending = true;
+    });
+    unawaited(_loadKeywordResults(submittedQuery, token));
   }
 
   /// 第一階段只掃出（作品, 卷, 行號）；點開一部經時用 HTML 再比對一次，
@@ -1108,37 +1240,8 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     _publishOfflineScan(progress);
   }
 
-  void _scheduleOfflineReveal() {
-    if (_offlineRevealTimer?.isActive ?? false) return;
-    _offlineRevealTimer = Timer(
-      _offlineRevealDelay,
-      () => _revealOfflineScan(),
-    );
-  }
-
-  /// 把延迟发布的本地结果亮出来。
-  ///
-  /// [force] 为 false 时不发布空结果：线上还在等、本地也还没命中时，
-  /// 先维持转圈，免得闪一下「找不到」又被线上结果替换。
-  void _revealOfflineScan({bool force = false}) {
-    _offlineRevealTimer?.cancel();
-    _offlineRevealTimer = null;
-    if (!_offlinePublishDeferred) return;
-    final progress = _pendingOfflineProgress ?? offlineSearchSession?.current;
-    if (progress == null) return;
-    if (!force && progress.results.isEmpty) return;
-    _offlinePublishDeferred = false;
-    _pendingOfflineProgress = null;
-    _publishOfflineScan(progress);
-  }
-
   void _publishOfflineScan(OfflineScanProgress progress) {
     if (!mounted || offlineSearchSession == null) return;
-    if (_offlinePublishDeferred) {
-      _pendingOfflineProgress = progress;
-      _scheduleOfflineReveal();
-      return;
-    }
     // 被上一頁（例如閱讀器）蓋住時先留住進度,轉場結束再一次更新;
     // 否則掃描會在路由動畫期間不斷重建底下的整串結果卡,點擊最後一卷就會卡死。
     if (!(_ownRoute?.isCurrent ?? true)) {
@@ -1147,10 +1250,11 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     }
     setState(() {
       offlineSearchActive = true;
+      offlineVolumesMissing = false;
+      connectionFailurePrompt = false;
+      serverSlowHint = false;
       keywordSearchSucceeded = true;
       keywordSearchError = null;
-      // 本地結果一旦亮出來就得收起全螢幕轉圈：線上請求可能還要好幾秒
-      // （甚至等到 45 秒逾時），不能讓它把已可操作的本地結果整個蓋住。
       isLoading = false;
       results = progress.results;
       nextStart = progress.results.length;
@@ -1162,6 +1266,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       _prioritizeSearchResultsByCatalog();
       FullTextSearchCache.remember(
         submittedQuery,
+        offline: true,
         results: results,
         nextStart: nextStart,
         totalFound: totalFound,
@@ -1282,6 +1387,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         _prioritizeSearchResultsByCatalog();
         FullTextSearchCache.remember(
           submittedQuery,
+          offline: false,
           results: results,
           nextStart: nextStart,
           totalFound: totalFound,
@@ -1300,11 +1406,16 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         });
         return;
       }
-      if (!offlineSearchActive && isNetworkFailure(error)) {
-        await _applyOfflineKeywordResults(submittedQuery, token);
-        if (mounted && token == requestToken) {
-          setState(() => isLoadingMore = false);
-        }
+      if (isNetworkFailure(error)) {
+        // 聯網模式的「載入更多」也必須來自伺服器；連不上就提示切離線，
+        // 不把後半段結果換成本地掃描。
+        final hasLocal = await _hasLocalVolumes();
+        if (!mounted || token != requestToken) return;
+        setState(() {
+          isLoadingMore = false;
+          connectionFailurePrompt = true;
+          connectionFailureHasLocal = hasLocal;
+        });
         return;
       }
       setState(() {
@@ -1319,6 +1430,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     searchController.clear();
     _lastSubmittedRawInput = '';
     _stopOfflineScan();
+    _serverSlowTimer?.cancel();
+    _serverSlowTimer = null;
+    _modeChangePending = false;
     // 離開三项結果的画面回到首頁：把掃描用的 worker 也還給系統，
     // 下一次搜尋再重新拉起（冷啟動只要幾百毫秒）。
     releaseSharedOfflineScanPool();
@@ -1340,6 +1454,10 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       keywordSearchSucceeded = false;
       catalogSearchSucceeded = false;
       offlineSearchActive = false;
+      offlineVolumesMissing = false;
+      connectionFailurePrompt = false;
+      connectionFailureHasLocal = false;
+      serverSlowHint = false;
       offlineScannedVolumes = 0;
       offlineTotalVolumes = 0;
       isLoading = false;
@@ -1366,6 +1484,8 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     scriptureDisplaySettings.removeListener(_onDisplaySettingsChanged);
+    offlineModeListenable.removeListener(_onOfflineModeChanged);
+    _serverSlowTimer?.cancel();
     _ownRoute?.secondaryAnimation?.removeListener(_onRouteTransitionChanged);
     _stopOfflineScan();
     releaseSharedOfflineScanPool();
@@ -1396,18 +1516,16 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
           actions: [
             IconButton(
               tooltip: displayText(
-                offlineKeywordSearchOnly
-                    ? '僅離線搜尋正文：開啟（不請求線上全文）'
-                    : '僅離線搜尋正文：關閉（先請求線上全文）',
+                offlineMode
+                    ? '離線模式：開啟（正文閱讀與搜尋都只用本地經卷）'
+                    : '離線模式：關閉（正文閱讀與搜尋都請求 CBETA）',
                 context,
               ),
               icon: Icon(
-                offlineKeywordSearchOnly
-                    ? Icons.cloud_off_rounded
-                    : Icons.cloud_outlined,
+                offlineMode ? Icons.cloud_off_rounded : Icons.cloud_outlined,
               ),
-              color: offlineKeywordSearchOnly ? const Color(0xFF176B67) : null,
-              onPressed: kIsWeb ? null : _toggleOfflineKeywordSearch,
+              color: offlineMode ? const Color(0xFF176B67) : null,
+              onPressed: kIsWeb ? null : _toggleOfflineMode,
             ),
             ScriptDisplayButton(),
             SettingsButton(
@@ -1668,7 +1786,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       return const [];
     }
 
-    if (isLoading) {
+    if (isLoading && !connectionFailurePrompt && !offlineVolumesMissing) {
       return const [
         SliverFillRemaining(
           hasScrollBody: false,
@@ -1677,7 +1795,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       ];
     }
 
-    if (errorMessage != null) {
+    if (errorMessage != null && !connectionFailurePrompt) {
       return [
         SliverToBoxAdapter(
           child: Padding(
@@ -1694,6 +1812,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         padding: const EdgeInsets.fromLTRB(24, 4, 24, 0),
         sliver: SliverList(
           delegate: SliverChildListDelegate([
+            if (connectionFailurePrompt) _buildConnectionFailureCard(context),
+            if (offlineVolumesMissing) _buildOfflineVolumesMissingCard(context),
+            if (serverSlowHint) _buildServerSlowHint(context),
             if (offlineSearchActive)
               Padding(
                 padding: const EdgeInsets.only(bottom: 12),
@@ -1741,6 +1862,113 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     slivers.addAll(_buildKeywordSectionSlivers(context));
 
     return slivers;
+  }
+
+  Widget _buildConnectionFailureCard(BuildContext context) {
+    final hasLocal = connectionFailureHasLocal;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Card(
+        margin: EdgeInsets.zero,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                hasLocal
+                    ? '無法連接 CBETA 伺服器。已下載的經卷可以離線搜尋。'
+                    : '無法連接 CBETA 伺服器，本地也沒有已下載的經卷。',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  if (hasLocal)
+                    FilledButton.tonal(
+                      onPressed: _switchToOfflineMode,
+                      child: const Text('改用離線搜尋'),
+                    )
+                  else
+                    FilledButton.tonal(
+                      onPressed: _openDownloads,
+                      child: const Text('前往下載'),
+                    ),
+                  TextButton(
+                    onPressed: _retryKeywordSearch,
+                    child: const Text('重試'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildOfflineVolumesMissingCard(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Card(
+        margin: EdgeInsets.zero,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '離線模式下沒有可搜尋的本地經卷。請先下載經卷，或切換到聯網模式。',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.tonal(
+                    onPressed: _openDownloads,
+                    child: const Text('前往下載'),
+                  ),
+                  TextButton(
+                    onPressed: () => unawaited(setOfflineMode(false)),
+                    child: const Text('切換到聯網模式'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildServerSlowHint(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              '伺服器較慢；已下載的經卷可改用離線搜尋。',
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: const Color(0xFF687671)),
+            ),
+          ),
+          TextButton(
+            onPressed: _switchToOfflineMode,
+            child: const Text('改用離線搜尋'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openDownloads() {
+    unawaited(showDownloadStatusPanel(context));
   }
 
   Widget _buildResultSection(
@@ -2108,6 +2336,13 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
                       ),
                     ),
                     Text(
+                      offlineMode ? '本地' : '線上',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF687671),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
                       isKeywordSearchPending ? '搜尋中…' : '$totalFound 筆',
                       style: theme.textTheme.bodySmall?.copyWith(
                         color: const Color(0xFF687671),
@@ -2146,7 +2381,10 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     }
 
     if (results.isEmpty) {
-      if (keywordSearchError == null && !(offlineSearchActive && hasMore)) {
+      if (!offlineVolumesMissing &&
+          !connectionFailurePrompt &&
+          keywordSearchError == null &&
+          !(offlineSearchActive && hasMore)) {
         slivers.add(
           SliverToBoxAdapter(
             child: Padding(

@@ -816,7 +816,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 - 偈颂（`div.lg-row`/`lg-cell`）与表格列不在 `buildScriptureSearchSource` 里（那一行只贡献一个换行），所以偈颂文字离线搜不到——这是阅读页卷内搜索同样的既有行为，要改得先动搜索源本身；
 - 悉曇／蘭札字目前只以「形似漢字壳字」进索引，按 `code`（如 `SD-A5A9`）或罗马转写的别名检索还没做，但 `runTable` + `refPool` 从第一版就写进档案，将来加别名层不必重建索引；
-- 離線掃描的**主執行緒工作全部可叫停**了，但線上請求本身仍斷不掉：`fetchSearchBatch` 走 `package:http` 的全域 `http.get`（測試也是靠攛改這個全域 client 來注入 mock），`Future.timeout` 只是放棄 await，socket 與那幾十萬位元組的 `bodyBytes` 还在跑。影響只剩带宽与一次 `jsonDecode`（在背景解析，不堵 UI），要真的取消得改成自備可 `close()` 的 client 並同步改所有測試的注入方式。
+- 離線掃描的**主執行緒工作全部可叫停**了，但線上請求本身仍斷不掉：`fetchSearchBatch` 以 `createCbetaHttpClient()` 建立請求（測試靠 `http.runWithClient` 注入 MockClient），`Future.timeout` 只是放棄 await，socket 與那幾十萬位元組的 `bodyBytes` 还在跑。影響只剩带宽与一次 `jsonDecode`（在背景解析，不堵 UI），要真的取消得在逾時時主動 `close()` client 並同步改所有測試的注入方式。
 
 ### 11.4.1 结果分页与显示
 
@@ -826,30 +826,33 @@ return scriptureDisplaySettings.showSimplifiedText
 - 向下卷动是两种模式的主要推进方式（`_onResultsScroll`）：离线模式到底就 `_revealMoreKeywordGroups()` 再放行一页卡片，线上模式到底就 `loadMore(fromScroll: true)` 发下一批请求；扫描期间每 300 ms 发布一次快照，若几百张卡片全部挂在一棵 `Column` 上，点击最后一卷时整串卡片会跟着重画而卡死；
 - 页面被其它路由盖住时（`_ownRoute.secondaryAnimation` 监听 + `isCurrent` 判断），进度只存进 `_pendingOfflineProgress`，等转场结束（`dismissed`）再一次性 flush，避免打开阅读器动画期间还在重建整页。
 
-### 11.4.2 「僅離線」開關與索引除錯入口
+### 11.4.2 全域離線模式與索引除錯入口
 
-- 首頁 AppBar 的雲朵按鈕切換 `offlineKeywordSearchOnly`（持久化 key `search_offline_only`，`lib/search/offline_preference.dart`）：開啟時 `_loadKeywordResults()` **不發線上請求**，直接走本地掃描（`_applyOfflineKeywordResults`）；全文搜尋頁的 `offlineMode` 也跟同一個值，避免每次搜尋都先等線上 45 秒完才落回本地；
-- 切換的當下若已有 `submittedQuery`，會立刻補跑一次本地掃描，不必等下一次搜尋；關閉後恢復「先線上、失敗才離線」的原路徑；
+- 首頁 AppBar 的雲朵按鈕切換 `offlineMode`（持久化 key `search_offline_only`，`lib/search/offline_preference.dart`）：這不是只影響搜尋的開關，而是整個 App 的取源模式，首頁搜尋與閱讀器（含最近閱讀、書籤）一起切換；
+- **聯網模式**：正文搜尋只請求 CBETA，**不再先跑本地掃描**；連線階段用 `createCbetaHttpClient()` 建立 `connectionTimeout = 5 秒` 的 client（`lib/common/cbeta_http_client.dart`），5 秒連不上就顯示連線失敗卡——本地有經卷時提供「改用離線搜尋／重試」，一卷都沒有時引導下載，**不會自動改掃本地**。這裡卡的是 TCP／TLS 建立，不是回應：常用字伺服端算十幾秒仍屬正常。連線成功但超過 5 秒還沒回來時，只顯示「伺服器較慢」提示，請求繼續跑到 45 秒上限；
+- **離線模式**：搜尋完全不發請求，只掃本地段索引；一卷都沒有時顯示「前往下載／切換到聯網」引導。閱讀器在離線模式只讀本地已下載的卷，沒有就顯示同樣的引導，不會退回去請求伺服器；
+- 模式切換的當下若已有 `submittedQuery`，首頁會立刻用新模式重跑一次；閱讀器也會清掉 `juanCache`、按新模式重新取卷。重跑會延到閱讀器轉場結束後才做，避免在背景重建整頁；
+- 全文快取以模式為 key（`online:<q>`／`offline:<q>`），切模式後不會拿另一邊的結果頂替；
 - 下載管理面板底部有除錯用的「清除索引／重建索引」按鈕（`searchIndexDebugEntriesVisible`，非 const 開關）：清除只刪 `cbeta_sidx/` 的段檔與舊 `.sidx`，不動 `.json`；重建是逐卷增量（戳記相符的卷會跳過），可以用來量測「索引到底省下多少時間」而不用重下兩萬多卷；入口穩定後把這個旗標改成 `false` 即隱藏。
 
 ### 11.5 在线全文延迟
 
 - `_fetchSearchBatch` 只发 `q`、`start`、`rows`、`around`，**不再请求 `facet`**：实测 `facet=1` 会让服务器多做一轮汇总，同一查询慢 2～6 倍（单字如「来」可差十几秒），而回传的分面栏位在本 App 没有任何使用者；
 - 单字查询仍有服务端下限（约 3.5～4 秒），这是移除 `facet` 后剩下的时间，客户端无法再压缩；
-- 因此 `_loadKeywordResults` 采用 stale-while-revalidate：先发 `_searchAllInOne`，但只要 `_FullTextSearchCache.get(query)` 有上次的快照就立刻用它的 `results` / `nextStart` / `totalFound` / `totalTermHits` / `hasMore` 顶住画面（并把 `isLoading` 关掉），API 回来后整批取代并重新 `remember`；同一个字再查第二次时不再面对空白转圈；
+- 因此 `_loadKeywordResults` 采用 stale-while-revalidate：先发 `_searchAllInOne`，但只要 `FullTextSearchCache.get(query, offline: false)` 有上次的線上快照就立刻用它的 `results` / `nextStart` / `totalFound` / `totalTermHits` / `hasMore` 顶住画面（并把 `isLoading` 关掉），API 回来后整批取代并重新 `remember`；同一个字再查第二次时不再面对空白转圈；
 - `_FullTextSearchCache` 是静态 Map，测试之间会互相污染，所以提供 `debugReset()`，并由档案外的 `resetFullTextSearchCache()` 在 `setUp` 调用；
 - 词典候选统计（`countKeyMatches`）已改为只读 key 索引：首次建 sidecar 约 278 ms、之后重启约 30 ms、同进程重复统计约 12 ms（9 部词典、去重后 75302 条 key 实测；改写前冷启动约 435 ms）。它从来不是搜索慢的原因，改的理由是省掉「统计把辞典正文挤出 LRU → 字典分区重解析」这笔互相拖累的账。
 
 ### 11.6 逾时语义与经目本地回答
 
-**逾时不再被当作离线故障，但本地结果可以先行**
+**逾时与断线分开处理，都不自动改扫本地**
 
 - 旧版 `_isNetworkFailure` 里包含 `TimeoutException`，网络上明明通、只是伺服端慢（单字「來」的 `all_in_one` 实测 26.3 秒）时会在第 20 秒悄悄切去本地扫描，使用者看到的就是「等了二十多秒才出结果」；
-- 现在 `_loadKeywordResults` 在**没有线上快取、且本地有经卷**时会同时起本地扫描：结果先压 500 ms（`_offlineRevealDelay`），线上还没回来就亮出来（`_revealOfflineScan`）；线上成功再整批取代并 `_stopOfflineScan()`，断网/逾时就留在本地结果上。断网时不必先等 socket 失败，伺服器慢时也不必对着转圈等 3.5～15 秒；
-- **本地结果发布时必须同时清掉 `isLoading`**：`_buildResultSlivers` 在 `isLoading` 为真时只渲染一颗全螢幕 `CircularProgressIndicator`，会盖住底下已经存在的本地结果。之前 `_publishOfflineScan` 只写 `results`、不关 `isLoading`，只有经目管线刚好在发布之后结束（`catalogSearchResults` 非空或重算 `isLoading`）才会顺带解锁；查询词碰不到任何经目书名时（例如「五蘊解脫」），离线搜完后切到有网路再搜，本地结果在 500 ms 就绪，画面却一直转圈到 `all_in_one` 回来或 45 秒逾时，看起来就是「卡死」。现在发布本地结果的同一个 `setState` 里直接 `isLoading = false`，线上请求继续在背景跑、回来再整批取代；
-- 有线上快取时仍然先画快取、不重复起本地扫描；`_isRequestTimeout` 仍排在 `_isNetworkFailure` 之前：本地已有非空结果时保留结果并显示可重试的逾时提示，本地也还没扫到东西时维持「請重試」画面（与 `keyword search timeout keeps results instead of going offline` 一致）；
-- 全文的超时上限从 20 秒调到 `_keywordSearchTimeout = 45 秒`（`_fetchSearchBatch` 与「載入更多」都用它），单字查询的服务端下限（约 3.5～4 秒）与慢查询的二十几秒都落在上限内；
-- `_buildKeywordSectionContent` 的空结果分支加了 `keywordSearchError == null` 条件，请求失败时不再同时宣称「找不到『X』相關經文」。
+- 现在 `isRequestTimeout` 排在 `isNetworkFailure` 之前，且**模式语义严格**：聯網模式下無論是伺服器慢（45 秒回應逾時）還是連線失敗，都不會自動掃描本地。逾時顯示「全文搜尋逾時」並保留現有結果（「載入更多」逾時只提示重試）；連線失敗且本地有經卷时显示「改用離線搜尋／重試」卡，没有本地经卷时引导下载。连接阶段本身由 `createCbetaHttpClient()` 的 5 秒 `connectionTimeout` 控制，`asCbetaConnectionException` 只包裝 `SocketException`／`ClientException`／`HandshakeException`，**不能把 `TimeoutException` 包成連線失敗**，否则伺服器单纯慢也会被引导切离线；
+- 離線模式的掃描結果发布时同一个 `setState` 里清掉 `isLoading`，避免全螢幕转圈盖住已就绪的本地结果；聯網模式不再启动背景本地扫描，所以不存在「线上回来整批取代本地」的时序；
+- 有線上快取时仍然先画快取（只取 `offline: false` 的 key）、不启动本地扫描；
+- 全文的超时上限从 20 秒调到 `keywordSearchTimeout = 45 秒`（`fetchSearchBatch` 与「載入更多」都用它），单字查询的服务端下限（约 3.5～4 秒）与慢查询的二十几秒都落在上限内；
+- `_buildKeywordContentSlivers` 的空结果分支加了 `keywordSearchError == null`、`connectionFailurePrompt`、`offlineVolumesMissing` 条件，请求失败时不再同时宣称「找不到『X』相關經文」。
 
 **首页经目分区改成纯本地回答**
 

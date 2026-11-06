@@ -145,6 +145,19 @@ RenderParagraph readerParagraphWith(WidgetTester tester, String needle) {
   throw StateError('找不到包含「$needle」的正文區塊');
 }
 
+/// 最近閱讀／書籤的錨點行應該貼近視窗頂端，而不是被置中。
+void expectLineNearViewportTop(WidgetTester tester, String lineText) {
+  final paragraph = readerParagraphWith(tester, lineText);
+  final blockText = paragraph.text.toPlainText();
+  final caret = paragraph.getOffsetForCaret(
+    TextPosition(offset: blockText.indexOf(lineText)),
+    Rect.zero,
+  );
+  final viewport = tester.renderObject<RenderBox>(find.byType(ListView).first);
+  final topY = viewport.localToGlobal(Offset.zero).dy;
+  expect((paragraph.localToGlobal(caret).dy - topY).abs(), lessThan(60));
+}
+
 /// 只收集正文（跳過卷題／作譯者前置文字）中帶有指定底色的文字。
 List<String> readerBodyHighlights(WidgetTester tester, Color background) {
   final highlights = <String>[];
@@ -200,6 +213,7 @@ void main() {
     scriptureVolumeStore = _MemoryScriptureVolumeStore();
     resetWorkPickerResponseCache();
     resetFullTextSearchCache();
+    resetOfflineModeForTest();
     CatalogCache.instance.debugReset();
     apiRateLimiter.debugReset();
   });
@@ -752,6 +766,7 @@ void main() {
   ) async {
     SharedPreferences.setMockInitialValues({});
     await scriptureDisplaySettings.load();
+    await setOfflineMode(true);
     await scriptureVolumeStore.write(
       const CachedScriptureVolume(
         work: 'T0001',
@@ -1390,6 +1405,7 @@ void main() {
   ) async {
     SharedPreferences.setMockInitialValues({});
     await scriptureDisplaySettings.load();
+    await setOfflineMode(true);
     await scriptureDisplaySettings.update(
       showCollation: false,
       showLineBeginnings: false,
@@ -2290,10 +2306,8 @@ void main() {
     }, () => client);
   });
 
-  testWidgets('offline search falls back to locally saved scriptures', (
-    tester,
-  ) async {
-    SharedPreferences.setMockInitialValues({});
+  testWidgets('offline mode searches locally saved scriptures', (tester) async {
+    SharedPreferences.setMockInitialValues({'search_offline_only': true});
     await scriptureDisplaySettings.load();
     await scriptureVolumeStore.write(
       const CachedScriptureVolume(
@@ -2332,7 +2346,7 @@ void main() {
     }, () => client);
   });
 
-  testWidgets('线上很慢时本地结果先出现，不必等请求失败', (tester) async {
+  testWidgets('联网连不上时提示改用离线，而不是自动切本地', (tester) async {
     SharedPreferences.setMockInitialValues({});
     await scriptureDisplaySettings.load();
     await scriptureVolumeStore.write(
@@ -2347,12 +2361,11 @@ void main() {
             '</div>',
       ),
     );
-    final keywordResponse = Completer<http.Response>();
-    final client = MockClient((request) {
+    final client = MockClient((request) async {
       if (request.url.path == '/stable/search/all_in_one') {
-        return keywordResponse.future;
+        throw const SocketException('offline');
       }
-      return Future.value(http.Response('{}', 404));
+      return http.Response('{}', 404);
     });
 
     await http.runWithClient(() async {
@@ -2361,22 +2374,154 @@ void main() {
 
       await tester.enterText(find.byType(TextField).first, '測試離線關鍵字');
       await tester.tap(find.byTooltip('搜尋經文'));
-      // 前 500 ms 先壓住，避免線上很快回來時閃一下本地結果。
-      await tester.pump(const Duration(milliseconds: 100));
-      expect(find.textContaining('目前為離線模式'), findsNothing);
+      await tester.pumpAndSettle();
 
-      await tester.pump(const Duration(milliseconds: 600));
-      await tester.pump();
+      // 聯網模式連不上時不得自動顯示本地結果，要先由使用者決定。
+      expect(find.textContaining('無法連接 CBETA 伺服器'), findsOneWidget);
+      expect(find.textContaining('目前為離線模式'), findsNothing);
+      expect(find.text('改用離線搜尋'), findsOneWidget);
+
+      await tester.tap(find.text('改用離線搜尋'));
+      await tester.pumpAndSettle();
+
       expect(find.textContaining('目前為離線模式'), findsOneWidget);
-      // 本地結果已經亮出來，就不能再被全螢幕轉圈蓋住；線上還在跑時
-      // 使用者仍要能看到、點到本地命中。
-      expect(find.byType(CircularProgressIndicator), findsNothing);
       expect(find.textContaining('長阿含經'), findsWidgets);
 
-      // 线上最终失败也不该把已经亮出来的本地结果收回。
-      keywordResponse.complete(http.Response('{}', 500));
+      await tester.pumpWidget(const SizedBox.shrink());
       await tester.pumpAndSettle();
-      expect(find.textContaining('目前為離線模式'), findsOneWidget);
+    }, () => client);
+  });
+
+  testWidgets('联网连不上且本地没有经卷时引导下载', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/search/all_in_one') {
+        throw const SocketException('offline');
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(const CbetaSearchApp());
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField).first, '測試關鍵字');
+      await tester.tap(find.byTooltip('搜尋經文'));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('無法連接 CBETA 伺服器，本地也沒有已下載的經卷'), findsOneWidget);
+      expect(find.text('前往下載'), findsOneWidget);
+      expect(find.text('重試'), findsOneWidget);
+      expect(find.text('改用離線搜尋'), findsNothing);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+    }, () => client);
+  });
+
+  testWidgets('离线模式下没有本地经卷时引导下载或切联网', (tester) async {
+    SharedPreferences.setMockInitialValues({'search_offline_only': true});
+    await scriptureDisplaySettings.load();
+    var keywordRequests = 0;
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/search/all_in_one') {
+        keywordRequests++;
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(const CbetaSearchApp());
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField).first, '測試關鍵字');
+      await tester.tap(find.byTooltip('搜尋經文'));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('離線模式下沒有可搜尋的本地經卷'), findsOneWidget);
+      expect(find.text('切換到聯網模式'), findsOneWidget);
+      expect(keywordRequests, 0);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+    }, () => client);
+  });
+
+  testWidgets('switching from offline to online reruns the keyword search', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({'search_offline_only': true});
+    await scriptureDisplaySettings.load();
+    await scriptureVolumeStore.write(
+      const CachedScriptureVolume(
+        work: 'T0001',
+        juan: '1',
+        html:
+            '<div id="body">'
+            '<p class="juan">長阿含經卷第一</p>'
+            '<span class="lb" id="T01n0001_p0001a01"></span>'
+            '<span class="t">本地般若內容</span>'
+            '</div>',
+      ),
+    );
+    var keywordRequests = 0;
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/search/all_in_one') {
+        keywordRequests++;
+        return http.Response(
+          jsonEncode({
+            'num_found': 1,
+            'total_term_hits': 1,
+            'results': [
+              {
+                'file': 'T0002',
+                'work': 'T0002',
+                'juan': 1,
+                'title': '線上第一卷',
+                'byline': '譯者',
+                'juan_list': '1',
+                'kwics': {
+                  'results': [
+                    {'kwic': '<em>般若</em>波羅蜜', 'vol': '1', 'lb': '0001a01'},
+                  ],
+                },
+              },
+            ],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      if (request.url.path == '/stable/search/toc') {
+        return http.Response(
+          jsonEncode({'num_found': 0, 'results': <Object>[]}),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(const CbetaSearchApp());
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField).first, '般若');
+      await tester.tap(find.byTooltip('搜尋經文'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('本地'), findsOneWidget);
+      expect(keywordRequests, 0);
+      expect(find.textContaining('線上第一卷'), findsNothing);
+
+      await tester.tap(find.byIcon(Icons.cloud_off_rounded));
+      await tester.pumpAndSettle();
+
+      expect(offlineMode, isFalse);
+      expect(keywordRequests, 1);
+      expect(find.text('線上'), findsOneWidget);
+      expect(find.textContaining('線上第一卷'), findsWidgets);
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pumpAndSettle();
@@ -2386,7 +2531,7 @@ void main() {
   testWidgets('offline search scans local volumes incrementally', (
     tester,
   ) async {
-    SharedPreferences.setMockInitialValues({});
+    SharedPreferences.setMockInitialValues({'search_offline_only': true});
     await scriptureDisplaySettings.load();
     for (var index = 1; index <= 70; index++) {
       final work = 'T${index.toString().padLeft(4, '0')}';
@@ -2437,7 +2582,7 @@ void main() {
   testWidgets('re-tapping the same offline search keeps the running scan', (
     tester,
   ) async {
-    SharedPreferences.setMockInitialValues({});
+    SharedPreferences.setMockInitialValues({'search_offline_only': true});
     await scriptureDisplaySettings.load();
     for (var index = 1; index <= 300; index++) {
       final work = 'T${index.toString().padLeft(4, '0')}';
@@ -2497,7 +2642,7 @@ void main() {
   testWidgets('scrolling reveals the next offline result groups', (
     tester,
   ) async {
-    SharedPreferences.setMockInitialValues({});
+    SharedPreferences.setMockInitialValues({'search_offline_only': true});
     await scriptureDisplaySettings.load();
     tester.view.physicalSize = const Size(800, 600);
     tester.view.devicePixelRatio = 1;
@@ -2560,6 +2705,11 @@ void main() {
   ) async {
     SharedPreferences.setMockInitialValues({});
     await scriptureDisplaySettings.load();
+    // 首頁上方還有經目、字典分區；用預設 600 邏輯像素高時，第一筆結果
+    // 就會落到視窗快取區，捲動與按鈕斷言都會受版面高度影響。
+    tester.view.physicalSize = const Size(800, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
     Map<String, dynamic> row(String work, String title) => {
       'file': work,
       'work': work,
@@ -2720,7 +2870,7 @@ void main() {
   testWidgets('offline search shows local catalog matches separately', (
     tester,
   ) async {
-    SharedPreferences.setMockInitialValues({});
+    SharedPreferences.setMockInitialValues({'search_offline_only': true});
     await scriptureDisplaySettings.load();
     await scriptureVolumeStore.write(
       const CachedScriptureVolume(
@@ -2853,7 +3003,7 @@ void main() {
   });
 
   testWidgets('offline Goto search opens a locally saved line', (tester) async {
-    SharedPreferences.setMockInitialValues({});
+    SharedPreferences.setMockInitialValues({'search_offline_only': true});
     await scriptureDisplaySettings.load();
     await scriptureVolumeStore.write(
       const CachedScriptureVolume(
@@ -2866,7 +3016,9 @@ void main() {
             '</div>',
       ),
     );
+    var cbetaRequests = 0;
     final client = MockClient((request) async {
+      if (request.url.host == 'cbdata.dila.edu.tw') cbetaRequests++;
       throw const SocketException('offline');
     });
 
@@ -2879,6 +3031,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(readerFirstBlockSpan(tester)!.toPlainText(), contains('離線行號經文'));
+      expect(cbetaRequests, 0);
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pumpAndSettle();
@@ -2888,7 +3041,7 @@ void main() {
   testWidgets('offline Goto of a finer line opens the nearest paragraph', (
     tester,
   ) async {
-    SharedPreferences.setMockInitialValues({});
+    SharedPreferences.setMockInitialValues({'search_offline_only': true});
     await scriptureDisplaySettings.load();
     // 下載壓縮檔只有段落級錨點：兩段都標在 a01，引文卻是段中的 a03。
     await scriptureVolumeStore.write(
@@ -4101,6 +4254,7 @@ void main() {
   ) async {
     SharedPreferences.setMockInitialValues({});
     await scriptureDisplaySettings.load();
+    await setOfflineMode(true);
     await scriptureDisplaySettings.update(
       showCollation: false,
       showLineBeginnings: true,
@@ -4231,6 +4385,7 @@ void main() {
   ) async {
     SharedPreferences.setMockInitialValues({});
     await scriptureDisplaySettings.load();
+    await setOfflineMode(true);
     await scriptureDisplaySettings.update(
       showCollation: false,
       showLineBeginnings: false,
@@ -4331,6 +4486,7 @@ void main() {
   ) async {
     SharedPreferences.setMockInitialValues({});
     await scriptureDisplaySettings.load();
+    await setOfflineMode(true);
     await scriptureDisplaySettings.update(
       showCollation: false,
       showLineBeginnings: false,
@@ -4376,6 +4532,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    expect(find.text('離線經文'), findsOneWidget);
     final preferences = await SharedPreferences.getInstance();
     Map<String, dynamic> historyEntry() =>
         (jsonDecode(preferences.getString('reading_history')!) as List<dynamic>)
@@ -4412,16 +4569,10 @@ void main() {
     final targetLineNumber = int.parse(
       scrolledLinehead.substring(scrolledLinehead.length - 2),
     );
-    final paragraph = readerParagraphWith(
+    expectLineNearViewportTop(
       tester,
       '第${targetLineNumber.toString().padLeft(2, '0')}行經文內容',
     );
-    final viewport = tester.renderObject<RenderBox>(
-      find.byType(ListView).first,
-    );
-    final viewportTop = viewport.localToGlobal(Offset.zero).dy;
-    final paragraphTop = paragraph.localToGlobal(Offset.zero).dy;
-    expect((paragraphTop - viewportTop).abs(), lessThan(80));
   });
 
   testWidgets(
@@ -4497,6 +4648,291 @@ void main() {
       expect(stored?.html, contains('本地已下載的經文內容'));
     },
   );
+
+  String recentReadingVolumeHtml() {
+    final buffer = StringBuffer('<div id="body">');
+    for (var i = 1; i <= 40; i++) {
+      final lineNumber = i.toString().padLeft(2, '0');
+      final text = i == 20 ? '第二十行，最近閱讀應該回到這裡。' : '第$lineNumber行其餘正文。';
+      buffer.write(
+        '<span class="lb" id="T01n0003_p0155a$lineNumber"></span><p>$text</p>',
+      );
+    }
+    buffer.write('</div>');
+    return buffer.toString();
+  }
+
+  MockClient recentReadingClient(String html) => MockClient((request) async {
+    if (request.url.path == '/stable/juans') {
+      return http.Response(
+        jsonEncode({
+          'content': 'online-version',
+          'results': [html],
+        }),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    }
+    return http.Response('{}', 404);
+  });
+
+  testWidgets('recent reading opens the online volume at the saved linehead', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureDisplaySettings.update(
+      showCollation: false,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    final html = recentReadingVolumeHtml();
+    await scriptureVolumeStore.write(
+      const CachedScriptureVolume(
+        work: 'T0003',
+        juan: '1',
+        contentVersion: 'local-version',
+        html:
+            '<div id="body">'
+            '<span class="lb" id="T01n0003_p0155a01"></span>'
+            '<p>本地舊內容。</p></div>',
+      ),
+    );
+
+    // 離線時期留下的 sourceOffset 指向卷首；線上重新取卷後應以行號為準。
+    const entry = ScripturePassage(
+      title: '毘婆尸佛經',
+      reference: '卷 1',
+      text: '',
+      linehead: 'T01n0003_p0155a20',
+      juan: '1',
+      work: 'T0003',
+      sourceOffset: 0,
+    );
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: entry,
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('線上經文'), findsOneWidget);
+      expectLineNearViewportTop(tester, '第二十行，最近閱讀應該回到這裡。');
+    }, () => recentReadingClient(html));
+  });
+
+  testWidgets(
+    'recent reading prefers a verified offset over the paragraph linehead',
+    (WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await scriptureDisplaySettings.load();
+      await scriptureDisplaySettings.update(
+        showCollation: false,
+        showLineBeginnings: false,
+        backgroundTheme: 'default',
+      );
+      final html = recentReadingVolumeHtml();
+      final source = buildScriptureSearchSource(parseScriptureHtml(html));
+      final targetOffset = source.indexOf('第二十行，最近閱讀應該回到這裡。');
+      expect(targetOffset, greaterThan(0));
+
+      // 離線壓縮檔的 linehead 只標到段首；存檔位移與摘要才是指真正的離開位置。
+      final entry = ScripturePassage(
+        title: '毘婆尸佛經',
+        reference: '卷 1',
+        text: '',
+        linehead: 'T01n0003_p0155a01',
+        juan: '1',
+        work: 'T0003',
+        sourceOffset: targetOffset,
+        snippet: '第二十行，最近閱讀應該回到這裡。',
+      );
+
+      await http.runWithClient(() async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: ScriptureReaderPage(
+              passage: entry,
+              query: '',
+              searchHits: const [],
+              initialHitIndex: 0,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expectLineNearViewportTop(tester, '第二十行，最近閱讀應該回到這裡。');
+      }, () => recentReadingClient(html));
+    },
+  );
+
+  testWidgets(
+    'recent reading falls back to sourceOffset when the linehead is gone',
+    (WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await scriptureDisplaySettings.load();
+      await scriptureDisplaySettings.update(
+        showCollation: false,
+        showLineBeginnings: false,
+        backgroundTheme: 'default',
+      );
+      final html = recentReadingVolumeHtml();
+      final source = buildScriptureSearchSource(parseScriptureHtml(html));
+      final targetOffset = source.indexOf('第二十行，最近閱讀應該回到這裡。');
+      expect(targetOffset, greaterThan(0));
+
+      final entry = ScripturePassage(
+        title: '毘婆尸佛經',
+        reference: '卷 1',
+        text: '',
+        linehead: 'T01n0003_p0999a01',
+        juan: '1',
+        work: 'T0003',
+        sourceOffset: targetOffset,
+      );
+
+      await http.runWithClient(() async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: ScriptureReaderPage(
+              passage: entry,
+              query: '',
+              searchHits: const [],
+              initialHitIndex: 0,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expectLineNearViewportTop(tester, '第二十行，最近閱讀應該回到這裡。');
+      }, () => recentReadingClient(html));
+    },
+  );
+
+  testWidgets(
+    'online reader failure offers offline reading when a copy exists',
+    (WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await scriptureDisplaySettings.load();
+      await scriptureDisplaySettings.update(
+        showCollation: false,
+        showLineBeginnings: false,
+        backgroundTheme: 'default',
+      );
+      await scriptureVolumeStore.write(
+        const CachedScriptureVolume(
+          work: 'T0003',
+          juan: '1',
+          contentVersion: 'local-version',
+          html:
+              '<div id="body">'
+              '<span class="lb" id="T01n0003_p0155a01"></span>'
+              '<p>本地離線內容。</p></div>',
+        ),
+      );
+      final client = MockClient((request) async {
+        throw const SocketException('offline');
+      });
+
+      await http.runWithClient(() async {
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: ScriptureReaderPage(
+              passage: ScripturePassage(
+                title: '毘婆尸佛經',
+                reference: '卷 1',
+                text: '',
+                linehead: 'T01n0003_p0155a01',
+                juan: '1',
+                work: 'T0003',
+              ),
+              query: '',
+              searchHits: [],
+              initialHitIndex: 0,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // 聯網模式連不上時不能靜默退回本地，只能由使用者選擇。
+        expect(find.textContaining('無法連接 CBETA 伺服器'), findsOneWidget);
+        expect(find.textContaining('本地離線內容'), findsNothing);
+        expect(find.text('改用離線閱讀'), findsOneWidget);
+
+        await tester.tap(find.text('改用離線閱讀'));
+        await tester.pumpAndSettle();
+
+        expect(readerFirstBlockSpan(tester)!.toPlainText(), contains('本地離線內容'));
+        expect(offlineMode, isTrue);
+      }, () => client);
+    },
+  );
+
+  testWidgets('offline reader without the volume offers download or online', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await setOfflineMode(true);
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        return http.Response(
+          jsonEncode({
+            'content': 'online-version',
+            'results': [
+              '<div id="body">'
+                  '<span class="lb" id="T01n0003_p0155a01"></span>'
+                  '<p>切回聯網後補載的內容。</p></div>',
+            ],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '毘婆尸佛經',
+              reference: '卷 1',
+              text: '',
+              linehead: 'T01n0003_p0155a01',
+              juan: '1',
+              work: 'T0003',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('本地沒有已下載的'), findsOneWidget);
+      expect(find.text('前往下載'), findsOneWidget);
+      expect(find.text('切換到聯網'), findsOneWidget);
+
+      await tester.tap(find.text('切換到聯網'));
+      await tester.pumpAndSettle();
+
+      expect(
+        readerFirstBlockSpan(tester)!.toPlainText(),
+        contains('切回聯網後補載的內容'),
+      );
+      expect(offlineMode, isFalse);
+    }, () => client);
+  });
 
   testWidgets('reader clamps hit scrolling at the start and end of a juan', (
     WidgetTester tester,

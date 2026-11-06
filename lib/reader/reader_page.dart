@@ -12,8 +12,10 @@ import '../scripture/reader_blocks.dart';
 import '../scripture/source_text.dart';
 import '../search/candidates.dart';
 import '../search/history.dart';
+import '../search/offline_preference.dart';
 import '../search/search_input.dart';
 import '../settings/display_settings.dart';
+import '../download/download_status_ui.dart';
 import 'reader_citations.dart';
 import 'reader_layout.dart';
 import 'reader_store.dart';
@@ -21,6 +23,57 @@ import '../settings/display_settings_ui.dart';
 import '../widgets/display_text.dart';
 import '../widgets/result_widgets.dart';
 import '../work_picker/work_picker_page.dart';
+
+/// 最近閱讀／書籤回到經卷時，把目標行放在視窗頂端略下方；
+/// 使用者離開前記錄的正是視窗頂端那一行。
+const double _archiveAnchorTopInset = 12;
+
+/// 離線模式要開的卷不在本地。
+class OfflineVolumeUnavailable implements Exception {
+  const OfflineVolumeUnavailable({this.work, this.juan});
+
+  final String? work;
+  final String? juan;
+
+  String get volumeLabel {
+    final work = (this.work ?? '').trim();
+    final juan = (this.juan ?? '').trim();
+    if (work.isEmpty && juan.isEmpty) return '此卷';
+    if (juan.isEmpty) return '《$work》';
+    if (work.isEmpty) return '卷 $juan';
+    return '《$work》卷 $juan';
+  }
+
+  @override
+  String toString() => '本地沒有已下載的$volumeLabel';
+}
+
+/// 聯網模式取卷失敗；[hasLocalCopy] 讓閱讀器決定要不要提供離線替代。
+class ScriptureOnlineLoadFailure implements Exception {
+  const ScriptureOnlineLoadFailure({
+    required this.work,
+    required this.juan,
+    required this.hasLocalCopy,
+    required this.cause,
+  });
+
+  final String? work;
+  final String? juan;
+  final bool hasLocalCopy;
+  final Object cause;
+
+  String get volumeLabel {
+    final work = (this.work ?? '').trim();
+    final juan = (this.juan ?? '').trim();
+    if (work.isEmpty && juan.isEmpty) return '此卷';
+    if (juan.isEmpty) return '《$work》';
+    if (work.isEmpty) return '卷 $juan';
+    return '《$work》卷 $juan';
+  }
+
+  @override
+  String toString() => '無法從 CBETA 載入$volumeLabel：$cause';
+}
 
 class ScriptureReaderPage extends StatefulWidget {
   const ScriptureReaderPage({
@@ -51,6 +104,10 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
   final localSearchController = TextEditingController();
   final Map<String, Future<List<ScriptureLine>>> juanCache = {};
   bool preferOnline = false;
+  bool _lastOfflineMode = false;
+
+  /// 最近閱讀／書籤／AI 段落等「非搜尋命中」入口，定位時把目標行貼齊視窗頂端。
+  bool _archiveAnchorMode = true;
   int? _currentSourceOffset;
   String _currentSnippet = '';
   String? _historyPositionKey;
@@ -84,16 +141,35 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
     super.initState();
     currentPassage = widget.passage;
     currentHitIndex = widget.initialHitIndex;
-    preferOnline = _preferOnlineFor(currentPassage);
+    preferOnline = !offlineMode;
+    _lastOfflineMode = offlineMode;
+    _archiveAnchorMode = widget.searchHits.isEmpty;
     linesFuture = _cachedJuan(currentPassage, preferOnline: preferOnline);
     _refreshBookmarkState();
     _persistReadingHistory();
+    offlineModeListenable.addListener(_onOfflineModeChanged);
     scriptureDisplaySettings.addListener(_onDisplaySettingsChanged);
     WidgetsBinding.instance.addObserver(this);
   }
 
-  bool _preferOnlineFor(ScripturePassage passage) =>
-      passage.fromOnlineIndex && passage.sourceOffset == null;
+  void _onOfflineModeChanged() {
+    if (!mounted || _lastOfflineMode == offlineMode) return;
+    _lastOfflineMode = offlineMode;
+    _reloadForSourceMode();
+  }
+
+  /// 模式切換後重新取源。失敗的 Future 已從 `juanCache` 移除，重試才會
+  /// 真的再打一次 API。
+  void _reloadForSourceMode() {
+    juanCache.clear();
+    setState(() {
+      preferOnline = !offlineMode;
+      linesFuture = _cachedJuan(currentPassage, preferOnline: preferOnline);
+    });
+    _resetReadingAnchor();
+    _refreshBookmarkState();
+    _persistReadingHistory();
+  }
 
   ScripturePassage _positionedPassage() => currentPassage.copyWith(
     linehead: _anchorLinehead ?? currentPassage.linehead,
@@ -283,7 +359,8 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
       currentPassage = passage;
       currentHitIndex = 0;
       showSearchNavigation = false;
-      preferOnline = false;
+      _archiveAnchorMode = true;
+      preferOnline = !offlineMode;
       _currentSourceOffset = passage.sourceOffset;
       _currentSnippet = passage.snippet;
       didScrollToMatch = false;
@@ -301,7 +378,8 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
       currentPassage = passage;
       currentHitIndex = 0;
       showSearchNavigation = false;
-      preferOnline = false;
+      _archiveAnchorMode = true;
+      preferOnline = !offlineMode;
       _currentSourceOffset = null;
       _currentSnippet = '';
       didScrollToMatch = false;
@@ -714,6 +792,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
     required List<int> blockOffsetBases,
     required List<ScriptureLine> lines,
     required double contentWidth,
+    double? anchorDelta,
   }) {
     if (layoutOffset == null || blocks.isEmpty) return;
     final blockIndex = _blockIndexForLayoutOffset(
@@ -725,6 +804,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
       _ReaderScrollRequest(
         blockIndex: blockIndex,
         localOffset: localOffset,
+        anchorDelta: anchorDelta,
         blocks: blocks,
         lines: lines,
         contentWidth: contentWidth,
@@ -894,29 +974,43 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
             ? null
             : '${workMatch.group(1)}${workMatch.group(2)}');
     final juan = passage.juan;
-    if (work == null || juan == null) return _loadJuan(passage);
+    if (work == null || juan == null) {
+      return _loadJuan(passage, preferOnline: preferOnline);
+    }
     final key = '$work:$juan:${preferOnline ? 'online' : 'local'}';
     return juanCache.putIfAbsent(key, () async {
-      final cached = await scriptureVolumeStore.read(work, juan);
-      if (!preferOnline) {
-        if (cached != null) return parseScriptureHtml(cached.html);
-        final latest = await fetchScriptureVolume(work, juan);
-        await scriptureVolumeStore.write(latest);
-        return parseScriptureHtml(latest.html);
-      }
       try {
-        final latest = await fetchScriptureVolume(work, juan);
-        // 本地沒有這卷時才留下線上備份；已下載的經卷不被線上內容覆蓋。
-        if (cached == null) await scriptureVolumeStore.write(latest);
-        return parseScriptureHtml(latest.html);
+        final cached = await scriptureVolumeStore.read(work, juan);
+        if (!preferOnline) {
+          if (cached != null) return parseScriptureHtml(cached.html);
+          throw OfflineVolumeUnavailable(work: work, juan: juan);
+        }
+        try {
+          final latest = await fetchScriptureVolume(work, juan);
+          // 本地沒有這卷時才留下線上備份；已下載的經卷不被線上內容覆蓋。
+          if (cached == null) await scriptureVolumeStore.write(latest);
+          return parseScriptureHtml(latest.html);
+        } catch (error) {
+          // 聯網模式不靜默回退本地；由使用者決定是否切換離線模式。
+          throw ScriptureOnlineLoadFailure(
+            work: work,
+            juan: juan,
+            hasLocalCopy: cached != null,
+            cause: error,
+          );
+        }
       } catch (_) {
-        if (cached == null) rethrow;
-        return parseScriptureHtml(cached.html);
+        // Future 失敗後留在快取裡會讓「重試」永遠拿到同一個錯誤。
+        juanCache.remove(key);
+        rethrow;
       }
     });
   }
 
-  Future<List<ScriptureLine>> _loadJuan(ScripturePassage passage) async {
+  Future<List<ScriptureLine>> _loadJuan(
+    ScripturePassage passage, {
+    required bool preferOnline,
+  }) async {
     final linehead = passage.linehead;
     final workMatch = RegExp(
       r'^([A-Z]+)\d+n(\d+[A-Z]?)_p',
@@ -933,9 +1027,23 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
     if (juan == null) {
       throw FormatException('搜尋結果缺少卷數，無法載入完整經卷：$linehead');
     }
-    final latest = await fetchScriptureVolume(work, juan);
-    await scriptureVolumeStore.write(latest);
-    return parseScriptureHtml(latest.html);
+    final cached = await scriptureVolumeStore.read(work, juan);
+    if (!preferOnline) {
+      if (cached != null) return parseScriptureHtml(cached.html);
+      throw OfflineVolumeUnavailable(work: work, juan: juan);
+    }
+    try {
+      final latest = await fetchScriptureVolume(work, juan);
+      if (cached == null) await scriptureVolumeStore.write(latest);
+      return parseScriptureHtml(latest.html);
+    } catch (error) {
+      throw ScriptureOnlineLoadFailure(
+        work: work,
+        juan: juan,
+        hasLocalCopy: cached != null,
+        cause: error,
+      );
+    }
   }
 
   Future<void> _goToHit(int index) async {
@@ -944,7 +1052,8 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
     setState(() {
       currentPassage = passage;
       currentHitIndex = index;
-      preferOnline = _preferOnlineFor(passage);
+      _archiveAnchorMode = false;
+      preferOnline = !offlineMode;
       _currentSourceOffset = passage.sourceOffset;
       _currentSnippet = passage.snippet;
       didScrollToMatch = false;
@@ -1016,10 +1125,59 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
     // 的存檔反而會在 widget 已銷毀後才回呼、污染下一筆測試，所以只取消計時器。
     _anchorFlushTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
+    offlineModeListenable.removeListener(_onOfflineModeChanged);
     scriptureDisplaySettings.removeListener(_onDisplaySettingsChanged);
     readerScrollController.dispose();
     localSearchController.dispose();
     super.dispose();
+  }
+
+  void _retryLoad() {
+    juanCache.clear();
+    setState(() {
+      preferOnline = !offlineMode;
+      linesFuture = _cachedJuan(currentPassage, preferOnline: preferOnline);
+    });
+  }
+
+  void _openDownloads() {
+    unawaited(showDownloadStatusPanel(context));
+  }
+
+  Widget _buildLoadError(Object? error) {
+    if (error is OfflineVolumeUnavailable) {
+      return NoResults(
+        message: '${error.toString()}\n請先下載此卷，或切換到聯網閱讀。',
+        actions: [
+          FilledButton.tonal(
+            onPressed: _openDownloads,
+            child: const Text('前往下載'),
+          ),
+          TextButton(
+            onPressed: () => unawaited(setOfflineMode(false)),
+            child: const Text('切換到聯網'),
+          ),
+        ],
+      );
+    }
+    if (error is ScriptureOnlineLoadFailure) {
+      return NoResults(
+        message: error.hasLocalCopy
+            ? '無法連接 CBETA 伺服器：${error.cause}\n本地已有這卷，可以改用離線閱讀。'
+            : '無法從 CBETA 載入${error.volumeLabel}：${error.cause}',
+        actions: [
+          FilledButton.tonal(onPressed: _retryLoad, child: const Text('重試')),
+          if (error.hasLocalCopy)
+            TextButton(
+              onPressed: () => unawaited(setOfflineMode(true)),
+              child: const Text('改用離線閱讀'),
+            )
+          else
+            TextButton(onPressed: _openDownloads, child: const Text('前往下載')),
+        ],
+      );
+    }
+    return NoResults(message: '無法載入經文：$error');
   }
 
   @override
@@ -1099,7 +1257,7 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                   return const Center(child: CircularProgressIndicator());
                 }
                 if (snapshot.hasError) {
-                  return NoResults(message: '無法載入經文：${snapshot.error}');
+                  return _buildLoadError(snapshot.error);
                 }
                 // 卷題與作譯者都留在正文原位：卷題置中變色、作譯者靠右字小。
                 final scriptureLines = snapshot.data ?? const <ScriptureLine>[];
@@ -1121,12 +1279,16 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                   widget.searchHits,
                   currentHitIndex,
                 );
+                // 最近閱讀／書籤：先驗證存檔位移與 snippet，對不上才退回行號。
+                // 離線壓縮檔的行號常只標到段首，存檔位移通常更精確。
+                final archiveEntry = _archiveAnchorMode && !showLocalSearch;
                 final hitTarget = resolveSearchTargetOffset(
                   layout,
                   scriptureLines,
                   currentPassage,
                   widget.query,
                   hitOccurrence,
+                  archiveAnchor: archiveEntry,
                 );
                 final targetOffset = hitTarget.offset;
                 _currentSourceOffset = hitTarget.sourceOffset;
@@ -1160,18 +1322,25 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                         constraints: const BoxConstraints(maxWidth: 680),
                         child: Padding(
                           padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
-                          child: Text(
-                            displayText(currentPassage.title, context),
-                            key: const ValueKey('reader-fixed-title'),
-                            textAlign: TextAlign.center,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontFamily: 'Noto Sans TC',
-                              fontSize: 18,
-                              fontWeight: FontWeight.w600,
-                              color: settings.textColor,
-                            ),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                displayText(currentPassage.title, context),
+                                key: const ValueKey('reader-fixed-title'),
+                                textAlign: TextAlign.center,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontFamily: 'Noto Sans TC',
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w600,
+                                  color: settings.textColor,
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              _ReaderSourceBadge(online: preferOnline),
+                            ],
                           ),
                         ),
                       ),
@@ -1234,6 +1403,9 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
                                 blockOffsetBases: blockOffsetBases,
                                 lines: scriptureLines,
                                 contentWidth: contentWidth,
+                                anchorDelta: archiveEntry
+                                    ? _archiveAnchorTopInset
+                                    : null,
                               );
                             });
                           }
@@ -1503,6 +1675,32 @@ class ReaderPassageBlockState extends State<_ReaderPassageBlock> {
       recognizer.dispose();
     }
     super.dispose();
+  }
+}
+
+/// 經文來源只做低調提示，不打斷閱讀。
+class _ReaderSourceBadge extends StatelessWidget {
+  const _ReaderSourceBadge({required this.online});
+
+  final bool online;
+
+  @override
+  Widget build(BuildContext context) {
+    final settings = scriptureDisplaySettings;
+    return Tooltip(
+      message: online ? '經文來源：CBETA 線上' : '經文來源：本地下載',
+      child: Text(
+        displayText(online ? '線上經文' : '離線經文', context),
+        key: const ValueKey('reader-source-badge'),
+        maxLines: 1,
+        style: TextStyle(
+          fontFamily: 'Noto Sans TC',
+          fontSize: 10,
+          letterSpacing: 0.4,
+          color: settings.textColor.withValues(alpha: 0.42),
+        ),
+      ),
+    );
   }
 }
 

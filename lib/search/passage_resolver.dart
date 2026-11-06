@@ -9,6 +9,7 @@ import '../scripture/parser.dart';
 import '../search/goto.dart';
 import '../download/catalog_cache.dart';
 import '../common/text_patterns.dart';
+import 'offline_preference.dart';
 import 'search_api.dart';
 
 String catalogResultWorkId(Map<String, dynamic> result) {
@@ -69,6 +70,15 @@ Future<ScripturePassage> resolveGotoPassage(String input) async {
   if (!isCbetaGotoExpression(linehead)) {
     throw const FormatException('請輸入有效的 CBETA 行號或引文');
   }
+  if (offlineMode) {
+    // 離線模式連 Goto 也不能先打伺服器；卷不在本地就直接引導下載或切換。
+    final local = await resolveGotoPassageLocally(linehead);
+    if (local != null) return local;
+    throw FormatException(
+      '離線模式下，本地尚未儲存「$linehead」所在的經卷；'
+      '請先下載或切換到聯網模式',
+    );
+  }
   try {
     return await resolveGotoPassageOnline(linehead);
   } catch (error) {
@@ -126,6 +136,11 @@ Future<ScripturePassage> resolveWorkPassage(
 }) async {
   final work = '${item['work'] ?? catalogResultWorkId(item)}';
   if (work.isEmpty) throw const FormatException('經目資料缺少作品編號');
+  if (offlineMode) {
+    final local = await localWorkPassage(work, targetLinehead: targetLinehead);
+    if (local != null) return local;
+    throw FormatException('離線模式下，本地尚未儲存《$work》；請先下載或切換到聯網模式');
+  }
   try {
     return await resolveWorkPassageOnline(
       work,

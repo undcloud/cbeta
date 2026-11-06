@@ -457,15 +457,29 @@ resolveSearchTargetOffset(
   List<ScriptureLine> lines,
   ScripturePassage passage,
   String query,
-  int occurrence,
-) {
+  int occurrence, {
+  bool archiveAnchor = false,
+}) {
   const empty = (offset: 0, lineStart: 0, sourceOffset: null, snippet: '');
   final source = buildScriptureSearchSource(lines);
   final storedOffset = passage.sourceOffset;
-  if (storedOffset != null) {
+  // 最近閱讀／書籤的 linehead 在離線壓縮檔可能只標到段首，存檔位移比它精確；
+  // 但位移与 snippet 都失效時要退回行號，不能把讀者帶到別處。
+  final lineheadExists =
+      passage.linehead != null &&
+      lines.any((line) => line.linehead == passage.linehead);
+  final canUseStoredOffset =
+      storedOffset != null &&
+      (!archiveAnchor || passage.snippet.isNotEmpty || !lineheadExists);
+  if (canUseStoredOffset) {
     // 來源位移就是整卷（含卷題與作譯者）的位移；snippet 對不上時
     // 退而求其次找最近的相同文字。
-    final located = _locateSnippetOffset(source, storedOffset, passage.snippet);
+    final located = _locateSnippetOffset(
+      source,
+      storedOffset,
+      passage.snippet,
+      maxDistance: archiveAnchor && lineheadExists ? 600 : null,
+    );
     if (located != null) {
       final layoutOffset = layoutEditableOffsetForSource(
         layout,
@@ -568,7 +582,12 @@ String _lineSnippet(String text, int offset) {
 }
 
 /// 在來源文字中驗證位移：優先用原位移，snippet 對不上時找最近的相同字串。
-int? _locateSnippetOffset(String source, int? offset, String snippet) {
+int? _locateSnippetOffset(
+  String source,
+  int? offset,
+  String snippet, {
+  int? maxDistance,
+}) {
   final lowerSource = source.toLowerCase();
   final lowerSnippet = snippet.toLowerCase();
   if (snippet.isEmpty) {
@@ -596,8 +615,9 @@ int? _locateSnippetOffset(String source, int? offset, String snippet) {
   }
 
   if (offset != null) {
-    final windowStart = (offset - 600).clamp(0, lowerSource.length);
-    final windowEnd = (offset + 600 + lowerSnippet.length).clamp(
+    final window = maxDistance ?? 600;
+    final windowStart = (offset - window).clamp(0, lowerSource.length);
+    final windowEnd = (offset + window + lowerSnippet.length).clamp(
       0,
       lowerSource.length,
     );
@@ -609,6 +629,8 @@ int? _locateSnippetOffset(String source, int? offset, String snippet) {
       from = hit + lowerSnippet.length;
     }
     if (nearest != null) return nearest;
+    // 最近閱讀／書籤：位移附近找不到摘要就改走行號，不採用全文遠處的相同文字。
+    if (maxDistance != null) return null;
   }
   var from = 0;
   while (true) {

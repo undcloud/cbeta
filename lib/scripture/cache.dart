@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -8,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../cbeta_api_headers.dart';
+import '../common/cbeta_http_client.dart';
 import 'sidx_store.dart';
 
 class CachedScriptureVolume {
@@ -316,8 +318,10 @@ Future<CachedScriptureVolume> fetchScriptureVolume(
   String work,
   String juan, {
   void Function(int bytes)? onBytesReceived,
+  http.Client? client,
 }) async {
-  final client = http.Client();
+  final ownsClient = client == null;
+  final httpClient = client ?? createCbetaHttpClient();
   final Map<String, dynamic> payload;
   try {
     final request = http.Request(
@@ -327,9 +331,19 @@ Future<CachedScriptureVolume> fetchScriptureVolume(
         'juan': juan,
       }),
     )..headers.addAll(cbetaApiHeaders);
-    final response = await client
-        .send(request)
-        .timeout(const Duration(seconds: 20));
+    final http.StreamedResponse response;
+    try {
+      response = await httpClient
+          .send(request)
+          .timeout(const Duration(seconds: 20));
+    } on TimeoutException {
+      rethrow;
+    } catch (error) {
+      if (isCbetaConnectionFailure(error)) {
+        throw asCbetaConnectionException(error);
+      }
+      rethrow;
+    }
     if (response.statusCode != 200) {
       throw Exception('經卷 API 回傳 ${response.statusCode}');
     }
@@ -343,7 +357,7 @@ Future<CachedScriptureVolume> fetchScriptureVolume(
     payload =
         jsonDecode(utf8.decode(bytes.takeBytes())) as Map<String, dynamic>;
   } finally {
-    client.close();
+    if (ownsClient) httpClient.close();
   }
   if (payload['success'] == false) {
     throw Exception('CBETA 經卷下載失敗：${payload['error'] ?? '未知錯誤'}');

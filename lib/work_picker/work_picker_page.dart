@@ -12,6 +12,7 @@ import '../search/candidates.dart';
 import '../search/conversion.dart';
 import '../search/goto.dart';
 import '../search/history.dart';
+import '../search/offline_preference.dart';
 import '../search/search_input.dart';
 import '../download/catalog_cache.dart';
 import '../download/download_manager.dart';
@@ -803,6 +804,19 @@ class _WorkPickerPageState extends State<WorkPickerPage>
         showingWorks = true;
       }
     });
+    if (offlineMode) {
+      // 離線模式不做經目遠端合併；內建目錄本身就能回答。
+      setState(() {
+        loading = false;
+        if (localResults.isEmpty) {
+          error = '離線模式下，本地經目沒有書名含「$query」的作品';
+        } else {
+          resultMessage = '離線模式：本地經目找到 ${localResults.length} 部作品';
+        }
+      });
+      if (localResults.isNotEmpty) _autoSelectCurrentView();
+      return;
+    }
     try {
       final payload = await _getJson('search/toc', {'q': query});
       final remoteResults = (payload['results'] as List<dynamic>? ?? const [])

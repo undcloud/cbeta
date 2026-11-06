@@ -9,6 +9,8 @@
 
 - 顶栏：卷切换（`JuanNavigation` / `JuanSelector`）、卷内搜索、书签、
   换经（`work_picker/showWorkPicker`）、显示设定（`ScriptDisplayButton`）；
+- 正文上方经名下方有一行低对比度来源标记：联网为「線上經文」，离线为「離線經文」
+  （`_ReaderSourceBadge`，长按有完整 tooltip），随模式切换即时更新；
 - 卷内搜索：`LocalSearchBar`，命中列表 `SearchResultNavigation` 上下跳，
   命中处高亮并居中滚动（复用 `search/conversion.dart` 查询形式）；
 - 长文渲染：正文按段落拆成 `ReaderPassageBlock`，标题/脚注/偈颂各有分支；
@@ -34,6 +36,13 @@
 - 相鄰正文段落之间加一行间距；该段落边界同时进入搜尋文字与位移換算，
   不在偈頌段落前重複插入間距；
 - 长按/选择文字：复制、引文格式化、分享、全选（见 reader_citations）；
+- 取源模式跟全域 `offlineMode` 走（`preferOnline = !offlineMode`），切换模式会清空
+  `juanCache` 并按新来源重新取卷：
+  - **联网**只读 CBETA；本地没有这卷时才留一份备份，已有下载不被覆盖。连不上时抛
+    `ScriptureOnlineLoadFailure`，**不静默回退本地**，错误面板提供「重试」、
+    「改用离线阅读」（本地有副本时）或「前往下载」；
+  - **离线**只读本地已下载的卷，缺卷抛 `OfflineVolumeUnavailable`，面板提供
+    「前往下载」／「切换到联网」；
 - 阅读位置记录（「上次阅读位置」/「最近阅读」用）：
   - 除进入时的搜索命中位置外，也会在「使用者自己捲动后停下」时，把
     当下**视窗顶端那一行**记为阅读锚点（`_updateReadingAnchorFromViewportTop`
@@ -51,7 +60,13 @@
     `_openBookmark`/`_selectWork`）都会先清除旧锚点，重新以进入位置计算；
   - 重新进入时不需要新逻辑：`_positionedPassage()` 存的还是
     `linehead`/`sourceOffset`/`snippet`，走的仍是
-    `resolveSearchTargetOffset` 里已有的「先验 snippet、再退回行号」路径。
+    `resolveSearchTargetOffset`；
+  - **联网重开最近阅读／书签时以验证过的位移为主**：先拿存档 `sourceOffset` 与 24 字
+    `snippet` 在线上卷内核对（±600 字窗口），对得上就用位移；离线压缩档的行号可能只标到
+    段首，位移通常更精确。位移／摘要对不上（或只有行号没有摘要）时才退回逐行行号；
+  - 最近阅读／书签这类非搜索命中入口，目标行会贴到视窗顶端
+    （`_archiveAnchorTopInset`，预留 12px），因为离开时记录的正是视窗顶端的行；
+    搜索命中仍置中，卷内搜索也按命中置中。
 
 ## reader_layout.dart
 
@@ -61,7 +76,9 @@
   列表拼成单一可搜索字符串，记录每段 offset 基址
   （`scriptureBlockOffsetBases`）、行首前缀、偈颂格渲染文本；
 - `resolveSearchTargetOffset` / `resolveArchiveAnchorTarget`：把搜索命中或引文锚点定位回
-  layout offset。layout 覆盖整卷（卷题与作译者都在正文内），所以來源位移不必再加减页首
+  layout offset。`archiveAnchor` 为 true（最近阅读／书签）时，只有 `sourceOffset` 附近的
+  ±600 字内能核对到 `snippet` 才采用位移，否则改走行号；没有摘要且行号存在时直接走行号。
+  layout 覆盖整卷（卷题与作译者都在正文内），所以來源位移不必再加减页首
   前进量：先以 `_locateSnippetOffset` 驗證 `sourceOffset`（原位對上就用，對不上先在
   ±600 字範圍找最近的相同文字，再退回全文最近命中），換算走
   `layoutEditableOffsetForSource`；沒有來源位移時才用逐行行號，行號也找不到才退回

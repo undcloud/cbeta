@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import '../cbeta_api_headers.dart';
+import '../common/cbeta_http_client.dart';
 import '../scripture/models.dart';
 import '../common/text_patterns.dart';
 
@@ -24,6 +25,7 @@ class SearchBatch {
 
 /// 判斷錯誤是否來自網路連線不可用，而非遠端服務回傳的錯誤。
 bool isNetworkFailure(Object error) =>
+    error is CbetaConnectionException ||
     error is SocketException ||
     error is TimeoutException ||
     error is http.ClientException ||
@@ -33,21 +35,53 @@ bool isNetworkFailure(Object error) =>
 /// 才不會在第 20 秒把使用者悄悄丟進本地掃描。
 bool isRequestTimeout(Object error) => error is TimeoutException;
 
-Future<SearchBatch> fetchSearchBatch(String query, {int start = 0}) async {
+Future<SearchBatch> fetchSearchBatch(
+  String query, {
+  int start = 0,
+  http.Client? client,
+}) async {
   const pageSize = 20;
   // facet 會讓伺服器多做一輪彙總（實測慢 2～5 倍，單字查詢可差十幾秒），
   // 而回傳的分面欄位並沒有人使用，因此不再請求。
-  final response = await http
-      .get(
-        Uri.https('cbdata.dila.edu.tw', '/stable/search/all_in_one', {
-          'q': query,
-          'start': '$start',
-          'rows': '$pageSize',
-          'around': '30',
-        }),
-        headers: cbetaApiHeaders,
-      )
-      .timeout(keywordSearchTimeout);
+  final ownsClient = client == null;
+  final httpClient = client ?? createCbetaHttpClient();
+  final http.Response response;
+  try {
+    final request = http.Request(
+      'GET',
+      Uri.https('cbdata.dila.edu.tw', '/stable/search/all_in_one', {
+        'q': query,
+        'start': '$start',
+        'rows': '$pageSize',
+        'around': '30',
+      }),
+    )..headers.addAll(cbetaApiHeaders);
+    final http.StreamedResponse streamed;
+    try {
+      // 連線本身由 client 的 5 秒 connectionTimeout 控制；這裡管的是
+      // 「連上後等伺服器算完、送回標頭」的整體上限。
+      streamed = await httpClient.send(request).timeout(keywordSearchTimeout);
+    } on TimeoutException {
+      // 伺服端慢與連線失敗要分開：逾時只提示重試，不引導切離線。
+      rethrow;
+    } catch (error) {
+      throw asCbetaConnectionException(error);
+    }
+    try {
+      response = await http.Response.fromStream(
+        streamed,
+      ).timeout(keywordSearchTimeout);
+    } on TimeoutException {
+      rethrow;
+    } catch (error) {
+      if (isCbetaConnectionFailure(error)) {
+        throw asCbetaConnectionException(error);
+      }
+      rethrow;
+    }
+  } finally {
+    if (ownsClient) httpClient.close();
+  }
   if (response.statusCode != 200) {
     throw Exception('全文檢索 API 回傳 ${response.statusCode}');
   }

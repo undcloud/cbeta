@@ -222,9 +222,10 @@ class SearchPrompt extends StatelessWidget {
 }
 
 class NoResults extends StatelessWidget {
-  const NoResults({super.key, required this.message});
+  const NoResults({super.key, required this.message, this.actions = const []});
 
   final String message;
+  final List<Widget> actions;
 
   @override
   Widget build(BuildContext context) => Center(
@@ -240,6 +241,10 @@ class NoResults extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           Text(message, textAlign: TextAlign.center),
+          if (actions.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Wrap(spacing: 8, runSpacing: 8, children: actions),
+          ],
         ],
       ),
     ),

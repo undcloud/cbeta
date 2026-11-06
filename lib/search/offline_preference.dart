@@ -1,29 +1,43 @@
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// 關鍵字正文搜尋是否只看本地經卷，不把請求發給 CBETA 全文 API。
+/// 全域離線模式：正文閱讀與正文搜尋都只使用本地經卷，不請求 CBETA。
 ///
-/// 常用單字在伺服端要跑十幾秒（實測「來」26 秒），已經下載經卷的使用者寧可
-/// 立刻掃本地。預設關：多數人還是希望拿到伺服器的完整命中統計。
-const String offlineKeywordSearchOnlyKey = 'search_offline_only';
+/// 這個 key 舊版只控制正文搜尋（`search_offline_only`），現在沿用同一個
+/// key 升級為全域模式，避免使用者升級後設定被重置。
+const String offlineModeKey = 'search_offline_only';
 
-bool offlineKeywordSearchOnly = false;
+bool offlineMode = false;
 
-Future<void> loadOfflineKeywordSearchOnly() async {
+/// 讓已開啟的頁面（例如閱讀器）能跟著模式切換重新取源。
+final ValueNotifier<bool> offlineModeListenable = ValueNotifier<bool>(false);
+
+Future<void> loadOfflineMode() async {
   try {
     final preferences = await SharedPreferences.getInstance();
-    offlineKeywordSearchOnly =
-        preferences.getBool(offlineKeywordSearchOnlyKey) ?? false;
+    final value = preferences.getBool(offlineModeKey) ?? false;
+    offlineMode = value;
+    offlineModeListenable.value = value;
   } catch (_) {
-    // 讀不到設定就用預設值，不擋搜尋。
+    // 讀不到設定就用預設值（聯網），不擋搜尋與閱讀。
   }
 }
 
-Future<void> setOfflineKeywordSearchOnly(bool value) async {
-  offlineKeywordSearchOnly = value;
+Future<void> setOfflineMode(bool value) async {
+  if (offlineMode != value) {
+    offlineMode = value;
+    offlineModeListenable.value = value;
+  }
   try {
     final preferences = await SharedPreferences.getInstance();
-    await preferences.setBool(offlineKeywordSearchOnlyKey, value);
+    await preferences.setBool(offlineModeKey, value);
   } catch (_) {
     // 存不下也至少在本次執行期間生效。
   }
+}
+
+@visibleForTesting
+void resetOfflineModeForTest() {
+  offlineMode = false;
+  offlineModeListenable.value = false;
 }
