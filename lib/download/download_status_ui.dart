@@ -7,6 +7,8 @@ import '../download/download_models.dart';
 import '../download/update_manager.dart';
 import '../common/app_nav.dart';
 import '../scripture/index_maintenance.dart';
+import '../scripture/index_update_service.dart';
+import '../scripture/index_update_status.dart';
 import '../widgets/display_text.dart';
 
 /// 搜尋索引（`.sidx`）的除錯入口：清除與重建，不需要重新下載經文。
@@ -62,12 +64,14 @@ class _DownloadInfoButtonState extends State<DownloadInfoButton>
     downloadManager.addListener(_onManagerChanged);
     fodictDownloadManager.addListener(_onManagerChanged);
     updateManager.addListener(_onManagerChanged);
+    indexUpdateService.addListener(_onManagerChanged);
   }
 
   void _onManagerChanged() {
     if (downloadManager.isDownloading ||
         fodictDownloadManager.isDownloading ||
-        updateManager.isUpdating) {
+        updateManager.isUpdating ||
+        indexUpdateService.isActive) {
       if (!_flashController.isAnimating) _flashController.repeat(reverse: true);
     } else {
       _flashController.stop();
@@ -81,6 +85,7 @@ class _DownloadInfoButtonState extends State<DownloadInfoButton>
     downloadManager.removeListener(_onManagerChanged);
     fodictDownloadManager.removeListener(_onManagerChanged);
     updateManager.removeListener(_onManagerChanged);
+    indexUpdateService.removeListener(_onManagerChanged);
     _flashController.dispose();
     super.dispose();
   }
@@ -90,7 +95,8 @@ class _DownloadInfoButtonState extends State<DownloadInfoButton>
     final isDownloading =
         downloadManager.isDownloading ||
         fodictDownloadManager.isDownloading ||
-        updateManager.isUpdating;
+        updateManager.isUpdating ||
+        indexUpdateService.isActive;
     final idleColor = Theme.of(context).colorScheme.onSurface;
     return AnimatedBuilder(
       animation: _flashController,
@@ -135,6 +141,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
         downloadManager,
         fodictDownloadManager,
         updateManager,
+        indexUpdateService,
       ]),
       builder: (context, _) {
         final manager = downloadManager;
@@ -196,6 +203,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
                 ),
                 const SizedBox(height: 16),
                 ..._buildUpdateSection(context),
+                ..._buildIndexUpdateSection(context),
                 if (manager.isDownloading && progress != null) ...[
                   Row(
                     children: [
@@ -514,8 +522,21 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
     ];
   }
 
+  /// 背景索引更新與一般下載分開顯示，完成/失敗狀態也留在面板裡。
+  List<Widget> _buildIndexUpdateSection(BuildContext context) {
+    final progress = indexUpdateService.progress;
+    if (progress.phase == IndexUpdatePhase.idle) return const [];
+    return [
+      const SizedBox(height: 4),
+      IndexUpdateStatusView(progress: progress),
+      const SizedBox(height: 12),
+      const Divider(),
+    ];
+  }
+
   /// 除錯用：把派生的搜尋索引清掉或全量重建，經文本體不受影響。
   List<Widget> _buildIndexDebugSection(BuildContext context) {
+    final busy = _indexRebuilding || indexUpdateService.isActive;
     return [
       Text(
         displayText('搜尋索引（除錯）', context),
@@ -531,7 +552,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
         children: [
           Expanded(
             child: OutlinedButton.icon(
-              onPressed: _indexRebuilding ? null : _clearSearchIndexes,
+              onPressed: busy ? null : _clearSearchIndexes,
               icon: const Icon(Icons.cleaning_services_outlined, size: 18),
               label: Text(displayText('清除索引', context)),
             ),
@@ -539,7 +560,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
           const SizedBox(width: 8),
           Expanded(
             child: FilledButton.tonalIcon(
-              onPressed: _indexRebuilding ? null : _rebuildSearchIndexes,
+              onPressed: busy ? null : _rebuildSearchIndexes,
               icon: const Icon(Icons.construction_outlined, size: 18),
               label: Text(displayText('重建索引', context)),
             ),
@@ -569,6 +590,8 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
       },
       shouldAbort: () => !mounted,
     );
+    if (!mounted) return;
+    await indexUpdateService.markCurrentVersion();
     if (!mounted) return;
     setState(() {
       _indexRebuilding = false;

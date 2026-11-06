@@ -13,12 +13,16 @@ import 'download/download_notifications.dart';
 import 'download/download_status_ui.dart';
 import 'download/update_manager.dart';
 import 'home/home_page.dart';
+import 'scripture/index_update_service.dart';
 import 'search/conversion.dart';
 import 'search/offline_preference.dart';
 import 'settings/display_settings.dart';
 import 'settings/display_settings_ui.dart';
+import 'widgets/display_text.dart';
 
 export 'scripture/cache.dart';
+export 'scripture/index_update_service.dart';
+export 'scripture/index_update_status.dart';
 export 'scripture/models.dart';
 export 'scripture/parser.dart';
 export 'search/conversion.dart';
@@ -56,11 +60,34 @@ Future<void> main() async {
   await downloadManager.initialize();
   await updateManager.initialize();
   await fodictDownloadManager.initialize();
+  await indexUpdateService.initialize();
+  indexUpdateService.isBusy = () =>
+      downloadManager.isDownloading || updateManager.isUpdating;
   downloadNotifications
     ..initialize()
     ..onOpenDownloadManager = _openDownloadManagerFromNotification;
   runApp(const CbetaSearchApp());
   unawaited(_consumePendingDownloadManagerRequest());
+  unawaited(_startBackgroundIndexUpdate());
+}
+
+/// APP 升級後若索引版本落後，等第一幀畫完再在背景重建，避免拖慢啟動。
+Future<void> _startBackgroundIndexUpdate() async {
+  if (!indexUpdateService.needsUpdate) return;
+  await Future<void>.delayed(const Duration(seconds: 2));
+  final started = await indexUpdateService.startIfNeeded();
+  if (!started) return;
+  final context = navigatorKey.currentContext;
+  if (context == null || !context.mounted) return;
+  ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+    SnackBar(
+      content: Text('正在背景更新搜尋索引，完成後離線全文搜尋會自動使用新索引'),
+      action: SnackBarAction(
+        label: displayText('查看'),
+        onPressed: _openDownloadManagerFromNotification,
+      ),
+    ),
+  );
 }
 
 Future<void> _consumePendingDownloadManagerRequest() async {
@@ -84,7 +111,9 @@ void _openDownloadManagerFromNotification() {
 }
 
 class CbetaSearchApp extends StatefulWidget {
-  const CbetaSearchApp({super.key});
+  const CbetaSearchApp({super.key, this.indexUpdateService});
+
+  final IndexUpdateService? indexUpdateService;
 
   @override
   State<CbetaSearchApp> createState() => _CbetaSearchAppState();
@@ -186,7 +215,9 @@ class _CbetaSearchAppState extends State<CbetaSearchApp>
                 surfaceTintColor: Colors.transparent,
               ),
             ),
-            home: const ScriptureSearchPage(),
+            home: ScriptureSearchPage(
+              indexUpdateService: widget.indexUpdateService,
+            ),
           ),
         );
       },

@@ -6,6 +6,8 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../dictionary/fodict_service.dart';
 import '../scripture/cache.dart';
+import '../scripture/index_update_service.dart';
+import '../scripture/index_update_status.dart';
 import '../scripture/models.dart';
 import '../scripture/offline_scan.dart';
 import '../search/candidates.dart';
@@ -32,7 +34,10 @@ import '../widgets/result_widgets.dart';
 import '../work_picker/work_picker_page.dart';
 
 class ScriptureSearchPage extends StatefulWidget {
-  const ScriptureSearchPage({super.key});
+  const ScriptureSearchPage({super.key, this.indexUpdateService});
+
+  /// 測試可注入假的索引更新服務；正式路徑使用全域單例。
+  final IndexUpdateService? indexUpdateService;
 
   @override
   State<ScriptureSearchPage> createState() => ScriptureSearchPageState();
@@ -110,6 +115,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   int offlineScannedVolumes = 0;
   int offlineTotalVolumes = 0;
 
+  /// 索引版本落後時，離線全文搜尋不掃舊索引，改顯示更新進度並等待完成。
+  bool waitingForIndexUpdate = false;
+
   /// 連續掃描每一塊都會更新進度;先把這些更新合併,最多每 300 毫秒才寫回
   /// state,否則掃描期間會不斷重建整個結果頁。
   static const Duration _offlinePublishInterval = Duration(milliseconds: 300);
@@ -148,6 +156,16 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   String _lastSubmittedRawInput = '';
   final FodictService _fodictService = FodictService();
 
+  IndexUpdateService get _indexUpdate =>
+      widget.indexUpdateService ?? indexUpdateService;
+
+  /// 背景索引更新也使用同一個常駐池；它還在跑時拆掉 worker，下一批索引
+  /// 會退回主 isolate 解析 HTML。
+  void _releaseOfflineScanPool() {
+    if (_indexUpdate.isActive) return;
+    releaseSharedOfflineScanPool();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -162,7 +180,13 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     // 離線模式要在第一次搜尋前就知道狀態；main() 已先載入，這裡再保險一次。
     _lastOfflineMode = offlineMode;
     offlineModeListenable.addListener(_onOfflineModeChanged);
+    _indexUpdate.addListener(_onIndexUpdateChanged);
     unawaited(loadOfflineMode());
+  }
+
+  void _onIndexUpdateChanged() {
+    if (!mounted || !waitingForIndexUpdate) return;
+    setState(() {});
   }
 
   void _onOfflineModeChanged() {
@@ -195,6 +219,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       serverSlowHint = false;
       offlineScannedVolumes = 0;
       offlineTotalVolumes = 0;
+      waitingForIndexUpdate = false;
       isLoading = true;
       isKeywordSearchPending = true;
       isLoadingMore = false;
@@ -231,7 +256,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         _offlineScanHaltedByOverlay = true;
         session.pause();
       }
-      releaseSharedOfflineScanPool();
+      _releaseOfflineScanPool();
       return;
     }
     if (animation.status != AnimationStatus.dismissed) return;
@@ -838,6 +863,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       serverSlowHint = false;
       offlineScannedVolumes = 0;
       offlineTotalVolumes = 0;
+      waitingForIndexUpdate = false;
       isLoading = true;
       isKeywordSearchPending = true;
       isCatalogSearchPending = true;
@@ -914,6 +940,38 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
           offlineVolumesMissing = false;
           connectionFailurePrompt = false;
         });
+        // 索引版本落後時，舊索引的正規化規則可能與目前程式不同；先等背景
+        // 重建完成再掃，期間只顯示進度，不拿過期索引回答。
+        final indexUpdate = _indexUpdate;
+        if (indexUpdate.needsUpdate) {
+          await indexUpdate.startIfNeeded();
+          if (!mounted || token != requestToken) return;
+        }
+        if (indexUpdate.isActive) {
+          _stopOfflineScan();
+          setState(() {
+            waitingForIndexUpdate = true;
+            offlineSearchActive = true;
+            offlineVolumesMissing = false;
+            connectionFailurePrompt = false;
+            serverSlowHint = false;
+            keywordSearchSucceeded = true;
+            keywordSearchError = null;
+            isLoading = false;
+            isKeywordSearchPending = false;
+            results = const [];
+            hasMore = false;
+            nextStart = 0;
+            totalFound = 0;
+            totalTermHits = 0;
+            offlineScannedVolumes = 0;
+            offlineTotalVolumes = 0;
+          });
+          await indexUpdate.waitForCompletion();
+          if (!mounted || token != requestToken) return;
+          setState(() => waitingForIndexUpdate = false);
+          if (!offlineMode) return;
+        }
         await _applyOfflineKeywordResults(query, token);
         return;
       }
@@ -1435,7 +1493,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     _modeChangePending = false;
     // 離開三项結果的画面回到首頁：把掃描用的 worker 也還給系統，
     // 下一次搜尋再重新拉起（冷啟動只要幾百毫秒）。
-    releaseSharedOfflineScanPool();
+    _releaseOfflineScanPool();
     setState(() {
       submittedQuery = '';
       results = const [];
@@ -1460,6 +1518,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       serverSlowHint = false;
       offlineScannedVolumes = 0;
       offlineTotalVolumes = 0;
+      waitingForIndexUpdate = false;
       isLoading = false;
       isKeywordSearchPending = false;
       isCatalogSearchPending = false;
@@ -1485,10 +1544,11 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     WidgetsBinding.instance.removeObserver(this);
     scriptureDisplaySettings.removeListener(_onDisplaySettingsChanged);
     offlineModeListenable.removeListener(_onOfflineModeChanged);
+    _indexUpdate.removeListener(_onIndexUpdateChanged);
     _serverSlowTimer?.cancel();
     _ownRoute?.secondaryAnimation?.removeListener(_onRouteTransitionChanged);
     _stopOfflineScan();
-    releaseSharedOfflineScanPool();
+    _releaseOfflineScanPool();
     searchController.dispose();
     resultsScrollController
       ..removeListener(_onResultsScroll)
@@ -2343,7 +2403,11 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
                     ),
                     const SizedBox(width: 8),
                     Text(
-                      isKeywordSearchPending ? '搜尋中…' : '$totalFound 筆',
+                      waitingForIndexUpdate
+                          ? '索引更新中'
+                          : isKeywordSearchPending
+                          ? '搜尋中…'
+                          : '$totalFound 筆',
                       style: theme.textTheme.bodySmall?.copyWith(
                         color: const Color(0xFF687671),
                       ),
@@ -2367,6 +2431,24 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
 
   List<Widget> _buildKeywordContentSlivers(BuildContext context) {
     final slivers = <Widget>[];
+
+    if (waitingForIndexUpdate) {
+      slivers.add(
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(40, 12, 40, 12),
+            child: Card(
+              margin: EdgeInsets.zero,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: IndexUpdateStatusView(progress: _indexUpdate.progress),
+              ),
+            ),
+          ),
+        ),
+      );
+      return slivers;
+    }
 
     if (isKeywordSearchPending && results.isEmpty) {
       slivers.add(

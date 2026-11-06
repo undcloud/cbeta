@@ -65,6 +65,8 @@ class ScriptureIndexMaintenance {
   Future<int> rebuildIndexes({
     void Function(int done, int total)? onProgress,
     bool Function()? shouldAbort,
+    Future<void> Function()? beforeBatch,
+    int batchSize = _rebuildBatchSize,
   }) async {
     if (kIsWeb) return 0;
     final refs = await scriptureVolumeStore.listRefs();
@@ -78,13 +80,13 @@ class ScriptureIndexMaintenance {
           ),
     ];
     final total = targets.length;
+    final size = math.max(1, batchSize);
     var built = 0;
-    for (var start = 0; start < total; start += _rebuildBatchSize) {
+    for (var start = 0; start < total; start += size) {
       if (shouldAbort != null && shouldAbort()) break;
-      final batch = targets.sublist(
-        start,
-        math.min(start + _rebuildBatchSize, total),
-      );
+      if (beforeBatch != null) await beforeBatch();
+      if (shouldAbort != null && shouldAbort()) break;
+      final batch = targets.sublist(start, math.min(start + size, total));
       built += await _runBuildBatch(batch);
       onProgress?.call(math.min(start + batch.length, total), total);
       // 主 isolate 自己掃的場合（測試、網頁版）要讓出畫面，否則几千卷會把 UI

@@ -61,6 +61,41 @@ class _MemoryScriptureVolumeStore extends ScriptureVolumeStore {
   Future<void> clearAll() async => volumes.clear();
 }
 
+/// 固定回報「正在更新索引」，由測試決定何時完成。
+class _FakeIndexUpdateService extends IndexUpdateService {
+  final Completer<void> _completion = Completer<void>();
+  IndexUpdateProgress _progress = const IndexUpdateProgress(
+    phase: IndexUpdatePhase.running,
+    done: 0,
+    total: 1,
+    message: '正在更新搜尋索引：0/1 卷',
+  );
+
+  @override
+  bool get needsUpdate => false;
+
+  @override
+  IndexUpdateProgress get progress => _progress;
+
+  @override
+  Future<bool> startIfNeeded() async => false;
+
+  @override
+  Future<void> waitForCompletion() => _completion.future;
+
+  void complete() {
+    if (_completion.isCompleted) return;
+    _progress = const IndexUpdateProgress(
+      phase: IndexUpdatePhase.completed,
+      done: 1,
+      total: 1,
+      message: '搜尋索引已更新（共 1 卷）',
+    );
+    notifyListeners();
+    _completion.complete();
+  }
+}
+
 Color? _dialogBackgroundColor(WidgetTester tester) {
   final material = find
       .descendant(of: find.byType(Dialog), matching: find.byType(Material))
@@ -2340,6 +2375,58 @@ void main() {
       await tester.tap(find.textContaining('T0001').first);
       await tester.pumpAndSettle();
       expect(find.text('般若波羅蜜多心經', findRichText: true), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+    }, () => client);
+  });
+
+  testWidgets('offline search waits for the background index update', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({'search_offline_only': true});
+    await scriptureDisplaySettings.load();
+    await scriptureVolumeStore.write(
+      const CachedScriptureVolume(
+        work: 'T0001',
+        juan: '1',
+        html:
+            '<div id="body">'
+            '<p class="juan">索引等待測試經卷</p>'
+            '<span class="lb" id="T01n0001_p0001a01"></span>'
+            '<span class="t">等待索引完成再搜尋</span>'
+            '</div>',
+      ),
+    );
+    final fakeIndexUpdate = _FakeIndexUpdateService();
+    final client = MockClient((request) async {
+      throw const SocketException('offline');
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        CbetaSearchApp(indexUpdateService: fakeIndexUpdate),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField).first, '等待索引完成');
+      await tester.tap(find.byTooltip('搜尋經文'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      final pageState = tester.state<ScriptureSearchPageState>(
+        find.byType(ScriptureSearchPage),
+      );
+      expect(pageState.waitingForIndexUpdate, isTrue);
+      expect(pageState.offlineSearchSession, isNull);
+      expect(find.text('搜尋索引更新'), findsOneWidget);
+      expect(find.textContaining('正在更新搜尋索引'), findsOneWidget);
+
+      fakeIndexUpdate.complete();
+      await tester.pumpAndSettle();
+
+      expect(pageState.waitingForIndexUpdate, isFalse);
+      expect(find.textContaining('等待索引完成'), findsWidgets);
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pumpAndSettle();
