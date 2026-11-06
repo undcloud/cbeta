@@ -1149,6 +1149,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       offlineSearchActive = true;
       keywordSearchSucceeded = true;
       keywordSearchError = null;
+      // 本地結果一旦亮出來就得收起全螢幕轉圈：線上請求可能還要好幾秒
+      // （甚至等到 45 秒逾時），不能讓它把已可操作的本地結果整個蓋住。
+      isLoading = false;
       results = progress.results;
       nextStart = progress.results.length;
       totalFound = progress.results.length;

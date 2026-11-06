@@ -846,6 +846,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 - 旧版 `_isNetworkFailure` 里包含 `TimeoutException`，网络上明明通、只是伺服端慢（单字「來」的 `all_in_one` 实测 26.3 秒）时会在第 20 秒悄悄切去本地扫描，使用者看到的就是「等了二十多秒才出结果」；
 - 现在 `_loadKeywordResults` 在**没有线上快取、且本地有经卷**时会同时起本地扫描：结果先压 500 ms（`_offlineRevealDelay`），线上还没回来就亮出来（`_revealOfflineScan`）；线上成功再整批取代并 `_stopOfflineScan()`，断网/逾时就留在本地结果上。断网时不必先等 socket 失败，伺服器慢时也不必对着转圈等 3.5～15 秒；
+- **本地结果发布时必须同时清掉 `isLoading`**：`_buildResultSlivers` 在 `isLoading` 为真时只渲染一颗全螢幕 `CircularProgressIndicator`，会盖住底下已经存在的本地结果。之前 `_publishOfflineScan` 只写 `results`、不关 `isLoading`，只有经目管线刚好在发布之后结束（`catalogSearchResults` 非空或重算 `isLoading`）才会顺带解锁；查询词碰不到任何经目书名时（例如「五蘊解脫」），离线搜完后切到有网路再搜，本地结果在 500 ms 就绪，画面却一直转圈到 `all_in_one` 回来或 45 秒逾时，看起来就是「卡死」。现在发布本地结果的同一个 `setState` 里直接 `isLoading = false`，线上请求继续在背景跑、回来再整批取代；
 - 有线上快取时仍然先画快取、不重复起本地扫描；`_isRequestTimeout` 仍排在 `_isNetworkFailure` 之前：本地已有非空结果时保留结果并显示可重试的逾时提示，本地也还没扫到东西时维持「請重試」画面（与 `keyword search timeout keeps results instead of going offline` 一致）；
 - 全文的超时上限从 20 秒调到 `_keywordSearchTimeout = 45 秒`（`_fetchSearchBatch` 与「載入更多」都用它），单字查询的服务端下限（约 3.5～4 秒）与慢查询的二十几秒都落在上限内；
 - `_buildKeywordSectionContent` 的空结果分支加了 `keywordSearchError == null` 条件，请求失败时不再同时宣称「找不到『X』相關經文」。

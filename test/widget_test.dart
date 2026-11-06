@@ -2343,7 +2343,7 @@ void main() {
             '<div id="body">'
             '<p class="juan">長阿含經卷第一</p>'
             '<span class="lb" id="T01n0001_p0001a01"></span>'
-            '<span class="t">般若波羅蜜多心經</span>'
+            '<span class="t">測試離線關鍵字</span>'
             '</div>',
       ),
     );
@@ -2359,7 +2359,7 @@ void main() {
       await tester.pumpWidget(const CbetaSearchApp());
       await tester.pumpAndSettle();
 
-      await tester.enterText(find.byType(TextField).first, '般若波羅蜜');
+      await tester.enterText(find.byType(TextField).first, '測試離線關鍵字');
       await tester.tap(find.byTooltip('搜尋經文'));
       // 前 500 ms 先壓住，避免線上很快回來時閃一下本地結果。
       await tester.pump(const Duration(milliseconds: 100));
@@ -2368,6 +2368,10 @@ void main() {
       await tester.pump(const Duration(milliseconds: 600));
       await tester.pump();
       expect(find.textContaining('目前為離線模式'), findsOneWidget);
+      // 本地結果已經亮出來，就不能再被全螢幕轉圈蓋住；線上還在跑時
+      // 使用者仍要能看到、點到本地命中。
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      expect(find.textContaining('長阿含經'), findsWidgets);
 
       // 线上最终失败也不该把已经亮出来的本地结果收回。
       keywordResponse.complete(http.Response('{}', 500));
