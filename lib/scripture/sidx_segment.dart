@@ -324,13 +324,13 @@ class SidxSegmentReader {
   final String _blobPath;
   Future<void> _gate = Future<void>.value();
 
-  Future<SidxVolume?> readVolume(SidxSegmentEntry entry) {
+  Future<SidxScanVolume?> readVolume(SidxSegmentEntry entry) {
     final next = _gate.then((_) => _readVolume(entry));
     _gate = next.then<void>((_) {}, onError: (Object _) {});
     return next;
   }
 
-  Future<SidxVolume?> _readVolume(SidxSegmentEntry entry) async {
+  Future<SidxScanVolume?> _readVolume(SidxSegmentEntry entry) async {
     final cacheKey =
         '$_blobPath@${entry.offset}:${entry.byteLength}:${entry.sourceStamp}';
     final cached = _rememberVolume(cacheKey);
@@ -340,7 +340,11 @@ class SidxSegmentReader {
       final bytes = await _file.read(entry.byteLength);
       if (bytes.length != entry.byteLength) return null;
       debugSidxBodyReads += 1;
-      final volume = decodeSidx(bytes, work: entry.work, juan: entry.juan);
+      final volume = decodeSidxForScan(
+        bytes,
+        work: entry.work,
+        juan: entry.juan,
+      );
       if (volume == null || volume.sourceStamp != entry.sourceStamp) {
         return null;
       }
@@ -600,20 +604,21 @@ SidxSegmentReader? _rememberReader(String path) {
   return cached;
 }
 
-final LinkedHashMap<String, SidxVolume> _volumeCache = LinkedHashMap();
+final LinkedHashMap<String, SidxScanVolume> _volumeCache = LinkedHashMap();
 final Map<String, int> _volumeSizes = {};
 int _volumeCacheBytes = 0;
 const int _volumeCacheBudgetBytes = 24 * 1024 * 1024;
 
-SidxVolume? _rememberVolume(String key) {
+SidxScanVolume? _rememberVolume(String key) {
   final entry = _volumeCache.remove(key);
   if (entry == null) return null;
   _volumeCache[key] = entry;
   return entry;
 }
 
-void _cacheVolume(String key, SidxVolume volume) {
-  final size = volume.bytes.length + volume.lines.length * 32;
+void _cacheVolume(String key, SidxScanVolume volume) {
+  // 視圖會保留整個編碼檔，按來源長度計價才不會低估記憶體。
+  final size = volume.byteLength + 64;
   final replaced = _volumeSizes.remove(key);
   if (replaced != null) _volumeCacheBytes -= replaced;
   _volumeCache.remove(key);

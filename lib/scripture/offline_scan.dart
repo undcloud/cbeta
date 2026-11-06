@@ -162,7 +162,8 @@ Future<OfflineScanOutcome> _runOfflineScan(
         final stamp = target.path.isEmpty
             ? 0
             : (await sidxSourceStamp(target.path)) ?? 0;
-        SidxVolume? volume;
+        SidxSearchVolume? volume;
+        SidxVolume? persistable;
         var fromLegacy = false;
         final entry = target.path.isEmpty
             ? null
@@ -179,12 +180,13 @@ Future<OfflineScanOutcome> _runOfflineScan(
           if (target.path.isNotEmpty) {
             // 舊版一卷一檔的索引先拿來用，省掉一次 HTML 解析；成功寫進段後
             // 再刪除，讓升級不必重掃整藏。
-            volume = await legacyStore.readAt(
+            persistable = await legacyStore.readAt(
               work: target.work,
               juan: target.juan,
               sourceStamp: stamp,
             );
-            fromLegacy = volume != null;
+            fromLegacy = persistable != null;
+            volume = persistable;
           }
           if (volume == null) {
             final lines = await _readVolumeLines(target);
@@ -192,22 +194,23 @@ Future<OfflineScanOutcome> _runOfflineScan(
               scanned++;
               continue;
             }
-            volume = buildSidxVolume(
+            persistable = buildSidxVolume(
               work: target.work,
               juan: target.juan,
               sourceStamp: stamp,
               lines: lines.lines,
             );
+            volume = persistable;
             built += 1;
           }
-          if (target.path.isNotEmpty) {
+          if (target.path.isNotEmpty && persistable != null) {
             // 拿不到段鎖就只在記憶體裡用這份索引，下次掃描再補寫；
             // 掃描不該為了等另一趟建置而停住。
             writer ??= await segmentStore.beginWrite(
               group.segmentId,
               timeout: const Duration(milliseconds: 100),
             );
-            final newEntry = await writer?.append(volume);
+            final newEntry = await writer?.append(persistable);
             if (newEntry != null) {
               meta ??= SidxSegmentMeta(group.segmentId);
               meta.add(newEntry);
@@ -223,9 +226,11 @@ Future<OfflineScanOutcome> _runOfflineScan(
         final loaded = volume;
         final hits = <OfflineHit>[];
         scanNormMatches(loaded.bytes, pattern, (match) {
-          final line = loaded.lineAt(match.byteStart);
           hits.add(
-            OfflineHit(juan: loaded.juan, linehead: line?.linehead ?? ''),
+            OfflineHit(
+              juan: loaded.juan,
+              linehead: loaded.lineheadAt(match.byteStart) ?? '',
+            ),
           );
         });
         if (hits.isEmpty) continue;

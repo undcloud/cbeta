@@ -13,7 +13,7 @@ import 'source_text.dart';
 /// 一卷的搜尋用表示（`.sidx`）：正規化正文 + 行定位表 + 特殊字體區間 + 字符集。
 ///
 /// 它是 `.json` 經卷的**派生物**，可以隨時刪除並重建；`.json` 才是真相源。
-class SidxVolume {
+class SidxVolume implements SidxSearchVolume {
   const SidxVolume({
     required this.work,
     required this.juan,
@@ -25,17 +25,22 @@ class SidxVolume {
     required this.charSet,
   });
 
+  @override
   final String work;
+  @override
   final String juan;
 
   /// 作品名（卷題去掉「卷第一」尾綴）；第一階段不解析 HTML 也能顯示經名。
+  @override
   final String title;
 
   /// 來源經卷檔案的「大小 + 修改時間」摘要（見 [sidxSourceStamp]）。
   ///
   /// 經卷 `.json` 是真相源、`.sidx` 是派生物；這枚戳記讓掃描只要一次 `stat`
   /// 就能判索引新舊，不必把 25 KB 正文讀進來比對內容版本。
+  @override
   final int sourceStamp;
+  @override
   final Uint8List bytes;
   final List<SidxLine> lines;
   final List<SidxRun> runs;
@@ -58,6 +63,24 @@ class SidxVolume {
     }
     return lines[low].byteOffset <= byteOffset ? lines[low] : null;
   }
+
+  @override
+  String? lineheadAt(int byteOffset) => lineAt(byteOffset)?.linehead;
+}
+
+/// 離線掃描眼裡的一卷：正文、標題與命中行的行號。
+///
+/// 段索引讀取只回傳這個輕量視圖；完整 [SidxVolume]（含所有行、悉曇區間、
+/// 字符集 Set）只在從舊索引遷移或從 HTML 重建時才需要。
+abstract class SidxSearchVolume {
+  String get work;
+  String get juan;
+  String get title;
+  int get sourceStamp;
+  Uint8List get bytes;
+
+  /// 正規化位元組位移落在哪一行；越界或沒有行表時回傳 null。
+  String? lineheadAt(int byteOffset);
 }
 
 /// 行定位表的一列。`srcOffset` 是閱讀器 layout 用的整卷來源位移。
@@ -786,6 +809,149 @@ SidxVolume? decodeSidx(
     ),
   );
 }
+
+/// 掃描用的輕量解碼：只驗標頭，正文用視圖，標題與行號延遲解碼。
+///
+/// 完整 [decodeSidx] 會校验 crc、把所有行號與標題解成字串、重建字符集
+/// Set；2 萬卷全藏掃描時這些都是白工（字符集由段清單判定，行號只在命中
+/// 時才要）。[verifyCrc] 預設關閉：段檔只在整卷寫完後才提交清單記錄，
+/// 清單又帶 crc，損毀的段會在下一次重建時被換掉。
+SidxScanVolume? decodeSidxForScan(
+  Uint8List bytes, {
+  required String work,
+  required String juan,
+  bool verifyCrc = false,
+}) {
+  final sections = _parseHeader(bytes);
+  if (sections == null) return null;
+  if (verifyCrc &&
+      ByteData.sublistView(
+            bytes,
+            bytes.length - 4,
+            bytes.length,
+          ).getUint32(0, _endian) !=
+          crc32(bytes, 0, bytes.length - 4)) {
+    return null;
+  }
+  return SidxScanVolume._(
+    work: work,
+    juan: juan,
+    sourceStamp: sections.sourceStamp,
+    source: bytes,
+    lineTableOffset: sections.lineTableOffset,
+    lineCount: sections.lineCount,
+    headPoolOffset: sections.headPoolOffset,
+    headPoolLength: sections.headPoolLength,
+    titleOffset: sections.titleOffset,
+    titleLength: sections.titleLength,
+    textOffset: sections.textOffset,
+    textLength: sections.textLength,
+  );
+}
+
+/// [decodeSidxForScan] 的產物；不持有行表與字符集。
+class SidxScanVolume implements SidxSearchVolume {
+  SidxScanVolume._({
+    required this.work,
+    required this.juan,
+    required this.sourceStamp,
+    required Uint8List source,
+    required int lineTableOffset,
+    required int lineCount,
+    required int headPoolOffset,
+    required int headPoolLength,
+    required int titleOffset,
+    required int titleLength,
+    required int textOffset,
+    required int textLength,
+  }) : _source = source,
+       _lineTableOffset = lineTableOffset,
+       _lineCount = lineCount,
+       _headPoolOffset = headPoolOffset,
+       _headPoolLength = headPoolLength,
+       _titleOffset = titleOffset,
+       _titleLength = titleLength,
+       bytes = Uint8List.sublistView(
+         source,
+         textOffset,
+         textOffset + textLength,
+       );
+
+  @override
+  final String work;
+  @override
+  final String juan;
+  @override
+  final int sourceStamp;
+  @override
+  final Uint8List bytes;
+
+  final Uint8List _source;
+  final int _lineTableOffset;
+  final int _lineCount;
+  final int _headPoolOffset;
+  final int _headPoolLength;
+  final int _titleOffset;
+  final int _titleLength;
+  String? _title;
+
+  /// 快取計價用：視圖會保留整個編碼檔，不能只算正文長度。
+  int get byteLength => _source.length;
+
+  @override
+  String get title {
+    final cached = _title;
+    if (cached != null) return cached;
+    return _title = _titleLength == 0
+        ? ''
+        : utf8.decode(
+            Uint8List.sublistView(
+              _source,
+              _titleOffset,
+              _titleOffset + _titleLength,
+            ),
+            allowMalformed: true,
+          );
+  }
+
+  @override
+  String? lineheadAt(int byteOffset) {
+    if (_lineCount == 0) return null;
+    var low = 0;
+    var high = _lineCount - 1;
+    while (low < high) {
+      final middle = (low + high + 1) >> 1;
+      if (_readSidxUint32(
+            _source,
+            _lineTableOffset + middle * _lineRecordSize,
+          ) <=
+          byteOffset) {
+        low = middle;
+      } else {
+        high = middle - 1;
+      }
+    }
+    final record = _lineTableOffset + low * _lineRecordSize;
+    if (_readSidxUint32(_source, record) > byteOffset) return null;
+    final headOffset = _readSidxUint32(_source, record + 12);
+    final headLength = _readSidxUint16(_source, record + 16);
+    if (headOffset + headLength > _headPoolLength) return null;
+    final start = _headPoolOffset + headOffset;
+    return utf8.decode(
+      Uint8List.sublistView(_source, start, start + headLength),
+      allowMalformed: true,
+    );
+  }
+}
+
+int _readSidxUint32(Uint8List bytes, int offset) =>
+    bytes[offset] |
+    (bytes[offset + 1] << 8) |
+    (bytes[offset + 2] << 16) |
+    (bytes[offset + 3] << 24);
+
+int _readSidxUint16(Uint8List bytes, int offset) =>
+    bytes[offset] | (bytes[offset + 1] << 8);
 
 final Uint32List _crcTable = _buildCrcTable();
 

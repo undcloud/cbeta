@@ -757,6 +757,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - 索引目录是 `<支援目录>/cbeta_sidx/`，与经卷 `cbeta_scripture/{work}-{juan}.json` 同层。每卷仍编码成一份 `.sidx` blob，但落地时按作品哈希写进固定 256 个段档 `seg-XXXX.csb`，旁边一份追加式清单 `seg-XXXX.csm` 记录每卷的戳记、blob 偏移与字符集。**`.json` 是真相源，整个 `cbeta_sidx/` 是派生物**，可随时删除重建；旧版一卷一档的 `{work}-{juan}.sidx` 会在首次扫描时被搬进段并删除。
 - **下载/更新完成时就建索引**：`DownloadManager._storeVolume()` 写完 `.json` 立刻把 `(work, juan, path)` 交给 `offlineIndexQueue`（批 32 卷、最多 4 批在飞），`replaceDownloadedVolumes()` 与下载结束前 `flush()`；这样第一次离线搜索不再边扫边逐卷重建（两万多卷时那是最大的卡顿来源），`index_maintenance.dart` 的 `rebuildIndexes()` 也能在「删光索引但不重下经文」的情况下重建；
 - 索引读取有**有界内存缓存**（段清单按 16 MB 字节预算 LRU、解码后的卷缓存 24 MB、每 isolate 复用段 blob 的读取句柄）：同一字重搜、或换字重扫同一批卷时不再重复读档；清空索引会同时清掉两层内存副本并关闭句柄，避免删掉索引后仍读到旧字节；
+- 扫描专用解码走 `decodeSidxForScan`（`SidxSearchVolume`）：不验整档 crc32、不建 `SidxLine` 对象与行首字串、不展开 charset `Set`，只保留标头、字节正文与行表／行首集的偏移，`title` 与 `lineheadAt(byteOffset)` 都延迟到真正用到时才解码；卷缓存按编码后字节数（`byteLength`）计费，视图会钉住整份 blob 来源；
 
 **正規化规则（写死并版本化：`sidxNormVersion`）**
 
