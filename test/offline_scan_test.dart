@@ -242,6 +242,54 @@ void main() {
     expect(after.termHits, 0);
   });
 
+  test('完整掃描後記住經卷世代，下一輪不再逐卷 stat', () async {
+    await seedVolumes(3);
+    final targets = await targetsFor(3);
+    final session = OfflineScanSession('般若');
+    addTearDown(session.dispose);
+    await session.prepare();
+    session.start();
+    await _waitFor(() => session.finished && !session.scanning);
+    expect(session.current.termHits, 3);
+
+    final marker = File(
+      '${tempDir.path}${Platform.pathSeparator}cbeta_sidx'
+      '${Platform.pathSeparator}volumes.gen',
+    );
+    expect(marker.existsSync(), isTrue);
+    final generation = File(
+      '${tempDir.path}${Platform.pathSeparator}cbeta_scripture'
+      '${Platform.pathSeparator}.generation',
+    ).lengthSync();
+    expect(int.parse(marker.readAsStringSync()), generation);
+
+    // 世代沒變：相信段索引的戳記，整輪一次 stat 都不做。
+    debugSidxStampReads = 0;
+    final warm = await runOfflineScan(requestFor('般若', targets));
+    expect(warm.termHits, 3);
+    expect(debugSidxStampReads, 0);
+
+    // 任何一次寫入都推進世代，下一輪就得逐卷重新取戳記。
+    await scriptureVolumeStore.write(
+      CachedScriptureVolume(
+        work: 'T0001',
+        juan: '1',
+        contentVersion: 'v99',
+        html:
+            '<div id="body">'
+            '<p class="juan">測試經1卷第一</p>'
+            '<span class="lb" id="t0001n0001_p0001a01"></span>'
+            '<span class="t">新的正文不含關鍵字</span>'
+            '</div>',
+      ),
+    );
+    debugSidxStampReads = 0;
+    final after = await runOfflineScan(requestFor('般若', targets));
+    expect(after.termHits, 2);
+    expect(after.builtIndexes, 1);
+    expect(debugSidxStampReads, 3);
+  });
+
   test('罕見字查詢靠字符集跳卷，正文一個字節都不讀', () async {
     await seedVolumes(4);
     final targets = await targetsFor(4);
@@ -260,6 +308,26 @@ void main() {
 
     debugSidxBodyReads = 0;
     expect((await runOfflineScan(requestFor('波羅', targets))).termHits, 4);
+    expect(debugSidxBodyReads, 4);
+  });
+
+  test('詞組查詢只要有一个槽位全缺就跳卷，不必讀正文', () async {
+    await seedVolumes(4);
+    final targets = await targetsFor(4);
+    expect((await runOfflineScan(requestFor('波羅', targets))).builtIndexes, 4);
+
+    // 「般」「若」都在卷內，但「解」「脫」不在：詞組不可能命中，
+    // 舊的「有交集就讀」會把四卷正文全部讀進來，逐槽判定則整批跳過。
+    debugSidxBodyReads = 0;
+    final impossible = await runOfflineScan(requestFor('般若解脫', targets));
+    expect(impossible.termHits, 0);
+    expect(impossible.builtIndexes, 0);
+    expect(debugSidxBodyReads, 0);
+
+    // 每個字都在卷內時不能跳，即使順序對不上仍要掃正文。
+    debugSidxBodyReads = 0;
+    final scrambled = await runOfflineScan(requestFor('蜜多般', targets));
+    expect(scrambled.termHits, 0);
     expect(debugSidxBodyReads, 4);
   });
 
@@ -631,8 +699,33 @@ void main() {
     expect(decoded.sourceStamp, 9);
     expect(decoded.offset, 12);
     expect(decoded.byteLength, 34);
-    expect(decoded.canSkip({0x822C}), isFalse);
-    expect(decoded.canSkip({0x9999}), isTrue);
+    expect(
+      decoded.canSkipSlots([
+        Int32List.fromList([0x822C]),
+      ]),
+      isFalse,
+    );
+    expect(
+      decoded.canSkipSlots([
+        Int32List.fromList([0x9999]),
+      ]),
+      isTrue,
+    );
+    // 逐槽判定：只要有任一槽位的候選全不在卷內就跳卷。
+    expect(
+      decoded.canSkipSlots([
+        Int32List.fromList([0x822C]),
+        Int32List.fromList([0x9999]),
+      ]),
+      isTrue,
+    );
+    expect(
+      decoded.canSkipSlots([
+        Int32List.fromList([0x9999, 0x822C]),
+        Int32List.fromList([0x822C]),
+      ]),
+      isFalse,
+    );
   });
 
   test('同一段同時只有一個寫入者', () async {
@@ -649,6 +742,46 @@ void main() {
     expect(again, isNotNull);
     await again!.close();
     expect(await store.countVolumes(), 0);
+  });
+
+  test('同段多卷合併區塊讀，逐卷取用不再碰段檔', () async {
+    final store = SidxSegmentStore(directoryProvider: () async => tempDir);
+    final writer = await store.beginWrite(11);
+    expect(writer, isNotNull);
+    final entries = <SidxSegmentEntry>[];
+    for (var index = 0; index < 6; index++) {
+      final work = 'T${9000 + index}';
+      final volume = buildSidxVolume(
+        work: work,
+        juan: '1',
+        sourceStamp: 5,
+        lines: parseScriptureHtml(
+          '<div id="body">'
+          '<p class="juan">區塊讀$index</p>'
+          '<span class="lb" id="${work.toLowerCase()}n0001_p0001a01"></span>'
+          '<span class="t">般若波羅蜜多心經</span>'
+          '</div>',
+        ),
+      );
+      entries.add((await writer!.append(volume))!);
+    }
+    await writer!.close();
+
+    clearSidxSegmentCaches();
+    debugSidxBodyReads = 0;
+    debugSidxRangeReads = 0;
+    final reader = await store.openReader(11);
+    expect(reader, isNotNull);
+    await reader!.prefetchVolumes(entries);
+    expect(debugSidxRangeReads, 1);
+    expect(debugSidxBodyReads, entries.length);
+    for (final entry in entries) {
+      final volume = await reader.readVolume(entry);
+      expect(volume, isNotNull);
+      expect(volume!.juan, '1');
+    }
+    // 六卷都已由區塊讀進快取，逐卷取用不該再讀段檔。
+    expect(debugSidxBodyReads, entries.length);
   });
 
   test('舊版一卷一檔的 .sidx 會搬進段檔並刪除', () async {

@@ -758,6 +758,10 @@ return scriptureDisplaySettings.showSimplifiedText
 - **下载/更新完成时就建索引**：`DownloadManager._storeVolume()` 写完 `.json` 立刻把 `(work, juan, path)` 交给 `offlineIndexQueue`（批 32 卷、最多 4 批在飞），`replaceDownloadedVolumes()` 与下载结束前 `flush()`；这样第一次离线搜索不再边扫边逐卷重建（两万多卷时那是最大的卡顿来源），`index_maintenance.dart` 的 `rebuildIndexes()` 也能在「删光索引但不重下经文」的情况下重建；
 - 索引读取有**有界内存缓存**（段清单按 16 MB 字节预算 LRU、解码后的卷缓存 24 MB、每 isolate 复用段 blob 的读取句柄）：同一字重搜、或换字重扫同一批卷时不再重复读档；清空索引会同时清掉两层内存副本并关闭句柄，避免删掉索引后仍读到旧字节；
 - 扫描专用解码走 `decodeSidxForScan`（`SidxSearchVolume`）：不验整档 crc32、不建 `SidxLine` 对象与行首字串、不展开 charset `Set`，只保留标头、字节正文与行表／行首集的偏移，`title` 与 `lineheadAt(byteOffset)` 都延迟到真正用到时才解码；卷缓存按编码后字节数（`byteLength`）计费，视图会钉住整份 blob 来源；
+- worker isolate 内的段档读取走**同步 API**（`blockingIo: true`，`statSync`／`setPositionSync`／`readSync`）：worker 本来独占 isolate，异步档 I/O 每卷一次事件回圈往返，2 万卷实测慢一个量级；主 isolate 的兜底路径必须保持异步，否则会卡住画面；
+- **段内合并区块读**：字符集筛选后同一段仍要读 ≥6 卷、且这些卷占偏移区间的一半以上时，`prefetchVolumes` 一次读完整个区间再切片解码（`debugSidxRangeReads` 计数），把 2 万次小读压到约 256 次；零星几卷仍走逐卷读，不为几 KB 拉一个整段；
+- **经卷世代标记**：每次 `ScriptureVolumeStore.write()`／`clearAll()` 先往 `<经卷目录>/.generation` 追加一个字节；一趟扫描**完整成功且没有任何缺索引**后才把当时的世代写进 `<支援目录>/cbeta_sidx/volumes.gen`。之后扫描只要世代相符就直接信任段清单里的戳记，省掉每卷一次 `stat`（2 万卷约 250 ms）；任何写入都会推进世代，标记自然失效，不会误信过期索引；
+- **会话固定开销也压到最低**：`listRefs()` 按经卷世代缓存目录清单（两万卷重扫目录约上百毫秒，`write()`／`clearAll()` 会清掉缓存）；结果列表每块只做合并、重建限流到 120 ms 一次（画面本来就每 300 ms 才发布），两万部经不必每块重排重配一遍，扫完时补一次完整重建；
 
 **正規化规则（写死并版本化：`sidxNormVersion`）**
 
@@ -777,7 +781,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 **第一階段只扫索引，第二階段才解析 HTML**
 
-- `runOfflineScan` 只产出 `(work, juan, linehead)`，不带正文；一部经的命中先以 `pendingHits` 发布，卡片展开时才调 `expandOfflineWork()` 用 `.json` 的 HTML 重比一次（实测约 4 ms/卷），摘要与 `sourceOffset` 都取自**带标点的原文**，再点其中一条才进阅读页；展开同样派给常驻池（`runExpand`），按来源 `.json` 的戳记做**整卷解析缓存**（`_expandedVolumes`，24 卷 LRU）：换字重开同一部经不会重解析同一卷；池已释放、网页版（`path` 为空）或测试环境退回 `runOfflineExpandInline`，主 isolate 一卷一卷做、卷间让出一帧，并由呼叫端传 `shouldAbort`（`!mounted || 會話已被換掉`）——點開一部長的經再跳走，不會出現「頁面已經換了還在一卷卷解析」；
+- `runOfflineScan` 只产出 `(work, juan, linehead)`，不带正文；**每卷只生成一笔命中，出现次数另记在 `hitCount`**（同卷多處命中只留第一处的行号），否则常用字 2 万卷会产出几十万个命中对象与其行号字串。卡片按 `hitCount` 显示「找到 N 處命中」；一部经的命中先以 `pendingHits` 发布，卡片展开时才调 `expandOfflineWork()` 用 `.json` 的 HTML 重比一次（实测约 4 ms/卷），摘要与 `sourceOffset` 都取自**带标点的原文**，再点其中一条才进阅读页；展开同样派给常驻池（`runExpand`），按来源 `.json` 的戳记做**整卷解析缓存**（`_expandedVolumes`，24 卷 LRU）：换字重开同一部经不会重解析同一卷；池已释放、网页版（`path` 为空）或测试环境退回 `runOfflineExpandInline`，主 isolate 一卷一卷做、卷间让出一帧，并由呼叫端传 `shouldAbort`（`!mounted || 會話已被換掉`）——點開一部長的經再跳走，不會出現「頁面已經換了還在一卷卷解析」；
 - 首页的接線是 `WorkStickyHeader.onExpansionChanged` → `_expandOfflineHits()`，用 `_expandingOfflineWorks` 防重复展开，完成后 `session.applyPassages(work, passages)` 用摘要取代那一部的待展开命中；还没展开完时该列显示「找到 N 處命中，正在載入經文摘要…」占位；
 - 上下文摘要 `offlineKwicSnippet()` 会停在卷题／作译者／校勘夹注的边界（`SidxSource.excluded`）：被结构边界挡住时不加省略号，因为省略号表示删掉的是经文，不是标题；
 - 命中一律排除：卷题、作译者、校勘夹注（`inlineNotes`）、以及卷首那行就在 `#body` 裡的 `No. 1092 [cf. Nos. 1093-1099, 901(Fasc. 5)]`，否则 cf 引用会污染正文结果。
@@ -786,10 +790,10 @@ return scriptureDisplaySettings.showSimplifiedText
 
 - `OfflineScanPool` 常驻最多 `min(4, max(2, 处理器数))` 个 isolate，`Isolate.spawn` + `RawReceivePort` 握手、UI 侧共用一个 `ReceivePort`，单块 120 s 逾时就当空结果放过；
 - 池是**模块级共用**（`sharedOfflineScanPool()`／`releaseSharedOfflineScanPool()`），不属于任何一个扫描会话：换字或重送搜索会重建会话，若池跟着会话生死，一次点击就要杀四个 isolate 再生四个，重生的固定开销比扫一卷还大。只有离开搜索页（`ScriptureSearchPageState.dispose`）才释放池；扩容要排队（`_growing`），否则两个会话同时 `_ensureWorkers` 会拿到同一个 worker；
-- 块大小跟着每帧预算走（`volumesPerChunk = 24` 起步、`_batchBudgetMicros = 16000`）：一块跑得比预算快就翻倍，慢过四倍就折半，上限 2000 卷，块之间让出 4 ms，所以索引就位后块会一路长到千卷级，扫描自己推到 `finished`，不依赖卷动或按钮；
-- `flutter test` 的 fake-async 不会推进真实 isolate 的回覆，网页版也没有档案，所以 `offlineScanSupportsIsolate()` 在这两种情况下走同一份同步实作（只少了 isolate 跳板）；经卷 ref 没有 `path` 时（网页版存 SharedPreferences）由主 isolate 用 `scanOfflineVolume` 逐卷读，也不会去建 `cbeta_sidx/`；
+- 块大小跟着每帧预算走：主 isolate 兜底从 `volumesPerChunk = 24` 起步、预算 16 ms、块间让出 4 ms；常驻池从 512 卷起步、预算 150 ms、块间不插固定等待（池在背景跑，不占 UI），上限都是 2000 卷。2 万卷在池路径下约 40 块，派发开销从几千次降到几十次；
+- worker isolate 的元数据与正文都用同步档 I/O（`blockingIo: true`）；`flutter test` 的 fake-async 不会推进真实 isolate 的回覆，网页版也没有档案，所以 `offlineScanSupportsIsolate()` 在这两种情况下走同一份同步实作（只少了 isolate 跳板）；经卷 ref 没有 `path` 时（网页版存 SharedPreferences）由主 isolate 用 `scanOfflineVolume` 逐卷读，也不会去建 `cbeta_sidx/`；
 - 扫描按段分组：同一段的卷只读一次 meta、并复用同一个 blob 读取句柄；池派工**按 `segmentId % workerCount` 固定分配**，一整段永远由同一个 worker 处理——不能按每块负载重新分配，否则同一段清单会被不同 worker 轮番重读（2 万卷时清单约 31 MB，小块扫描能放大成 GB 级读）；段号只由作品名决定，所以同一部经的卷永远在同一段，结果里的卷序不会被打乱；
-- 清单里的字符集**不展开成 `Set<int>`**：`SidxSegmentEntry` 只持有 `encodeRuneSet` 的字节视图，`canSkip` 串流解 LEB128 并与查询候补比对，2 万卷的清单解码从数百毫秒降到约一百毫秒，也省掉上百 MB 的 Set 常驻；
+- 清单里的字符集**不展开成 `Set<int>`**：`SidxSegmentEntry` 只持有 `encodeRuneSet` 的字节视图，`canSkip`／`canSkipSlots` 串流解 LEB128 并与查询候补比对，2 万卷的清单解码从数百毫秒降到约一百毫秒，也省掉上百 MB 的 Set 常驻；
 - 任何「只能在 UI isolate 上扫这一块」的兜底（池已释放、卷数太少、派工失败）都走 `runOfflineScanInline()`，它与 `runOfflineScan()` 共用 `_runOfflineScan` 但**每卷之间让出一幀**。自适应后一块可长到 2000 卷，同步扫完整块会把整个 App 顶死（Android 直接报「没有响应」），这条路径绝不能再用不分段的 `runOfflineScan`；
 - 缺索引或索引过期就在扫描的 isolate 内从 `.json` 重建；旧版 `.sidx` 还在时优先解码复用，避免升级后重扫整藏。新 blob 追加进对应段，meta 在该段写完后一次提交；下载流程已经提前建好，这里只剩「下载中／旧版留下的卷」与调试删档后的兜底回填。之后每卷只剩「内存字符集判跳 →（可能命中才）按偏移读 blob」，罕见字查询连 blob 都不用打开；
 - 进度透过 `ValueNotifier<OfflineScanProgress>` 回报，页面把通知合并成最多每 300 ms 一次 `setState`（`_offlinePublishInterval`），避免每一块都重建整个结果页；`loadMore()` 在离线模式直接返回，卷动不会再触发扫描；
@@ -800,10 +804,13 @@ return scriptureDisplaySettings.showSimplifiedText
 
 **跳卷过滤**
 
-- 每卷存精确的码位集合（`charset`，delta + LEB128 压缩，一卷通常小于 64 B）；段清单把它一起载入内存，`SidxSegmentEntry.canSkip(queryRunes)` 与查询候補并集完全无交集才整卷跳过；字符集是繁体侧、且取全部候補的并集，所以简体输入不会被误跳；
-- 判定发生在**读 blob 之前**：先读段清单（可缓存），字符集无交集就直接跳过，连段 blob 文件都不用打开；
+- 每卷存精确的码位集合（`charset`，delta + LEB128 压缩，一卷通常小于 64 B）；段清单把它一起载入内存，跳卷判定按查询槽位逐槽检查（`SidxSegmentEntry.canSkipSlots`）：
+  - 单字查询退化為「候補与本卷字符集有无交集」，完全无交集才整卷跳过；
+  - 多字词组的每个槽位都必须至少有一个候補字出现在本卷；**任一槽位全缺**就跳过该卷。词组要命中，四个字都要在同一卷里，缺一个字的结构性条件已经足够判死，比旧版「任一候補有交集就讀」剪掉更多卷——像「五蘊解脫」这种包含「五」「解」「脫」等高频字的查询，旧版几乎整藏都读，新版会把没有「蘊」或「脫」的卷整批跳掉；
+  - 字符集是繁体侧、且取该槽位全部候補的并集，所以简体输入不会被误跳；
+- 判定发生在**读 blob 之前**：先读段清单（可缓存），字符集不足就直接跳过，连段 blob 文件都不用打开；预读（`prefetchVolumes`）也用同一个逐槽判定，不会把已判死的卷先读进来；
 - 过期的索引（`sourceStamp` 与 `.json` 的 stat 不符）不参与跳卷判定 —— 内容换了字集可能变大，拿旧字符集跳卷会漏命中，所以直接走重建路径；没有档案路径的经卷（网页版）也一律实读；
-- 顺序本身是有测试盯住的：`test/offline_scan_test.dart` 的「罕見字查詢靠字符集跳卷，正文一個字節都不讀」用 `debugSidxBodyReads`（段读取器的计数）先断言罕见字扫描读到 0 次正文、再对照常见字读到 4 次。
+- 顺序本身是有测试盯住的：`test/offline_scan_test.dart` 的「罕見字查詢靠字符集跳卷，正文一個字節都不讀」用 `debugSidxBodyReads`（段读取器的计数）先断言罕见字扫描读到 0 次正文、再对照常见字读到 4 次；「詞組查詢只要有一个槽位全缺就跳卷，不必讀正文」用「般若解脫」验证四卷正文一次都不读，再用「蜜多般」（每字都在卷内、只是顺序不对）验证仍然要读四卷，防止跳卷条件过宽漏命中。
 
 **已知限制**
 
@@ -835,10 +842,11 @@ return scriptureDisplaySettings.showSimplifiedText
 
 ### 11.6 逾时语义与经目本地回答
 
-**逾时不再被当作离线故障**
+**逾时不再被当作离线故障，但本地结果可以先行**
 
-- `_isNetworkFailure` 里包含 `TimeoutException`，所以旧版在网络上明明通、只是伺服端慢（单字「來」的 `all_in_one` 实测 26.3 秒）时，会在第 20 秒悄悄切去本地扫描，使用者看到的就是「等了二十多秒才出结果」；
-- 新增 `_isRequestTimeout(error)`（`error is TimeoutException`），放在 `_isNetworkFailure` 判断**之前**：逾时只显示可重试的错误，保留画面上已有的结果，不启动离线回退。两处这样做——`_loadKeywordResults`（「全文搜尋逾時（等待超過 45 秒）…」）与 `loadMore`（「載入更多結果逾時…」）；经目分区改成纯本地之后已经没有需要判逾时的请求；
+- 旧版 `_isNetworkFailure` 里包含 `TimeoutException`，网络上明明通、只是伺服端慢（单字「來」的 `all_in_one` 实测 26.3 秒）时会在第 20 秒悄悄切去本地扫描，使用者看到的就是「等了二十多秒才出结果」；
+- 现在 `_loadKeywordResults` 在**没有线上快取、且本地有经卷**时会同时起本地扫描：结果先压 500 ms（`_offlineRevealDelay`），线上还没回来就亮出来（`_revealOfflineScan`）；线上成功再整批取代并 `_stopOfflineScan()`，断网/逾时就留在本地结果上。断网时不必先等 socket 失败，伺服器慢时也不必对着转圈等 3.5～15 秒；
+- 有线上快取时仍然先画快取、不重复起本地扫描；`_isRequestTimeout` 仍排在 `_isNetworkFailure` 之前：本地已有非空结果时保留结果并显示可重试的逾时提示，本地也还没扫到东西时维持「請重試」画面（与 `keyword search timeout keeps results instead of going offline` 一致）；
 - 全文的超时上限从 20 秒调到 `_keywordSearchTimeout = 45 秒`（`_fetchSearchBatch` 与「載入更多」都用它），单字查询的服务端下限（约 3.5～4 秒）与慢查询的二十几秒都落在上限内；
 - `_buildKeywordSectionContent` 的空结果分支加了 `keywordSearchError == null` 条件，请求失败时不再同时宣称「找不到『X』相關經文」。
 

@@ -183,6 +183,7 @@ class ScriptureSearchResult {
     required this.passages,
     this.workId = '',
     this.pendingHits = const [],
+    this.hitCount = 0,
   });
 
   final String title;
@@ -193,7 +194,12 @@ class ScriptureSearchResult {
   final String workId;
 
   /// 尚未展開成可讀摘要的命中（離線第一段掃描的產物）。
+  ///
+  /// 第一階段每卷只留一筆（展開只需要卷號），出現次數見 [hitCount]。
   final List<OfflineHit> pendingHits;
+
+  /// 這部經的總出現次數（同一卷可能有多處）。
+  final int hitCount;
 
   bool get isDeferred => passages.isEmpty && pendingHits.isNotEmpty;
 
@@ -203,5 +209,6 @@ class ScriptureSearchResult {
         description: description,
         passages: resolved,
         workId: workId,
+        hitCount: hitCount,
       );
 }

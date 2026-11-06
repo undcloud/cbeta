@@ -291,6 +291,13 @@ var scriptureIndexStore = ScriptureIndexStore();
 /// 字符集沒有查詢用的碼位，這一卷連正文都不該讀。
 int debugSidxBodyReads = 0;
 
+/// 測試計數：段內合併區塊讀的次數。
+int debugSidxRangeReads = 0;
+
+/// 測試計數：為取得來源戳記而 stat `.json` 的次數。世代驗證過且之後沒有
+/// 寫入時，整輪掃描不該增加。
+int debugSidxStampReads = 0;
+
 /// 每 isolate 一份的 `.sidx` 記憶體快取（計價以正規化正文位元組數）。
 ///
 /// 常駐 worker 池跨搜尋重用，所以這一層真正的收益是「第二次搜常用字時不必再
@@ -349,15 +356,32 @@ void _forget(String path) {
 ///
 /// 檔案不存在或讀不到時回傳 null；呼叫端把索引當成過期、從 `.json` 重建。
 Future<int?> sidxSourceStamp(String jsonPath) async {
+  debugSidxStampReads += 1;
   try {
-    final stat = await File(jsonPath).stat();
-    // 檔案不存在時 stat 不會丟例外，而是回傳 type=notFound 的全零結果。
-    if (stat.type != FileSystemEntityType.file) return null;
-    return (stat.size * 0x9E3779B9 + stat.modified.millisecondsSinceEpoch) &
-        0xFFFFFFFF;
+    return _stampOf(await File(jsonPath).stat());
   } catch (_) {
     return null;
   }
+}
+
+/// [sidxSourceStamp] 的同步版本，只給背景 worker isolate 用。
+///
+/// worker 本來就獨占一個 isolate，同步 I/O 省掉每卷一次的事件迴圈往返；
+/// 2 萬卷實測同步讀比 async 快一個量級。
+int? sidxSourceStampSync(String jsonPath) {
+  debugSidxStampReads += 1;
+  try {
+    return _stampOf(File(jsonPath).statSync());
+  } catch (_) {
+    return null;
+  }
+}
+
+int? _stampOf(FileStat stat) {
+  // 檔案不存在時 stat 不會丟例外，而是回傳 type=notFound 的全零結果。
+  if (stat.type != FileSystemEntityType.file) return null;
+  return (stat.size * 0x9E3779B9 + stat.modified.millisecondsSinceEpoch) &
+      0xFFFFFFFF;
 }
 
 /// 卷首的經號提示行（`No. 1092 [cf. Nos. 1093-1099, 901(Fasc. 5)]`）就在

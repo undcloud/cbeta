@@ -67,11 +67,17 @@ class ScriptureVolumeStore {
     : _directoryProvider = directoryProvider ?? getApplicationSupportDirectory;
 
   static const _webKeyPrefix = 'cbeta_scripture_volume:';
+  static final RegExp _workPattern = RegExp(r'^[A-Za-z0-9]+$');
+  static final RegExp _juanPattern = RegExp(r'^\d+$');
   final Future<Directory> Function() _directoryProvider;
 
+  /// 經卷清單只跟「經卷世代」有關；兩萬卷時每次搜尋重掃目錄要上百毫秒，
+  /// 世代沒變就直接重用。任何一次寫入／清空都會推進世代或清掉這份快取。
+  List<ScriptureVolumeRef>? _refsCache;
+  int? _refsGeneration;
+
   String _validateKey(String work, String juan) {
-    if (!RegExp(r'^[A-Za-z0-9]+$').hasMatch(work) ||
-        !RegExp(r'^\d+$').hasMatch(juan)) {
+    if (!_workPattern.hasMatch(work) || !_juanPattern.hasMatch(juan)) {
       throw FormatException('無效的經卷識別碼：$work 卷 $juan');
     }
     return '$work-$juan';
@@ -132,6 +138,9 @@ class ScriptureVolumeStore {
     }
     final directory = await _cacheDirectory();
     if (!await directory.exists()) return const [];
+    final generation = await readVolumesGeneration(directory);
+    final cached = _refsCache;
+    if (cached != null && _refsGeneration == generation) return cached;
     final refs = <ScriptureVolumeRef>[];
     await for (final entity in directory.list()) {
       if (entity is! File || !entity.path.endsWith('.json')) continue;
@@ -143,6 +152,8 @@ class ScriptureVolumeStore {
         );
       }
     }
+    _refsCache = refs;
+    _refsGeneration = generation;
     return refs;
   }
 
@@ -168,8 +179,7 @@ class ScriptureVolumeStore {
     if (separator <= 0 || separator >= fileKey.length - 1) return null;
     final work = fileKey.substring(0, separator);
     final juan = fileKey.substring(separator + 1);
-    if (!RegExp(r'^[A-Za-z0-9]+$').hasMatch(work) ||
-        !RegExp(r'^\d+$').hasMatch(juan)) {
+    if (!_workPattern.hasMatch(work) || !_juanPattern.hasMatch(juan)) {
       return null;
     }
     return ScriptureVolumeRef(work: work, juan: juan);
@@ -189,10 +199,16 @@ class ScriptureVolumeStore {
       return '';
     }
     final directory = await _cacheDirectory();
+    // 先推進世代再寫檔：掃描端讀到新世代就會重新 stat；反過來（先寫檔）
+    // 若中途斷電會留下「內容已換、世代沒動」的窗口，舊索引會被誤信。
+    await bumpVolumesGeneration(directory);
     final file = File(
       '${directory.path}${Platform.pathSeparator}$fileKey.json',
     );
     await file.writeAsString(stored, flush: true);
+    // 寫入期間可能已有 listRefs 讀到「世代已前進、檔案還沒出現」的空窗，
+    // 這裡清一次，讓下一次清單重建時一定看得到這一卷。
+    _refsCache = null;
     // 經卷是真相源，`.sidx` 只是派生物；內容換了就丟（含記憶體裡那一份），
     // 下次掃描或建置佇列會重建。
     await scriptureIndexStore.deleteAt(work: volume.work, juan: volume.juan);
@@ -248,12 +264,49 @@ class ScriptureVolumeStore {
     }
     final directory = await _cacheDirectory();
     if (!await directory.exists()) return;
+    await bumpVolumesGeneration(directory);
+    _refsCache = null;
     await for (final entity in directory.list()) {
       if (entity is File && entity.path.endsWith('.json')) {
         await entity.delete();
       }
     }
     await scriptureIndexStore.clearAll();
+  }
+}
+
+String _volumesGenerationFilePath(Directory directory) =>
+    '${directory.path}${Platform.pathSeparator}.generation';
+
+/// 經卷目錄的世代：檔案長度就是寫入次數。
+///
+/// 掃描用它判斷「上次完整建索引之後，有沒有任何一卷被寫過」，不必逐卷
+/// `stat` 兩萬個 `.json`。只追加、不改寫，並發寫入也不會互相覆蓋。
+Future<void> bumpVolumesGeneration(Directory directory) async {
+  try {
+    await File(
+      _volumesGenerationFilePath(directory),
+    ).writeAsBytes(const <int>[1], mode: FileMode.append, flush: true);
+  } catch (_) {
+    // 世代檔寫不了只會讓下次掃描多做一點 stat，不影響正確性。
+  }
+}
+
+int readVolumesGenerationSync(Directory directory) {
+  try {
+    final file = File(_volumesGenerationFilePath(directory));
+    return file.existsSync() ? file.lengthSync() : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+Future<int> readVolumesGeneration(Directory directory) async {
+  try {
+    final file = File(_volumesGenerationFilePath(directory));
+    return await file.exists() ? await file.length() : 0;
+  } catch (_) {
+    return 0;
   }
 }
 

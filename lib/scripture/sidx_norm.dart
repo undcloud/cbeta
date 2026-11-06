@@ -287,7 +287,6 @@ class QueryPattern {
     required this.slotBytes,
     required this.anchorSlot,
     required this.singleBytes,
-    required this.runeSet,
   });
 
   final List<Int32List> slots;
@@ -301,9 +300,6 @@ class QueryPattern {
   /// 所有槽位都只有一個候選時的完整位元組模式，否則 null（改走錨點驗證）。
   final Uint8List? singleBytes;
 
-  /// 全部候補的碼位集合；跳卷過濾檢查它與該卷字符集的交集。
-  final Set<int> runeSet;
-
   int get slotCount => slots.length;
 
   bool get isBlank => slots.isEmpty;
@@ -312,7 +308,6 @@ class QueryPattern {
   factory QueryPattern.fromSlotCandidates(List<List<int>> candidates) {
     final slots = <Int32List>[];
     final slotBytes = <List<Uint8List>>[];
-    final runeSet = <int>{};
     for (final candidate in candidates) {
       final unique = <int>[];
       final encoded = <Uint8List>[];
@@ -320,7 +315,6 @@ class QueryPattern {
         if (unique.contains(rune)) continue;
         unique.add(rune);
         encoded.add(Uint8List.fromList(_encodeUtf8(rune)));
-        runeSet.add(rune);
       }
       if (unique.isEmpty) continue;
       slots.add(Int32List.fromList(unique));
@@ -332,7 +326,6 @@ class QueryPattern {
         slotBytes: const [],
         anchorSlot: 0,
         singleBytes: null,
-        runeSet: const {},
       );
     }
     var anchor = 0;
@@ -359,7 +352,6 @@ class QueryPattern {
       slotBytes: slotBytes,
       anchorSlot: anchor,
       singleBytes: single,
-      runeSet: runeSet,
     );
   }
 }

@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../dictionary/fodict_service.dart';
+import '../scripture/cache.dart';
 import '../scripture/models.dart';
 import '../scripture/offline_scan.dart';
 import '../search/candidates.dart';
@@ -112,6 +113,12 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   static const Duration _offlinePublishInterval = Duration(milliseconds: 300);
   Timer? _offlinePublishTimer;
   OfflineScanProgress? _pendingOfflineProgress;
+
+  /// 线上请求还没回来时，本地扫描可以先跑，但先不抢画面；超过这个延迟
+  /// 才把本地结果亮出来（快取命中或线上很快的查询就不会闪一下）。
+  static const Duration _offlineRevealDelay = Duration(milliseconds: 500);
+  Timer? _offlineRevealTimer;
+  bool _offlinePublishDeferred = false;
   ModalRoute<Object?>? _ownRoute;
   bool _offlineScanPausedByUser = false;
   bool _offlineScanPausedByLifecycle = false;
@@ -773,12 +780,25 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       resultsScrollController.jumpTo(0);
     }
     if (reuseOfflineScan) {
+      // 同一個字重送：既有會話的結果直接畫回去，不再延遲。
+      _offlinePublishDeferred = false;
+      _offlineRevealTimer?.cancel();
+      _offlineRevealTimer = null;
       _publishOfflineScan(offlineSearchSession!.current);
     }
 
     unawaited(_loadKeywordResults(query, token));
     unawaited(_loadCatalogSearchResults(query, token));
     unawaited(_loadDictionarySearchResults(query, token));
+  }
+
+  Future<bool> _hasLocalVolumes() async {
+    try {
+      return (await scriptureVolumeStore.listRefs()).isNotEmpty;
+    } catch (_) {
+      // 本地清單讀不到只影響「先亮本地結果」，不能拖累線上搜尋。
+      return false;
+    }
   }
 
   Future<void> _loadKeywordResults(String query, int token) async {
@@ -806,6 +826,11 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
           hasMore = cached.hasMore;
           _prioritizeSearchResultsByCatalog();
         });
+      } else if (await _hasLocalVolumes()) {
+        // 線上結果可能要好幾秒（常見單字伺服端就要 3.5～15 秒，斷網時連線
+        // 失敗也可能拖上幾秒）。本地先掃，500 ms 後線上還沒回來就先亮本地
+        // 結果；線上成功再整批取代，失敗就留在本地結果上。
+        unawaited(_applyOfflineKeywordResults(query, token, deferred: true));
       }
       final batch = await _searchAllInOne(query, start: 0);
       if (!mounted || token != requestToken) return;
@@ -833,8 +858,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     } catch (error) {
       if (!mounted || token != requestToken) return;
       if (isRequestTimeout(error)) {
-        // 伺服器只是慢,不代表沒有網路:保留畫面上已有的結果,讓使用者重試,
-        // 不要在第 20 秒悄悄切到本地掃描。
+        // 伺服器只是慢,不代表沒有網路。本地若已有結果就直接亮出來，並保留
+        // 逾時提示；本地也還沒掃到東西時才維持原本的「請重試」畫面。
+        _revealOfflineScan();
         setState(
           () => keywordSearchError =
               '全文搜尋逾時（等待超過 ${keywordSearchTimeout.inSeconds} 秒）：'
@@ -843,6 +869,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         return;
       }
       if (isNetworkFailure(error)) {
+        _revealOfflineScan(force: true);
         await _applyOfflineKeywordResults(query, token);
         return;
       }
@@ -944,7 +971,11 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     }
   }
 
-  Future<void> _applyOfflineKeywordResults(String query, int token) async {
+  Future<void> _applyOfflineKeywordResults(
+    String query,
+    int token, {
+    bool deferred = false,
+  }) async {
     final existing = offlineSearchSession;
     if (existing != null && existing.query == query) {
       // 這一輪的本地掃描還在跑或已掃完：把進度画回去就好，不要再建第二個會話
@@ -953,14 +984,29 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       return;
     }
     _stopOfflineScan();
+    if (deferred) {
+      _offlinePublishDeferred = true;
+      _scheduleOfflineReveal();
+    }
     final session = OfflineScanSession(query);
     offlineSearchSession = session;
     session.progress.addListener(_onOfflineScanProgress);
     await session.prepare();
+    // 等待期間線上可能已经回来并停掉了这一轮扫描，别再发布旧会话的进度。
+    if (!mounted ||
+        token != requestToken ||
+        !identical(offlineSearchSession, session)) {
+      return;
+    }
     // 先掃一塊讓首屏就有結果,其餘由會話自行連續推進,不再依賴捲動觸發。
     await session.scanChunk();
-    if (!mounted || token != requestToken) return;
+    if (!mounted ||
+        token != requestToken ||
+        !identical(offlineSearchSession, session)) {
+      return;
+    }
     _publishOfflineScan(session.current);
+    if (!identical(offlineSearchSession, session)) return;
     if (!_offlineScanPausedByUser && !_offlineScanPausedByLifecycle) {
       session.start();
     }
@@ -969,6 +1015,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   void _stopOfflineScan() {
     _offlinePublishTimer?.cancel();
     _offlinePublishTimer = null;
+    _offlineRevealTimer?.cancel();
+    _offlineRevealTimer = null;
+    _offlinePublishDeferred = false;
     _pendingOfflineProgress = null;
     _expandingOfflineWorks.clear();
     _offlineScanPausedByUser = false;
@@ -1004,6 +1053,9 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     unawaited(setOfflineKeywordSearchOnly(next));
     setState(() {});
     if (!next || submittedQuery.isEmpty) return;
+    _offlinePublishDeferred = false;
+    _offlineRevealTimer?.cancel();
+    _offlineRevealTimer = null;
     unawaited(_applyOfflineKeywordResults(submittedQuery, requestToken));
   }
 
@@ -1056,8 +1108,37 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     _publishOfflineScan(progress);
   }
 
+  void _scheduleOfflineReveal() {
+    if (_offlineRevealTimer?.isActive ?? false) return;
+    _offlineRevealTimer = Timer(
+      _offlineRevealDelay,
+      () => _revealOfflineScan(),
+    );
+  }
+
+  /// 把延迟发布的本地结果亮出来。
+  ///
+  /// [force] 为 false 时不发布空结果：线上还在等、本地也还没命中时，
+  /// 先维持转圈，免得闪一下「找不到」又被线上结果替换。
+  void _revealOfflineScan({bool force = false}) {
+    _offlineRevealTimer?.cancel();
+    _offlineRevealTimer = null;
+    if (!_offlinePublishDeferred) return;
+    final progress = _pendingOfflineProgress ?? offlineSearchSession?.current;
+    if (progress == null) return;
+    if (!force && progress.results.isEmpty) return;
+    _offlinePublishDeferred = false;
+    _pendingOfflineProgress = null;
+    _publishOfflineScan(progress);
+  }
+
   void _publishOfflineScan(OfflineScanProgress progress) {
     if (!mounted || offlineSearchSession == null) return;
+    if (_offlinePublishDeferred) {
+      _pendingOfflineProgress = progress;
+      _scheduleOfflineReveal();
+      return;
+    }
     // 被上一頁（例如閱讀器）蓋住時先留住進度,轉場結束再一次更新;
     // 否則掃描會在路由動畫期間不斷重建底下的整串結果卡,點擊最後一卷就會卡死。
     if (!(_ownRoute?.isCurrent ?? true)) {
@@ -1972,6 +2053,8 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         ..write(result.passages.length)
         ..write('/')
         ..write(result.pendingHits.length)
+        ..write('#')
+        ..write(result.hitCount)
         ..write('|');
     }
     final text = signature.toString();

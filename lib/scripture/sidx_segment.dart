@@ -16,6 +16,7 @@ const int sidxSegmentCount = 256;
 const List<int> _metaHeaderMagic = <int>[0x43, 0x53, 0x58, 0x48]; // CSXH
 const List<int> _metaRecordMagic = <int>[0x43, 0x53, 0x58, 0x52]; // CSXR
 const int _metaHeaderSize = 16;
+const String _volumesMarkerName = 'volumes.gen';
 const int _metaRecordFixedSize = 24;
 const Endian _endian = Endian.little;
 
@@ -41,9 +42,16 @@ class SidxSegmentEntry {
 
   String get key => '$work:$juan';
 
-  /// 查詢候補與本卷字符集無交集時，這卷不可能命中。
-  bool canSkip(Set<int> queryRunes) {
-    if (queryRunes.isEmpty) return true;
+  /// 詞組要求每一個槽位都至少有一個候選字出現在本卷；任一槽位全缺即
+  /// 不可能命中。單字查詢退化為「候補與本卷字符集有無交集」。
+  bool canSkipSlots(List<Int32List> slots) {
+    if (slots.isEmpty) return true;
+    final single = slots.length == 1 ? slots.first : null;
+    if (single != null && single.isEmpty) return true;
+    final matched = single == null
+        ? List<bool>.filled(slots.length, false)
+        : null;
+    var remaining = slots.length;
     var rune = 0;
     var value = 0;
     var shift = 0;
@@ -54,7 +62,17 @@ class SidxSegmentEntry {
         continue;
       }
       rune += value;
-      if (queryRunes.contains(rune)) return false;
+      if (single != null) {
+        if (single.contains(rune)) return false;
+      } else {
+        for (var slot = 0; slot < slots.length; slot++) {
+          if (matched![slot]) continue;
+          if (!slots[slot].contains(rune)) continue;
+          matched[slot] = true;
+          remaining--;
+          if (remaining == 0) return false;
+        }
+      }
       value = 0;
       shift = 0;
     }
@@ -94,10 +112,16 @@ String _segmentFileStem(int id) => 'seg-${id.toString().padLeft(4, '0')}';
 /// meta（可快取），字符集判定跳卷後才按偏移讀 blob，因此常見字的整藏掃描
 /// 只剩少量檔案開啟與順序讀取，罕見字連 blob 都不用碰。
 class SidxSegmentStore {
-  SidxSegmentStore({Future<Directory> Function()? directoryProvider})
-    : _directoryProvider = directoryProvider ?? getApplicationSupportDirectory;
+  SidxSegmentStore({
+    Future<Directory> Function()? directoryProvider,
+    this.blockingIo = false,
+  }) : _directoryProvider = directoryProvider ?? getApplicationSupportDirectory;
 
   final Future<Directory> Function() _directoryProvider;
+
+  /// 背景 worker isolate 設為 true：檔案讀取改用同步 API，省掉每卷一次
+  /// 事件迴圈往返。主 isolate 必須保持 false，否則會卡住畫面。
+  final bool blockingIo;
 
   String? _directoryPath;
 
@@ -110,6 +134,45 @@ class SidxSegmentStore {
     );
     await directory.create(recursive: true);
     return _directoryPath = directory.path;
+  }
+
+  /// 上次「完整驗證過所有卷索引」時的經卷世代；null 表示沒有可信標記。
+  Future<int?> readVolumesGenerationMarker() async {
+    if (kIsWeb) return null;
+    try {
+      final file = File(
+        '${await directoryPath()}${Platform.pathSeparator}$_volumesMarkerName',
+      );
+      if (!await file.exists()) return null;
+      return int.tryParse(await file.readAsString());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  int? readVolumesGenerationMarkerSync() {
+    if (kIsWeb) return null;
+    try {
+      final dir = _directoryPath;
+      if (dir == null) return null;
+      final file = File('$dir${Platform.pathSeparator}$_volumesMarkerName');
+      if (!file.existsSync()) return null;
+      return int.tryParse(file.readAsStringSync());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> writeVolumesGenerationMarker(int generation) async {
+    if (kIsWeb) return;
+    try {
+      final file = File(
+        '${await directoryPath()}${Platform.pathSeparator}$_volumesMarkerName',
+      );
+      await file.writeAsString('$generation', flush: true);
+    } catch (_) {
+      // 標記寫不了只會讓下次搜尋重新 stat，不影響結果。
+    }
   }
 
   Future<String> blobPath(int id) async =>
@@ -126,7 +189,7 @@ class SidxSegmentStore {
     try {
       final path = await metaPath(id);
       final file = File(path);
-      final stat = await file.stat();
+      final stat = blockingIo ? file.statSync() : await file.stat();
       if (stat.type != FileSystemEntityType.file) return null;
       final cached = _metaCache[path];
       if (cached != null &&
@@ -135,7 +198,10 @@ class SidxSegmentStore {
         _rememberMeta(path, cached);
         return cached.meta;
       }
-      final meta = decodeSidxSegmentMeta(id, await file.readAsBytes());
+      final bytes = blockingIo
+          ? file.readAsBytesSync()
+          : await file.readAsBytes();
+      final meta = decodeSidxSegmentMeta(id, bytes);
       if (meta == null) return null;
       final entry = _MetaCacheEntry(
         meta,
@@ -156,8 +222,13 @@ class SidxSegmentStore {
       final cached = _rememberReader(path);
       if (cached != null) return cached;
       final file = File(path);
-      if (!await file.exists()) return null;
-      final reader = SidxSegmentReader._(await file.open(), path);
+      if (blockingIo) {
+        if (!file.existsSync()) return null;
+      } else if (!await file.exists()) {
+        return null;
+      }
+      final handle = blockingIo ? file.openSync() : await file.open();
+      final reader = SidxSegmentReader._(handle, path, blockingIo);
       _readerCache[path] = reader;
       while (_readerCache.length > _readerCacheLimit) {
         final eldest = _readerCache.keys.first;
@@ -318,11 +389,80 @@ class SidxSegmentStore {
 /// 控制代碼由 [SidxSegmentStore.openReader] 跨塊重用，掃描時不再每塊重開
 /// 檔；同一 worker 可能同時被派到掃描與建置工作，讀寫位置必須排隊。
 class SidxSegmentReader {
-  SidxSegmentReader._(this._file, this._blobPath);
+  SidxSegmentReader._(this._file, this._blobPath, this._blockingIo);
 
   final RandomAccessFile _file;
   final String _blobPath;
+  final bool _blockingIo;
   Future<void> _gate = Future<void>.value();
+
+  /// 同一段內有多卷要讀時，合併成一次區塊讀。
+  ///
+  /// 逐卷 `setPosition + read` 在 2 萬卷時是兩萬次系統呼叫；段內需要的卷夠密
+  /// （字集判定後仍留下大半）就整段讀一次，只為零星幾卷讀 100 KB 反而浪費。
+  Future<void> prefetchVolumes(Iterable<SidxSegmentEntry> entries) {
+    final pending = <SidxSegmentEntry>[];
+    var needed = 0;
+    for (final entry in entries) {
+      if (_rememberVolume(_volumeCacheKey(entry)) != null) continue;
+      pending.add(entry);
+      needed += entry.byteLength;
+    }
+    if (pending.length < _prefetchMinVolumes) return Future<void>.value();
+    pending.sort((left, right) => left.offset.compareTo(right.offset));
+    final start = pending.first.offset;
+    final end = pending.last.offset + pending.last.byteLength;
+    final span = end - start;
+    if (span <= 0 || needed < span * _prefetchMinDensity) {
+      return Future<void>.value();
+    }
+    final next = _gate.then((_) => _readRange(pending, start, end));
+    _gate = next.then<void>((_) {}, onError: (Object _) {});
+    return next;
+  }
+
+  static const int _prefetchMinVolumes = 6;
+  static const double _prefetchMinDensity = 0.5;
+
+  String _volumeCacheKey(SidxSegmentEntry entry) =>
+      '$_blobPath@${entry.offset}:${entry.byteLength}:${entry.sourceStamp}';
+
+  Future<void> _readRange(
+    List<SidxSegmentEntry> entries,
+    int start,
+    int end,
+  ) async {
+    try {
+      final Uint8List block;
+      if (_blockingIo) {
+        _file.setPositionSync(start);
+        block = _file.readSync(end - start);
+      } else {
+        await _file.setPosition(start);
+        block = await _file.read(end - start);
+      }
+      if (block.length != end - start) return;
+      debugSidxRangeReads += 1;
+      for (final entry in entries) {
+        final local = entry.offset - start;
+        if (local < 0 || local + entry.byteLength > block.length) continue;
+        // 複製單卷，不讓快取視圖釘住整個區塊。
+        final bytes = Uint8List.fromList(
+          Uint8List.sublistView(block, local, local + entry.byteLength),
+        );
+        final volume = decodeSidxForScan(
+          bytes,
+          work: entry.work,
+          juan: entry.juan,
+        );
+        if (volume == null || volume.sourceStamp != entry.sourceStamp) continue;
+        debugSidxBodyReads += 1;
+        _cacheVolume(_volumeCacheKey(entry), volume);
+      }
+    } catch (_) {
+      // 區塊讀失敗就退回逐卷讀，不影響結果。
+    }
+  }
 
   Future<SidxScanVolume?> readVolume(SidxSegmentEntry entry) {
     final next = _gate.then((_) => _readVolume(entry));
@@ -331,13 +471,18 @@ class SidxSegmentReader {
   }
 
   Future<SidxScanVolume?> _readVolume(SidxSegmentEntry entry) async {
-    final cacheKey =
-        '$_blobPath@${entry.offset}:${entry.byteLength}:${entry.sourceStamp}';
+    final cacheKey = _volumeCacheKey(entry);
     final cached = _rememberVolume(cacheKey);
     if (cached != null) return cached;
     try {
-      await _file.setPosition(entry.offset);
-      final bytes = await _file.read(entry.byteLength);
+      final Uint8List bytes;
+      if (_blockingIo) {
+        _file.setPositionSync(entry.offset);
+        bytes = _file.readSync(entry.byteLength);
+      } else {
+        await _file.setPosition(entry.offset);
+        bytes = await _file.read(entry.byteLength);
+      }
       if (bytes.length != entry.byteLength) return null;
       debugSidxBodyReads += 1;
       final volume = decodeSidxForScan(

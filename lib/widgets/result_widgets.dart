@@ -310,11 +310,13 @@ List<ScriptureSearchResult> groupResultsByWork(
   final workIds = <String, String>{};
   final passages = <String, List<ScripturePassage>>{};
   final pending = <String, List<OfflineHit>>{};
+  final hitCounts = <String, int>{};
   for (final result in results) {
     final key = resultWorkKey(result);
     final bucket = passages[key];
     workIds.putIfAbsent(key, () => result.workId);
     pending.putIfAbsent(key, () => <OfflineHit>[]).addAll(result.pendingHits);
+    hitCounts[key] = (hitCounts[key] ?? 0) + result.hitCount;
     if (bucket == null) {
       order.add(key);
       passages[key] = List.of(result.passages);
@@ -333,6 +335,7 @@ List<ScriptureSearchResult> groupResultsByWork(
         passages: passages[key]!,
         workId: workIds[key]!,
         pendingHits: pending[key]!,
+        hitCount: hitCounts[key] ?? 0,
       ),
   ];
 }
@@ -447,8 +450,10 @@ class _WorkStickyHeaderState extends State<WorkStickyHeader>
       groups[juan]!.add(passage);
     }
     if (order.isEmpty) {
-      // 離線第一段掃描只有行號，點開才用 HTML 展開摘要。
-      final pending = widget.result.pendingHits.length;
+      // 離線第一段掃描只有卷號，點開才用 HTML 展開摘要。
+      final pending = widget.result.hitCount > 0
+          ? widget.result.hitCount
+          : widget.result.pendingHits.length;
       return [
         if (pending > 0)
           Padding(

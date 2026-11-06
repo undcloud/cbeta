@@ -2332,6 +2332,53 @@ void main() {
     }, () => client);
   });
 
+  testWidgets('线上很慢时本地结果先出现，不必等请求失败', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await scriptureVolumeStore.write(
+      const CachedScriptureVolume(
+        work: 'T0001',
+        juan: '1',
+        html:
+            '<div id="body">'
+            '<p class="juan">長阿含經卷第一</p>'
+            '<span class="lb" id="T01n0001_p0001a01"></span>'
+            '<span class="t">般若波羅蜜多心經</span>'
+            '</div>',
+      ),
+    );
+    final keywordResponse = Completer<http.Response>();
+    final client = MockClient((request) {
+      if (request.url.path == '/stable/search/all_in_one') {
+        return keywordResponse.future;
+      }
+      return Future.value(http.Response('{}', 404));
+    });
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(const CbetaSearchApp());
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField).first, '般若波羅蜜');
+      await tester.tap(find.byTooltip('搜尋經文'));
+      // 前 500 ms 先壓住，避免線上很快回來時閃一下本地結果。
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.textContaining('目前為離線模式'), findsNothing);
+
+      await tester.pump(const Duration(milliseconds: 600));
+      await tester.pump();
+      expect(find.textContaining('目前為離線模式'), findsOneWidget);
+
+      // 线上最终失败也不该把已经亮出来的本地结果收回。
+      keywordResponse.complete(http.Response('{}', 500));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('目前為離線模式'), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+    }, () => client);
+  });
+
   testWidgets('offline search scans local volumes incrementally', (
     tester,
   ) async {
