@@ -552,7 +552,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
   Future<void> _clearSearchIndexes() async {
     final removed = await scriptureIndexMaintenance.clearAllIndexes();
     if (!mounted) return;
-    setState(() => _indexStatus = '已刪除 $removed 個索引檔（經文未動），下次搜尋逐卷重建');
+    setState(() => _indexStatus = '已刪除 $removed 卷索引（經文未動），下次搜尋或重建時補回');
   }
 
   Future<void> _rebuildSearchIndexes() async {
@@ -561,7 +561,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
       _indexStatus = '正在重建索引…';
     });
     final removed = await scriptureIndexMaintenance.clearAllIndexes();
-    final head = '已刪除 $removed 個舊索引';
+    final head = '已清除 $removed 卷舊索引';
     final built = await scriptureIndexMaintenance.rebuildIndexes(
       onProgress: (done, total) {
         if (!mounted) return;

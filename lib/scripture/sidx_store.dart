@@ -129,6 +129,9 @@ class ScriptureIndexStore {
 
   final Future<Directory> Function() _directoryProvider;
 
+  /// 段式索引與一卷一檔共用同一個目錄，維護入口由此建立對應的段儲存。
+  Future<Directory> Function() get directoryProvider => _directoryProvider;
+
   /// 目錄路徑推導一次就固定；`pathFor` 每卷從搜尋到幾次，不該每次都 `create`。
   String? _directoryPath;
 

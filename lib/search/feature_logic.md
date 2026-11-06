@@ -749,14 +749,14 @@ return scriptureDisplaySettings.showSimplifiedText
 - `FodictService` 缓存已加载的词典内容，提供 `clearCache()` 供测试或数据变更后清理；
 - 全文搜索有 `_FullTextSearchCache`，按 query 缓存搜索结果快照，与候选生成无关。
 
-### 11.4 离线正文连续扫描（.sidx 索引）
+### 11.4 离线正文连续扫描（段式 .sidx 索引）
 
 **为什么要sidecar**
 
 - 实测 600 卷：读档 106 ms、`jsonDecode` 再加 185 ms、`parseScriptureHtml` 再加 2239 ms —— 九成以上的时间花在把 HTML 解析成 DOM。离线全文要的只是「一串可比对的文字」，所以扫描第一階段改读预先建好的正規化字节档，命中集合与旧实作完全一致，速度约 40～140 倍；
-- 索引目录是 `<支援目录>/cbeta_sidx/{work}-{juan}.sidx`，与经卷 `cbeta_scripture/{work}-{juan}.json` 同层。**`.json` 是真相源，`.sidx` 是派生物**，可随时删除重建；`ScriptureVolumeStore.write()` 写完经卷会顺手 `scriptureIndexStore.deleteAt()`，`clearAll()` 会连索引目录一起清掉。
+- 索引目录是 `<支援目录>/cbeta_sidx/`，与经卷 `cbeta_scripture/{work}-{juan}.json` 同层。每卷仍编码成一份 `.sidx` blob，但落地时按作品哈希写进固定 256 个段档 `seg-XXXX.csb`，旁边一份追加式清单 `seg-XXXX.csm` 记录每卷的戳记、blob 偏移与字符集。**`.json` 是真相源，整个 `cbeta_sidx/` 是派生物**，可随时删除重建；旧版一卷一档的 `{work}-{juan}.sidx` 会在首次扫描时被搬进段并删除。
 - **下载/更新完成时就建索引**：`DownloadManager._storeVolume()` 写完 `.json` 立刻把 `(work, juan, path)` 交给 `offlineIndexQueue`（批 32 卷、最多 4 批在飞），`replaceDownloadedVolumes()` 与下载结束前 `flush()`；这样第一次离线搜索不再边扫边逐卷重建（两万多卷时那是最大的卡顿来源），`index_maintenance.dart` 的 `rebuildIndexes()` 也能在「删光索引但不重下经文」的情况下重建；
-- 索引读取有**有界内存缓存**（`SidxStore` 的卷缓存 24 MB、跳卷信息 4096 条，`LinkedHashMap` LRU）：同一字重搜、或换字重扫同一批卷时不再重复 `stat` + 读档；`write`／`deleteAt`／`clearAll` 会同时失效内存副本，避免删掉索引后仍读到旧字节；
+- 索引读取有**有界内存缓存**（段清单按 16 MB 字节预算 LRU、解码后的卷缓存 24 MB、每 isolate 复用段 blob 的读取句柄）：同一字重搜、或换字重扫同一批卷时不再重复读档；清空索引会同时清掉两层内存副本并关闭句柄，避免删掉索引后仍读到旧字节；
 
 **正規化规则（写死并版本化：`sidxNormVersion`）**
 
@@ -769,6 +769,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 - 64 字节标头：magic `CSDX` | u16 `formatVersion` | u16 `normVersion` | u32 `flags` | u32 `sourceStamp` | u32 行数 | u32 区分数 | u32 字符数 | 各段长度… | u32 `headerSize=64` | u32 书名长度；
 - 段落顺序：`charset | lineTable | runTable | lineheadPool | refPool | title | text | crc32`，行记录 20 B、区段记录 16 B；末尾是整档 crc32，magic、版本、长度或 crc 任一不符就回传 null 让调用端重建；
+- 段文件 `seg-XXXX.csb` 只是上面这些 blob 的追加串接（不额外加头）；清单 `seg-XXXX.csm` 由 16 B 头（magic `CSXH`、版本、`sidxFormatVersion`、`sidxNormVersion`）加若干追加记录组成：magic `CSXR`、work/juan 长度、`sourceStamp`、blob 偏移与长度、字符集长度、work、juan、字符集、crc32。尾部写了一半的记录直接忽略；同一卷出现多次以最后一笔为准，因此更新只要追加，不必重写整段；
 - 新鲜度用 `sidxSourceStamp(jsonPath)`（来源 `.json` 的「大小 + 修改时间」摘要）：扫一卷只要一次 `stat` 就能判定索引新旧，不必读 25 KB 正文去比内容版本；档案不存在时 `stat` 不抛异常而是 `type = notFound`，一律当过期处理；
 - 正文用 UTF-8 字节保存，但 CJK 一个字符就 3 字节，字节位移可能超过 UTF-16 个数，所以 `NormedSource.toSource` 是「每个正规字节 → 所属字符的原始 UTF-16 位移」的密集表（最后一项是 `source.length`），摘要与 `sourceOffset` 都靠它换回原文；
 - 比对是字节层 Boyer-Moore-Horspool（`Uint16List(256)` skip 表）：槽位全唯一就整串 BMH；有多义槽就挑候補最少的当锚点，再向左向右逐字节验证；命中允许重叠，匹配后窗口只前进 1。
@@ -784,10 +785,12 @@ return scriptureDisplaySettings.showSimplifiedText
 
 - `OfflineScanPool` 常驻最多 `min(4, max(2, 处理器数))` 个 isolate，`Isolate.spawn` + `RawReceivePort` 握手、UI 侧共用一个 `ReceivePort`，单块 120 s 逾时就当空结果放过；
 - 池是**模块级共用**（`sharedOfflineScanPool()`／`releaseSharedOfflineScanPool()`），不属于任何一个扫描会话：换字或重送搜索会重建会话，若池跟着会话生死，一次点击就要杀四个 isolate 再生四个，重生的固定开销比扫一卷还大。只有离开搜索页（`ScriptureSearchPageState.dispose`）才释放池；扩容要排队（`_growing`），否则两个会话同时 `_ensureWorkers` 会拿到同一个 worker；
-- 块大小跟着每帧预算走（`volumesPerChunk = 24` 起步、`_batchBudgetMicros = 8000`）：一块跑得比预算快就翻倍，慢过四倍就折半，上限 2000 卷，块之间让出 4 ms，所以索引就位后块会一路长到千卷级，扫描自己推到 `finished`，不依赖卷动或按钮；
+- 块大小跟着每帧预算走（`volumesPerChunk = 24` 起步、`_batchBudgetMicros = 16000`）：一块跑得比预算快就翻倍，慢过四倍就折半，上限 2000 卷，块之间让出 4 ms，所以索引就位后块会一路长到千卷级，扫描自己推到 `finished`，不依赖卷动或按钮；
 - `flutter test` 的 fake-async 不会推进真实 isolate 的回覆，网页版也没有档案，所以 `offlineScanSupportsIsolate()` 在这两种情况下走同一份同步实作（只少了 isolate 跳板）；经卷 ref 没有 `path` 时（网页版存 SharedPreferences）由主 isolate 用 `scanOfflineVolume` 逐卷读，也不会去建 `cbeta_sidx/`；
-- 任何「只能在 UI isolate 上扫这一块」的兜底（池已释放、`parts < 2`、派工失败）都走 `runOfflineScanInline()`，它与 `runOfflineScan()` 共用 `_runOfflineScan` 但**每卷之间让出一幀**。自适应后一块可长到 2000 卷，同步扫完整块会把整个 App 顶死（Android 直接报「没有响应」），这条路径绝不能再用不分段的 `runOfflineScan`；
-- 缺索引或索引过期就在扫描的 isolate 内从 `.json` 重建（`_loadVolume`）；下载流程已经提前建好，这里只剩「下载中／旧版留下的卷」与调试删档后的兜底回填。之后每卷只剩「读标头与字符集 →（可能命中才）读正文」，罕见字查询连正文都不用打开；
+- 扫描按段分组：同一段的卷只读一次 meta、并复用同一个 blob 读取句柄；池派工**按 `segmentId % workerCount` 固定分配**，一整段永远由同一个 worker 处理——不能按每块负载重新分配，否则同一段清单会被不同 worker 轮番重读（2 万卷时清单约 31 MB，小块扫描能放大成 GB 级读）；段号只由作品名决定，所以同一部经的卷永远在同一段，结果里的卷序不会被打乱；
+- 清单里的字符集**不展开成 `Set<int>`**：`SidxSegmentEntry` 只持有 `encodeRuneSet` 的字节视图，`canSkip` 串流解 LEB128 并与查询候补比对，2 万卷的清单解码从数百毫秒降到约一百毫秒，也省掉上百 MB 的 Set 常驻；
+- 任何「只能在 UI isolate 上扫这一块」的兜底（池已释放、卷数太少、派工失败）都走 `runOfflineScanInline()`，它与 `runOfflineScan()` 共用 `_runOfflineScan` 但**每卷之间让出一幀**。自适应后一块可长到 2000 卷，同步扫完整块会把整个 App 顶死（Android 直接报「没有响应」），这条路径绝不能再用不分段的 `runOfflineScan`；
+- 缺索引或索引过期就在扫描的 isolate 内从 `.json` 重建；旧版 `.sidx` 还在时优先解码复用，避免升级后重扫整藏。新 blob 追加进对应段，meta 在该段写完后一次提交；下载流程已经提前建好，这里只剩「下载中／旧版留下的卷」与调试删档后的兜底回填。之后每卷只剩「内存字符集判跳 →（可能命中才）按偏移读 blob」，罕见字查询连 blob 都不用打开；
 - 进度透过 `ValueNotifier<OfflineScanProgress>` 回报，页面把通知合并成最多每 300 ms 一次 `setState`（`_offlinePublishInterval`），避免每一块都重建整个结果页；`loadMore()` 在离线模式直接返回，卷动不会再触发扫描；
 - 中断方式：换新搜索、`clearSearch()`、离开页面（`dispose`）都会 `_stopOfflineScan()`；App 进入后台时 `didChangeAppLifecycleState` 自动 `pause()`，回前台自动 `resume()`；用户可用正文分区的「暫停掃描／繼續掃描」按钮就地暂停（暂停只管「不再排下一块」，已交出去的那一块仍会跑完）；
 - **「看不見結果頁」等於取消 + 釋放**：結果頁被上一頁完全蓋住（`_ownRoute.secondaryAnimation.status == completed`）就 `pause()` 並 `releaseSharedOfflineScanPool()`，回到結果頁（`dismissed`）才 `resume()`，worker 由下一块掃描惰性重建；`clearSearch()` 同樣釋放池。代價是開一趟閱讀器回來要多等一次 worker 冷啟動（幾百毫秒），換來的是「使用者在讀經文時主執行緒不再被一批批經卷排著」；
@@ -796,10 +799,10 @@ return scriptureDisplaySettings.showSimplifiedText
 
 **跳卷过滤**
 
-- 每卷存精确的码位集合（`charset`，delta + LEB128 压缩，一卷通常小于 64 B），`SidxSkipInfo.canSkip(queryRunes)` 与查询候補并集完全无交集才整卷跳过；字符集是繁体侧、且取全部候補的并集，所以简体输入不会被误跳；
-- 这是两段式读取，而且**判定在第二次读之前**：`_loadVolume(target, store, pattern)` 先用 `RandomAccessFile` 只读 64 B 标头算出 charset 的位置与长度，再只读 charset；判定不过就回传 `_LoadedVolume.skipped()`，连 `.sidx` 正文都不碰（截断的 charset 会让该卷「看起来没有这些字」而误跳，宁回传 null 去重建）；
+- 每卷存精确的码位集合（`charset`，delta + LEB128 压缩，一卷通常小于 64 B）；段清单把它一起载入内存，`SidxSegmentEntry.canSkip(queryRunes)` 与查询候補并集完全无交集才整卷跳过；字符集是繁体侧、且取全部候補的并集，所以简体输入不会被误跳；
+- 判定发生在**读 blob 之前**：先读段清单（可缓存），字符集无交集就直接跳过，连段 blob 文件都不用打开；
 - 过期的索引（`sourceStamp` 与 `.json` 的 stat 不符）不参与跳卷判定 —— 内容换了字集可能变大，拿旧字符集跳卷会漏命中，所以直接走重建路径；没有档案路径的经卷（网页版）也一律实读；
-- 顺序本身是有测试盯住的：`test/offline_scan_test.dart` 的「罕見字查詢靠字符集跳卷，正文一個字節都不讀」用 `debugSidxBodyReads`（`readAt` 里的计数）先断言罕见字扫描读到 0 次正文、再对照常见字读到 4 次。
+- 顺序本身是有测试盯住的：`test/offline_scan_test.dart` 的「罕見字查詢靠字符集跳卷，正文一個字節都不讀」用 `debugSidxBodyReads`（段读取器的计数）先断言罕见字扫描读到 0 次正文、再对照常见字读到 4 次。
 
 **已知限制**
 
@@ -819,7 +822,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 - 首頁 AppBar 的雲朵按鈕切換 `offlineKeywordSearchOnly`（持久化 key `search_offline_only`，`lib/search/offline_preference.dart`）：開啟時 `_loadKeywordResults()` **不發線上請求**，直接走本地掃描（`_applyOfflineKeywordResults`）；全文搜尋頁的 `offlineMode` 也跟同一個值，避免每次搜尋都先等線上 45 秒完才落回本地；
 - 切換的當下若已有 `submittedQuery`，會立刻補跑一次本地掃描，不必等下一次搜尋；關閉後恢復「先線上、失敗才離線」的原路徑；
-- 下載管理面板底部有除錯用的「清除索引／重建索引」按鈕（`searchIndexDebugEntriesVisible`，非 const 開關）：清除只刪 `cbeta_sidx/` 不動 `.json`，重建是逐卷增量（戳記相符的卷會跳過），可以用來量測「索引到底省下多少時間」而不用重下兩萬多卷；入口穩定後把這個旗標改成 `false` 即隱藏。
+- 下載管理面板底部有除錯用的「清除索引／重建索引」按鈕（`searchIndexDebugEntriesVisible`，非 const 開關）：清除只刪 `cbeta_sidx/` 的段檔與舊 `.sidx`，不動 `.json`；重建是逐卷增量（戳記相符的卷會跳過），可以用來量測「索引到底省下多少時間」而不用重下兩萬多卷；入口穩定後把這個旗標改成 `false` 即隱藏。
 
 ### 11.5 在线全文延迟
 
@@ -878,7 +881,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - `offline search shows local catalog matches separately`：离线经目命中显示「經目搜尋結果」并可展开更多；
 - `online search keeps loading batches while scrolling`：线上第一批全部渲染、没有「顯示更多作品」按钮，卷到底自动发 `start=2` 的下一批并渲染新一部作品；
 - `scrolling reveals the next offline result groups`：离线扫描先只渲染 20 部（第 25 部看不到），卷到底自动放行第二页；因为新放的卡片会把尾端按钮挤出画面，要多卷到底一次才会出现「收合多顯示的作品」；
-- `test/offline_scan_test.dart`：端到端的离线扫描 —— `OfflineScanSession` 的分块扫描、自行连续推进到全部卷、暂停后不再排下一块（已交出的那一块仍会跑完）、恢复后从中断处继续、没有本地经卷时立即结束；索引侧覆盖「首轮建索引、次轮直接重用 `.sidx`」「经卷内容更新后戳记失效并重建」「罕见字靠字符集跳卷，不读正文」；第二段覆盖「用 HTML 展开摘要，`snippet`/`sourceOffset` 与原文对得上、上下文不会把卷题扫进来」「展开完成后摘要取代待展开命中」；查询侧覆盖简体输入匹配繁体正文、查询有无标点空格都一样命中，以及 KWIC 摘要的省略号；没有档案路径的经卷（网页版）也在当前 isolate 扫，且不会去建 `cbeta_sidx/`；
+- `test/offline_scan_test.dart`：端到端的离线扫描 —— `OfflineScanSession` 的分块扫描、自行连续推进到全部卷、暂停后不再排下一块（已交出的那一块仍会跑完）、恢复后从中断处继续、没有本地经卷时立即结束；索引侧覆盖「首轮建索引、次轮直接重用段索引」「经卷内容更新后戳记失效并重建」「罕见字靠字符集跳卷，不读正文」「段清单追加往返与半截记录容错」「同一段写入互斥」「旧版 `.sidx` 搬进段后删除」；第二段覆盖「用 HTML 展开摘要，`snippet`/`sourceOffset` 与原文对得上、上下文不会把卷题扫进来」「展开完成后摘要取代待展开命中」；查询侧覆盖简体输入匹配繁体正文、查询有无标点空格都一样命中，以及 KWIC 摘要的省略号；没有档案路径的经卷（网页版）也在当前 isolate 扫，且不会去建 `cbeta_sidx/`；
 - 重送搜索与「看不见结果頁」後的取消：`test/offline_scan_test.dart` 的「常駐池跨掃描會話重用，離開頁面釋放後才重建」盯住池的生命周期（会话换了不等于 isolate 该杀）；「主 isolate 的兜底掃描能被叫停，不會把整塊掃完」斷言 `shouldAbort` 跳起後 `scannedVolumes` 小於請求卷數（同一請求不叫停仍是全部）；「經目兜底查詢能被叫停，不會讀完全部本地經卷」同理盯 `searchOfflineCatalog`；「展開摘要時換了搜尋就停手」斷言 `expandOfflineWork(shouldAbort: () => true)` 回空而不是一卷卷解析完；`test/widget_test.dart` 的 `re-tapping the same offline search keeps the running scan` 用 300 卷本地经卷扫到中途再点一次搜索，断言 `offlineSearchSession` 仍是同一个对象、`scannedVolumes` 没有退回第一块（把 `_runKeywordSearch()` 的同字重用去掉，这条就红）；`repeat keyword search paints cached results before the API` 同時盯住輸入沒變的重複點擊——再點一次不發新請求（`keywordRequests` 仍是 1）、結果不動，而要等清空後再搜同一個字才算新搜尋，那時先用快取頂住畫面、不等 API 回覆；
 - `test/sidx_test.dart`：正規化规则（空白与标点闭集 191 码位、ASCII 小写）、跨行与重叠命中、`.sidx` 序列化往返（书名与悉曇 `code` 区间）、crc／版本不符判失效、字符集 delta+LEB128 往返、卷题/作译者/夹注/`No. xxxx [cf. ...]` 的排除、行定位表把命中换回 linehead、跳过区间重叠先合并，以及 `sidxSourceStamp` 隨檔案大小或修改時間改變；
 - `test/fodict_key_index_test.dart`：候选统计的新语义与 sidecar 生命周期 —— 同一术语在两部词典各算一笔（计数单位是条目）、大小写不影响命中、`.keys` 编解码往返（含带换行的 key）、戳记不符或档案截断判为不存在、`parseFodictKeys` 与整本解析抽出同一批 key、统计过程不载入含释义的整本（`debugFodictFullDictionaryLoads` 为 0）且重启后靠 sidecar 不再解析 `.dat`（`debugFodictKeyParses` 不增加）、sidecar 损坏时只有那一部回退重建、词典被删后重新列目录会清掉孤儿 `.keys`；

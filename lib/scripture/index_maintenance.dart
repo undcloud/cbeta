@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 
 import 'cache.dart';
 import 'offline_scan.dart';
+import 'sidx_segment.dart';
 import 'sidx_store.dart';
 
 /// 一次重建的卷數：派給常駐池的訊息次數與批大小折衷。
@@ -27,18 +28,23 @@ class ScriptureIndexMaintenance {
 
   ScriptureIndexStore get indexStore => _indexStore ?? scriptureIndexStore;
   ScriptureVolumeStore get volumeStore => _volumeStore ?? scriptureVolumeStore;
+  SidxSegmentStore get segmentStore =>
+      SidxSegmentStore(directoryProvider: indexStore.directoryProvider);
 
-  /// 清掉全部派生索引（不動經卷本體），回傳刪除的檔案數。
+  /// 清掉全部派生索引（不動經卷本體），回傳刪除的卷索引數。
   Future<int> clearAllIndexes() async {
     if (kIsWeb) return 0;
     final count = await countIndexes();
+    await segmentStore.clearAll();
     await indexStore.clearAll();
     return count;
   }
 
-  /// 目前已經存在的索引檔數；目錄還沒建立時為 0。
+  /// 目前已有索引的卷數；段式索引為空時才回退去數舊版 `.sidx`。
   Future<int> countIndexes() async {
     if (kIsWeb) return 0;
+    final segmented = await segmentStore.countVolumes();
+    if (segmented > 0) return segmented;
     try {
       final directory = Directory(await indexStore.directoryPath());
       if (!await directory.exists()) return 0;

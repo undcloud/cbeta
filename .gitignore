@@ -51,6 +51,13 @@ app.*.map.json
 fodict
 # CBETA crawler cache
 tool/.catalog_cache/
+
+# Local tooling: CBETA download scripts (contain an API key) and outputs
+tool/cbeta_download/
 tool/cbeta_all/
+tool/cbeta_html/
+
+# Local icon preprocessing tooling and source images
+tool/image_tools/
 assets/cbeta_catalog
 /cbeta-fodict/

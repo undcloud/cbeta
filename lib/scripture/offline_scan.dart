@@ -14,6 +14,7 @@ import 'cache.dart';
 import 'models.dart';
 import 'parser.dart';
 import 'sidx_norm.dart';
+import 'sidx_segment.dart';
 import 'sidx_store.dart';
 
 final _whitespacePattern = RegExp(r'\s+');
@@ -134,32 +135,118 @@ Future<OfflineScanOutcome> _runOfflineScan(
   if (pattern.isBlank || request.targets.isEmpty) {
     return OfflineScanOutcome.empty;
   }
-  final store = _indexStoreFor(request.targets);
-  final merged = <String, List<OfflineHit>>{};
-  final titles = <String, String>{};
+  final segmentStore = _segmentStoreFor(request.targets);
+  final legacyStore = _indexStoreFor(request.targets);
+  final targets = request.targets;
+  final hitsByTarget = List<List<OfflineHit>?>.filled(targets.length, null);
+  final titlesByTarget = List<String?>.filled(targets.length, null);
   var termHits = 0;
   var built = 0;
   var scanned = 0;
-  for (final target in request.targets) {
-    final loaded = await _loadVolume(target, store, pattern);
-    scanned++;
-    if (yieldBetweenVolumes) {
-      await Future<void>.delayed(Duration.zero);
-      if (shouldAbort != null && shouldAbort()) break;
+
+  outer:
+  for (final group in _groupTargetIndexesBySegment(targets)) {
+    SidxSegmentReader? reader;
+    SidxSegmentWriter? writer;
+    SidxSegmentMeta? meta;
+    try {
+      if (group.hasPaths) {
+        meta = await segmentStore.readMeta(group.segmentId);
+      }
+      for (final index in group.indexes) {
+        if (yieldBetweenVolumes) {
+          await Future<void>.delayed(Duration.zero);
+          if (shouldAbort != null && shouldAbort()) break outer;
+        }
+        final target = targets[index];
+        final stamp = target.path.isEmpty
+            ? 0
+            : (await sidxSourceStamp(target.path)) ?? 0;
+        SidxVolume? volume;
+        var fromLegacy = false;
+        final entry = target.path.isEmpty
+            ? null
+            : meta?.entryFor(target.work, target.juan);
+        if (entry != null && entry.sourceStamp == stamp) {
+          if (entry.canSkip(pattern.runeSet)) {
+            scanned++;
+            continue;
+          }
+          reader ??= await segmentStore.openReader(group.segmentId);
+          volume = await reader?.readVolume(entry);
+        }
+        if (volume == null) {
+          if (target.path.isNotEmpty) {
+            // 舊版一卷一檔的索引先拿來用，省掉一次 HTML 解析；成功寫進段後
+            // 再刪除，讓升級不必重掃整藏。
+            volume = await legacyStore.readAt(
+              work: target.work,
+              juan: target.juan,
+              sourceStamp: stamp,
+            );
+            fromLegacy = volume != null;
+          }
+          if (volume == null) {
+            final lines = await _readVolumeLines(target);
+            if (lines == null) {
+              scanned++;
+              continue;
+            }
+            volume = buildSidxVolume(
+              work: target.work,
+              juan: target.juan,
+              sourceStamp: stamp,
+              lines: lines.lines,
+            );
+            built += 1;
+          }
+          if (target.path.isNotEmpty) {
+            // 拿不到段鎖就只在記憶體裡用這份索引，下次掃描再補寫；
+            // 掃描不該為了等另一趟建置而停住。
+            writer ??= await segmentStore.beginWrite(
+              group.segmentId,
+              timeout: const Duration(milliseconds: 100),
+            );
+            final newEntry = await writer?.append(volume);
+            if (newEntry != null) {
+              meta ??= SidxSegmentMeta(group.segmentId);
+              meta.add(newEntry);
+              if (fromLegacy) {
+                unawaited(
+                  legacyStore.deleteAt(work: target.work, juan: target.juan),
+                );
+              }
+            }
+          }
+        }
+        scanned++;
+        final loaded = volume;
+        final hits = <OfflineHit>[];
+        scanNormMatches(loaded.bytes, pattern, (match) {
+          final line = loaded.lineAt(match.byteStart);
+          hits.add(
+            OfflineHit(juan: loaded.juan, linehead: line?.linehead ?? ''),
+          );
+        });
+        if (hits.isEmpty) continue;
+        termHits += hits.length;
+        hitsByTarget[index] = hits;
+        titlesByTarget[index] = loaded.title;
+      }
+    } finally {
+      await writer?.close();
+      // 讀取器由 segment store 跨塊重用，這裡不能關；清索引時才統一關閉。
     }
-    if (loaded == null) continue;
-    built += loaded.built ? 1 : 0;
-    if (loaded.skipped) continue;
-    final volume = loaded.volume!;
-    final hits = <OfflineHit>[];
-    scanNormMatches(volume.bytes, pattern, (match) {
-      final line = volume.lineAt(match.byteStart);
-      hits.add(OfflineHit(juan: volume.juan, linehead: line?.linehead ?? ''));
-    });
-    if (hits.isEmpty) continue;
-    termHits += hits.length;
-    titles.putIfAbsent(volume.work, () => volume.title);
-    merged.putIfAbsent(volume.work, () => <OfflineHit>[]).addAll(hits);
+  }
+
+  final merged = <String, List<OfflineHit>>{};
+  final titles = <String, String>{};
+  for (var index = 0; index < targets.length; index++) {
+    final hits = hitsByTarget[index];
+    if (hits == null || hits.isEmpty) continue;
+    final work = targets[index].work;
+    merged.putIfAbsent(work, () => <OfflineHit>[]).addAll(hits);
+    titles.putIfAbsent(work, () => titlesByTarget[index] ?? work);
   }
   return OfflineScanOutcome(
     groups: [
@@ -188,63 +275,39 @@ ScriptureIndexStore _indexStoreFor(List<OfflineScanTarget> targets) {
   return scriptureIndexStore;
 }
 
-class _LoadedVolume {
-  const _LoadedVolume.found(this.volume, {required this.built});
+/// 掃描時按段分組：同一段只讀一次 meta、只開一次 blob 檔。
+///
+/// 段號只由作品決定，所以同一部經的卷不會被拆開；請求內的卷序也維持不變。
+class _TargetGroup {
+  _TargetGroup(this.segmentId);
 
-  /// 字符集已判定這一卷不可能命中：正文一個字節都沒讀。
-  const _LoadedVolume.skipped() : volume = null, built = false;
-
-  final SidxVolume? volume;
-  final bool built;
-
-  bool get skipped => volume == null;
+  final int segmentId;
+  final List<int> indexes = [];
+  bool hasPaths = false;
 }
 
-/// 取一卷的可搜表示。`.sidx` 缺席或過期時就地重建，所以第一次掃描同時是回填，
-/// 之後每卷只剩「讀標頭與字符集 →（可能命中才）讀正文」。
-///
-/// 跳卷過濾必須发生在讀正文之前：字符集是繁體側且取全部候補的並集，交集為空
-/// 即可整卷跳過，簡體輸入不會被誤跳；過期的索引不能拿來跳卷（內容換了字集可能
-/// 變大），所以戳記不符時一律重建。
-Future<_LoadedVolume?> _loadVolume(
-  OfflineScanTarget target,
-  ScriptureIndexStore store,
-  QueryPattern pattern,
-) async {
-  // 戳記取自來源 `.json` 的 stat，一次系統呼叫就能判索引新舊；
-  // 沒有檔案路徑（網頁版）時不寫索引，戳記固定 0。
-  final stamp = target.path.isEmpty
-      ? 0
-      : (await sidxSourceStamp(target.path)) ?? 0;
-  if (target.path.isNotEmpty) {
-    final skip = await store.readSkipInfoAt(
-      work: target.work,
-      juan: target.juan,
-    );
-    if (skip != null && skip.sourceStamp == stamp) {
-      if (skip.canSkip(pattern.runeSet)) return const _LoadedVolume.skipped();
-      final volume = await store.readAt(
-        work: target.work,
-        juan: target.juan,
-        sourceStamp: stamp,
-      );
-      if (volume != null) {
-        return _LoadedVolume.found(volume, built: false);
-      }
-    }
+List<_TargetGroup> _groupTargetIndexesBySegment(
+  List<OfflineScanTarget> targets,
+) {
+  final groups = <int, _TargetGroup>{};
+  for (var index = 0; index < targets.length; index++) {
+    final target = targets[index];
+    final segmentId = sidxSegmentId(target.work);
+    final group = groups.putIfAbsent(segmentId, () => _TargetGroup(segmentId));
+    group.indexes.add(index);
+    if (target.path.isNotEmpty) group.hasPaths = true;
   }
-  final lines = await _readVolumeLines(target);
-  if (lines == null) return null;
-  final volume = buildSidxVolume(
-    work: target.work,
-    juan: target.juan,
-    sourceStamp: stamp,
-    lines: lines.lines,
-  );
-  if (target.path.isNotEmpty) {
-    await store.write(volume);
+  return groups.values.toList();
+}
+
+/// 段檔目錄與經卷目錄同層；worker 裡沒有 path_provider，只能由路徑反推。
+SidxSegmentStore _segmentStoreFor(List<OfflineScanTarget> targets) {
+  for (final target in targets) {
+    if (target.path.isEmpty) continue;
+    final cacheDirectory = File(target.path).parent.parent;
+    return SidxSegmentStore(directoryProvider: () async => cacheDirectory);
   }
-  return _LoadedVolume.found(volume, built: true);
+  return scriptureSidxSegmentStore;
 }
 
 class _VolumeLines {
@@ -304,27 +367,51 @@ class OfflineIndexBuildRequest {
 /// HTML。戳記相符的卷直接跳過，重跑一次同一批是無害的。
 Future<int> buildOfflineIndexBatch(List<OfflineScanTarget> targets) async {
   if (targets.isEmpty) return 0;
-  final store = _indexStoreFor(targets);
+  final segmentStore = _segmentStoreFor(targets);
+  final legacyStore = _indexStoreFor(targets);
   var built = 0;
-  for (final target in targets) {
-    if (target.path.isEmpty) continue;
-    final stamp = await sidxSourceStamp(target.path) ?? 0;
-    final existing = await store.readSkipInfoAt(
-      work: target.work,
-      juan: target.juan,
-    );
-    if (existing != null && existing.sourceStamp == stamp) continue;
-    final lines = await _readVolumeLines(target);
-    if (lines == null) continue;
-    await store.write(
-      buildSidxVolume(
-        work: target.work,
-        juan: target.juan,
-        sourceStamp: stamp,
-        lines: lines.lines,
-      ),
-    );
-    built++;
+  for (final group in _groupTargetIndexesBySegment(targets)) {
+    if (!group.hasPaths) continue;
+    // 建置與掃描共用同一把段鎖；批次內同段只開一次檔案、一次寫完 meta。
+    final writer = await segmentStore.beginWrite(group.segmentId);
+    if (writer == null) continue;
+    try {
+      final meta =
+          await segmentStore.readMeta(group.segmentId) ??
+          SidxSegmentMeta(group.segmentId);
+      for (final index in group.indexes) {
+        final target = targets[index];
+        if (target.path.isEmpty) continue;
+        final stamp = await sidxSourceStamp(target.path) ?? 0;
+        final existing = meta.entryFor(target.work, target.juan);
+        if (existing != null && existing.sourceStamp == stamp) continue;
+        var volume = await legacyStore.readAt(
+          work: target.work,
+          juan: target.juan,
+          sourceStamp: stamp,
+        );
+        final fromLegacy = volume != null;
+        if (volume == null) {
+          final lines = await _readVolumeLines(target);
+          if (lines == null) continue;
+          volume = buildSidxVolume(
+            work: target.work,
+            juan: target.juan,
+            sourceStamp: stamp,
+            lines: lines.lines,
+          );
+        }
+        final entry = await writer.append(volume);
+        if (entry == null) continue;
+        meta.add(entry);
+        built += 1;
+        if (fromLegacy) {
+          unawaited(legacyStore.deleteAt(work: target.work, juan: target.juan));
+        }
+      }
+    } finally {
+      await writer.close();
+    }
   }
   return built;
 }
@@ -758,7 +845,10 @@ class OfflineScanSession {
   static const int volumesPerChunk = 24;
   static const int maxVolumesPerChunk = 2000;
   static const Duration _chunkGap = Duration(milliseconds: 4);
-  static const int _batchBudgetMicros = 8000;
+
+  /// 一塊的目標耗時（一幀）；比這快就翻倍，慢過四倍就折半。
+  /// 段清單與讀取句柄會跨塊重用，塊太小反而讓每塊的派工開銷占比變高。
+  static const int _batchBudgetMicros = 16000;
 
   final String query;
   final ValueNotifier<OfflineScanProgress> _progress =
@@ -900,8 +990,12 @@ class OfflineScanSession {
   }
 
   void _rebuildResults() {
+    // 段式索引按段分組後，命中順序不再等於作品順序；結果仍按經號排，
+    // 分頁與「第 N 部之後」的行為才和以前一致。
+    final entries = _merged.entries.toList()
+      ..sort((left, right) => left.key.compareTo(right.key));
     _results = [
-      for (final entry in _merged.entries)
+      for (final entry in entries)
         ScriptureSearchResult(
           title: '${entry.key} ${entry.value.title}'.trim(),
           description: '離線經文 · 命中 ${entry.value.hits.length} 處',
@@ -1049,30 +1143,31 @@ class OfflineScanPool {
     if (_disposed || request.targets.isEmpty) {
       return runOfflineScanInline(request, shouldAbort: shouldAbort);
     }
-    final parts = math.min(
-      workerCount,
-      math.max(1, request.targets.length ~/ 8),
-    );
-    if (parts < 2) {
+    // 同一段固定交給同一個 worker：段清單與 blob 控制代碼才有機會跨塊命中。
+    final buckets = _bucketTargetsBySegment(request.targets, workerCount);
+    final active = [
+      for (var part = 0; part < buckets.length; part++)
+        if (buckets[part].isNotEmpty) part,
+    ];
+    if (active.isEmpty) {
       return runOfflineScanInline(request, shouldAbort: shouldAbort);
     }
-    await _ensureWorkers(parts);
+    if (active.length == 1 && request.targets.length < 8) {
+      return runOfflineScanInline(request, shouldAbort: shouldAbort);
+    }
+    await _ensureWorkers(active.last + 1);
     if (_disposed) {
       return runOfflineScanInline(request, shouldAbort: shouldAbort);
     }
-    final size = (request.targets.length + parts - 1) ~/ parts;
     final futures = <Future<OfflineScanOutcome>>[];
-    for (var part = 0; part < parts; part++) {
-      final start = part * size;
-      if (start >= request.targets.length) break;
-      final end = math.min(start + size, request.targets.length);
+    for (final part in active) {
       futures.add(
         _dispatch<OfflineScanOutcome>(
           _workers[part],
           _commandScan,
           OfflineScanRequest(
             slotCandidates: request.slotCandidates,
-            targets: request.targets.sublist(start, end),
+            targets: buckets[part],
           ),
           OfflineScanOutcome.empty,
         ),
@@ -1096,8 +1191,18 @@ class OfflineScanPool {
     );
   }
 
+  /// 建置工作排隊執行：不同批次若同時命中同一段，段鎖會讓其中一邊白等
+  /// 兩秒；下載本身在等網路，序列化建置反而更穩。
+  Future<void> _buildGate = Future<void>.value();
+
   /// 把索引建置分給現成的 worker；池已釋放或卷數太少時自己在當前 isolate 做完。
-  Future<void> runBuild(
+  Future<void> runBuild(OfflineIndexBuildRequest request, int workerCount) {
+    final next = _buildGate.then((_) => _runBuild(request, workerCount));
+    _buildGate = next.then<void>((_) {}, onError: (Object _) {});
+    return next;
+  }
+
+  Future<void> _runBuild(
     OfflineIndexBuildRequest request,
     int workerCount,
   ) async {
@@ -1105,28 +1210,30 @@ class OfflineScanPool {
       await buildOfflineIndexBatch(request.targets);
       return;
     }
-    final parts = math.min(
+    final buckets = _bucketTargetsBySegment(
+      request.targets,
       math.max(1, workerCount),
-      math.max(1, request.targets.length ~/ 8),
     );
-    await _ensureWorkers(parts);
+    final active = [
+      for (var part = 0; part < buckets.length; part++)
+        if (buckets[part].isNotEmpty) part,
+    ];
+    if (active.isEmpty) {
+      await buildOfflineIndexBatch(request.targets);
+      return;
+    }
+    await _ensureWorkers(active.last + 1);
     if (_disposed) {
       await buildOfflineIndexBatch(request.targets);
       return;
     }
-    final size = (request.targets.length + parts - 1) ~/ parts;
     final futures = <Future<int>>[];
-    for (var part = 0; part < parts; part++) {
-      final start = part * size;
-      if (start >= request.targets.length) break;
-      final end = math.min(start + size, request.targets.length);
+    for (final part in active) {
       futures.add(
         _dispatch<int>(
           _workers[part],
           _commandBuild,
-          OfflineIndexBuildRequest(
-            targets: request.targets.sublist(start, end),
-          ),
+          OfflineIndexBuildRequest(targets: buckets[part]),
           0,
         ),
       );
@@ -1227,6 +1334,24 @@ class OfflineScanPool {
     }
     _pending.clear();
   }
+}
+
+/// 按段固定分配到 worker：同一段整個掃描期間都由同一個 worker 處理，
+/// 段清單與 blob 控制代碼才能留在該 worker 的快取裡。
+///
+/// 以前每塊重新按負載分配，同一段會被不同 worker 輪流重讀 100 多 KB 的清單，
+/// 2 萬卷時讀放大的 GB 級別，正是搜索變慢的主因。
+List<List<OfflineScanTarget>> _bucketTargetsBySegment(
+  List<OfflineScanTarget> targets,
+  int parts,
+) {
+  if (targets.isEmpty) return const [];
+  if (parts <= 1) return [targets];
+  final buckets = List.generate(parts, (_) => <OfflineScanTarget>[]);
+  for (final target in targets) {
+    buckets[sidxSegmentId(target.work) % parts].add(target);
+  }
+  return buckets;
 }
 
 List<OfflineWorkGroup> _mergeGroups(List<OfflineWorkGroup> groups) {

@@ -1,10 +1,13 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:xuefo/scripture/cache.dart';
 import 'package:xuefo/scripture/index_maintenance.dart';
 import 'package:xuefo/scripture/offline_scan.dart';
 import 'package:xuefo/scripture/parser.dart';
+import 'package:xuefo/scripture/sidx_segment.dart';
+import 'package:xuefo/scripture/sidx_norm.dart';
 import 'package:xuefo/scripture/sidx_store.dart';
 import 'package:xuefo/scripture/source_text.dart';
 import 'package:xuefo/search/conversion.dart';
@@ -182,10 +185,13 @@ void main() {
     expect(session.current.results, isEmpty);
   });
 
-  test('首輪建索引、次輪直接重用 .sidx', () async {
+  test('首輪建索引、次輪直接重用段索引', () async {
     await seedVolumes(3);
     final request = requestFor('般若', await targetsFor(3));
     final indexStore = ScriptureIndexStore(
+      directoryProvider: () async => tempDir,
+    );
+    final segmentStore = SidxSegmentStore(
       directoryProvider: () async => tempDir,
     );
 
@@ -193,8 +199,12 @@ void main() {
     expect(first.groups, hasLength(3));
     expect(first.termHits, 3);
     expect(first.builtIndexes, 3);
+    expect(await segmentStore.countVolumes(), 3);
+    final metaPath = await segmentStore.metaPath(sidxSegmentId('T0001'));
+    expect(File(metaPath).existsSync(), isTrue);
+    // 新流程只寫段檔，不再留下兩萬個一卷一檔的索引。
     final sidxPath = await indexStore.pathFor(work: 'T0001', juan: '1');
-    expect(File(sidxPath!).existsSync(), isTrue);
+    expect(File(sidxPath!).existsSync(), isFalse);
 
     final second = await runOfflineScan(request);
     expect(second.termHits, 3);
@@ -597,5 +607,87 @@ void main() {
     );
     expect(passages, isNotEmpty);
     expect(passages.first.text, contains('般若波羅蜜多心經'));
+  });
+
+  test('段清單可追加往返，尾部半截記錄會被忽略', () {
+    final entry = SidxSegmentEntry(
+      work: 'T0001',
+      juan: '1',
+      sourceStamp: 9,
+      offset: 12,
+      byteLength: 34,
+      charSetBytes: encodeRuneSet({0x822C}),
+    );
+    final bytes = BytesBuilder(copy: false)
+      ..add(encodeSidxSegmentMetaHeader())
+      ..add(encodeSidxSegmentMetaRecord(entry));
+    // 模擬寫到一半斷電：多出來的幾個字節不該讓整份清單失效。
+    final meta = decodeSidxSegmentMeta(
+      3,
+      Uint8List.fromList([...bytes.toBytes(), 0x43, 0x53]),
+    );
+    expect(meta, isNotNull);
+    final decoded = meta!.entryFor('T0001', '1')!;
+    expect(decoded.sourceStamp, 9);
+    expect(decoded.offset, 12);
+    expect(decoded.byteLength, 34);
+    expect(decoded.canSkip({0x822C}), isFalse);
+    expect(decoded.canSkip({0x9999}), isTrue);
+  });
+
+  test('同一段同時只有一個寫入者', () async {
+    final store = SidxSegmentStore(directoryProvider: () async => tempDir);
+    final first = await store.beginWrite(7, timeout: Duration.zero);
+    expect(first, isNotNull);
+    expect(await store.beginWrite(7, timeout: Duration.zero), isNull);
+
+    await first!.close();
+    final again = await store.beginWrite(
+      7,
+      timeout: const Duration(seconds: 1),
+    );
+    expect(again, isNotNull);
+    await again!.close();
+    expect(await store.countVolumes(), 0);
+  });
+
+  test('舊版一卷一檔的 .sidx 會搬進段檔並刪除', () async {
+    await seedVolumes(2);
+    final targets = await targetsFor(2);
+    final indexStore = ScriptureIndexStore(
+      directoryProvider: () async => tempDir,
+    );
+    for (final target in targets) {
+      final stored = await scriptureVolumeStore.readRef(
+        ScriptureVolumeRef(
+          work: target.work,
+          juan: target.juan,
+          path: target.path,
+        ),
+      );
+      await indexStore.write(
+        buildSidxVolume(
+          work: target.work,
+          juan: target.juan,
+          sourceStamp: await sidxSourceStamp(target.path) ?? 0,
+          lines: parseScriptureHtml(stored!.html),
+        ),
+      );
+    }
+
+    final outcome = await runOfflineScan(requestFor('般若', targets));
+    // 舊索引可直接解碼重用，不必重新解析 HTML。
+    expect(outcome.builtIndexes, 0);
+    expect(outcome.termHits, 2);
+
+    final segmentStore = SidxSegmentStore(
+      directoryProvider: () async => tempDir,
+    );
+    expect(await segmentStore.countVolumes(), 2);
+    final legacyPaths = <String>[
+      for (final target in targets)
+        (await indexStore.pathFor(work: target.work, juan: target.juan))!,
+    ];
+    await _waitFor(() => legacyPaths.every((path) => !File(path).existsSync()));
   });
 }
