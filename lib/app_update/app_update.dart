@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../widgets/display_text.dart';
 
 const giteeOwner = 'undclouds';
@@ -22,6 +23,28 @@ const appUpdaterChannel = MethodChannel('xuefo/app_updater');
 const pendingUpdatePathKey = 'pending_update_apk_path';
 const pendingUpdateVersionKey = 'pending_update_version';
 
+/// 是否在啟動時自動彈出新版本提示；使用者取消一次後設為 false，
+/// 手動完成一次更新後再恢復為 true。
+const autoUpdatePromptEnabledKey = 'auto_update_prompt_enabled';
+
+Future<bool> loadAutoUpdatePromptEnabled() async {
+  try {
+    final preferences = await SharedPreferences.getInstance();
+    return preferences.getBool(autoUpdatePromptEnabledKey) ?? true;
+  } catch (_) {
+    return true;
+  }
+}
+
+Future<void> saveAutoUpdatePromptEnabled(bool enabled) async {
+  try {
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool(autoUpdatePromptEnabledKey, enabled);
+  } catch (_) {
+    // 儲存失敗只影響下次啟動是否自動提示，不影響本次使用。
+  }
+}
+
 enum InstallPermissionAction { cancel, proceed, settings }
 
 class AppUpdateInfo {
@@ -35,6 +58,47 @@ class AppUpdateInfo {
   final String downloadUrl;
   final String releaseName;
   final String releaseNotes;
+}
+
+enum AppUpdateCheckStatus { updateAvailable, upToDate, failed }
+
+class AppUpdateCheckResult {
+  const AppUpdateCheckResult(this.status, [this.info]);
+
+  const AppUpdateCheckResult.updateAvailable(AppUpdateInfo info)
+    : this(AppUpdateCheckStatus.updateAvailable, info);
+  const AppUpdateCheckResult.upToDate() : this(AppUpdateCheckStatus.upToDate);
+  const AppUpdateCheckResult.failed() : this(AppUpdateCheckStatus.failed);
+
+  final AppUpdateCheckStatus status;
+  final AppUpdateInfo? info;
+
+  bool get hasUpdate => status == AppUpdateCheckStatus.updateAvailable;
+}
+
+/// 把 Gitee release 描述（Markdown）轉成適合直接顯示的純文字。
+String releaseNotesForDisplay(String raw) {
+  var notes = raw.replaceAll('\r\n', '\n').trim();
+  if (notes.isEmpty) return '';
+  notes = notes
+      .replaceAllMapped(RegExp(r'!\[[^\]]*\]\([^)]*\)'), (_) => '')
+      .replaceAllMapped(
+        RegExp(r'\[([^\]]+)\]\([^)]*\)'),
+        (match) => match.group(1) ?? '',
+      )
+      .replaceAll(RegExp(r'<[^>]+>'), '')
+      .replaceAllMapped(
+        RegExp(r'^\s{0,3}#{1,6}\s*', multiLine: true),
+        (_) => '',
+      )
+      .replaceAllMapped(
+        RegExp(r'\*\*(.+?)\*\*'),
+        (match) => match.group(1) ?? '',
+      )
+      .replaceAllMapped(RegExp(r'__(.+?)__'), (match) => match.group(1) ?? '')
+      .replaceAllMapped(RegExp(r'`([^`]*)`'), (match) => match.group(1) ?? '')
+      .replaceAll(RegExp(r'\n{3,}'), '\n\n');
+  return notes.trim();
 }
 
 /// 從 Gitee Releases API 取得最新版本資訊。

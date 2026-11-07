@@ -15,6 +15,7 @@ import '../search/conversion.dart';
 import '../search/goto.dart';
 import '../search/history.dart';
 import '../search/offline_preference.dart';
+import '../common/app_lifecycle.dart';
 import '../common/cbeta_http_client.dart';
 import '../download/catalog_cache.dart';
 import '../download/download_status_ui.dart';
@@ -144,6 +145,8 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   bool _offlineScanHaltedByOverlay = false;
   AppUpdateInfo? _availableUpdate;
   String _currentVersion = '';
+  bool _autoUpdatePromptScheduled = false;
+  Future<AppUpdateCheckResult>? _appUpdateCheckInFlight;
   bool _isUpdating = false;
   bool _awaitingInstallPermission = false;
   bool _installLaunched = false;
@@ -174,7 +177,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     resultsScrollController.addListener(_onResultsScroll);
     _loadHomeSections();
     _fodictBaseDirTask = _loadFodictBaseDir();
-    unawaited(_checkForAppUpdate());
+    unawaited(_checkForAppUpdate(promptIfAvailable: true));
     // 經目查詢改走本地全量目錄,先暖好，第一次搜尋才不用等解析 4 MB JSON。
     unawaited(CatalogCache.instance.load().catchError((_) {}));
     // 離線模式要在第一次搜尋前就知道狀態；main() 已先載入，這裡再保險一次。
@@ -367,8 +370,29 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     }
   }
 
-  Future<void> _checkForAppUpdate() async {
-    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+  Future<AppUpdateCheckResult> _checkForAppUpdate({
+    bool promptIfAvailable = false,
+  }) {
+    final existing = _appUpdateCheckInFlight;
+    if (existing != null) return existing;
+    final future = _runAppUpdateCheck(promptIfAvailable: promptIfAvailable);
+    _appUpdateCheckInFlight = future;
+    unawaited(
+      future.whenComplete(() {
+        if (identical(_appUpdateCheckInFlight, future)) {
+          _appUpdateCheckInFlight = null;
+        }
+      }),
+    );
+    return future;
+  }
+
+  Future<AppUpdateCheckResult> _runAppUpdateCheck({
+    required bool promptIfAvailable,
+  }) async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      return const AppUpdateCheckResult.upToDate();
+    }
     try {
       final packageInfo = await PackageInfo.fromPlatform();
       final info = await fetchLatestGiteeRelease(
@@ -382,15 +406,34 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       if (!hasUpdate) {
         await _clearPendingUpdate();
       }
-      if (!mounted) return;
-      setState(() {
-        _currentVersion = packageInfo.version;
-        _availableUpdate = hasUpdate ? info : null;
-        _pendingInstallApkPath = pendingPath;
-      });
+      if (mounted) {
+        setState(() {
+          _currentVersion = packageInfo.version;
+          _availableUpdate = hasUpdate ? info : null;
+          _pendingInstallApkPath = pendingPath;
+        });
+      }
+      if (hasUpdate) {
+        if (promptIfAvailable) _scheduleAutoUpdatePrompt();
+        return AppUpdateCheckResult.updateAvailable(info);
+      }
+      return const AppUpdateCheckResult.upToDate();
     } catch (_) {
-      // 檢查更新失敗時保持安靜，避免影響正常使用。
+      // 檢查更新失敗時保持安靜，避免影響正常使用；手動檢查會回報失敗。
+      return const AppUpdateCheckResult.failed();
     }
+  }
+
+  void _scheduleAutoUpdatePrompt() {
+    if (_autoUpdatePromptScheduled) return;
+    _autoUpdatePromptScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      if (!await loadAutoUpdatePromptEnabled() || !mounted) return;
+      final route = _ownRoute;
+      if (route != null && !route.isCurrent) return;
+      unawaited(_promptForAppUpdate(fromAutoPrompt: true));
+    });
   }
 
   Future<String?> _restorePendingUpdateApk(String version) async {
@@ -433,22 +476,65 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     }
   }
 
-  Future<void> _promptForAppUpdate() async {
+  Future<void> _promptForAppUpdate({bool fromAutoPrompt = false}) async {
     final info = _availableUpdate;
-    if (info == null || _isUpdating) return;
+    if (info == null || _isUpdating || !mounted) return;
+    final notes = releaseNotesForDisplay(info.releaseNotes);
+    final releaseName = info.releaseName.trim();
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: Text('發現新版本 ${info.version}'),
-        content: Text(
-          '目前版本：${_currentVersion.isEmpty ? '未知' : _currentVersion}\n\n'
-          '將從 Gitee 下載最新 APK 並覆蓋安裝，'
-          '已下載的經文與偏好設定都會保留。',
+        content: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: 480,
+            maxHeight: MediaQuery.sizeOf(dialogContext).height * 0.55,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '目前版本：${_currentVersion.isEmpty ? '未知' : _currentVersion}',
+                ),
+                if (releaseName.isNotEmpty && releaseName != info.version) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    releaseName,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ],
+                if (notes.isNotEmpty) ...[
+                  const SizedBox(height: 14),
+                  const Text(
+                    '更新內容',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(notes),
+                ],
+                const SizedBox(height: 14),
+                const Text(
+                  '將從 Gitee 下載最新 APK 並覆蓋安裝，'
+                  '已下載的經文與偏好設定都會保留。',
+                ),
+                if (fromAutoPrompt) ...[
+                  const SizedBox(height: 8),
+                  const Text(
+                    '取消後將不再自動提示更新，'
+                    '你仍可在「介面設定」中手動檢查；'
+                    '手動完成一次更新後會恢復自動提示。',
+                  ),
+                ],
+              ],
+            ),
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('稍後'),
+            child: const Text('取消'),
           ),
           FilledButton(
             onPressed: () => Navigator.pop(dialogContext, true),
@@ -457,7 +543,11 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         ],
       ),
     );
-    if (confirmed != true || !mounted) return;
+    if (confirmed != true) {
+      if (fromAutoPrompt) await saveAutoUpdatePromptEnabled(false);
+      return;
+    }
+    if (!mounted) return;
     await _performAppUpdate(info);
   }
 
@@ -465,10 +555,12 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
     if (_isUpdating || !mounted) return;
 
     // 若先前已下載同一版本，直接沿用，避免重複下載。
+    // 使用者主動下載更新後，恢復啟動時自動提示新版本。
     final cachedApk =
         _pendingInstallApkPath ?? await _restorePendingUpdateApk(info.version);
     if (cachedApk != null && await File(cachedApk).exists()) {
       _pendingInstallApkPath = cachedApk;
+      await saveAutoUpdatePromptEnabled(true);
       await _installDownloadedApk(cachedApk);
       return;
     }
@@ -507,6 +599,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       dialogOpen = false;
     }
     _pendingInstallApkPath = apkPath;
+    await saveAutoUpdatePromptEnabled(true);
     await _rememberPendingUpdate(apkPath, info.version);
     if (!mounted) return;
     setState(() => _isUpdating = false);
@@ -1559,10 +1652,18 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   @override
   Widget build(BuildContext context) {
     final settings = scriptureDisplaySettings;
+    // Android 根頁面的返回鍵只把 App 退到背景，避免中斷下載、更新與索引重建。
+    final backgroundOnBack =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
     return PopScope<Object?>(
-      canPop: submittedQuery.isEmpty,
+      canPop: !backgroundOnBack && submittedQuery.isEmpty,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && submittedQuery.isNotEmpty) clearSearch();
+        if (didPop) return;
+        if (submittedQuery.isNotEmpty) {
+          clearSearch();
+        } else if (backgroundOnBack) {
+          unawaited(moveTaskToBack());
+        }
       },
       child: Scaffold(
         backgroundColor: settings.backgroundColor,
@@ -1591,6 +1692,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
             SettingsButton(
               availableUpdate: _availableUpdate,
               onUpdate: _promptForAppUpdate,
+              onCheckUpdate: () => _checkForAppUpdate(),
             ),
             SizedBox(width: 8),
           ],
@@ -1823,14 +1925,10 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
           ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
           textAlign: TextAlign.center,
         ),
-        const SizedBox(height: 8),
-        Text(
-          '點擊左上角選單，選擇一部佛經開始閱讀',
-          textAlign: TextAlign.center,
-          style: Theme.of(context).textTheme.bodyMedium,
-        ),
         const SizedBox(height: 4),
         Text(
+          '左上角選單可下載經文與詞典\n'
+          '雲朵圖示切換在線／本地搜尋 · 右上角切換簡繁體\n'
           '支援部類、冊別、作譯者、年代等多種瀏覽方式',
           textAlign: TextAlign.center,
           style: Theme.of(

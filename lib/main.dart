@@ -13,6 +13,7 @@ import 'download/download_notifications.dart';
 import 'download/download_status_ui.dart';
 import 'download/update_manager.dart';
 import 'home/home_page.dart';
+import 'scripture/index_update_notification.dart';
 import 'scripture/index_update_service.dart';
 import 'search/conversion.dart';
 import 'search/offline_preference.dart';
@@ -63,6 +64,9 @@ Future<void> main() async {
   await indexUpdateService.initialize();
   indexUpdateService.isBusy = () =>
       downloadManager.isDownloading || updateManager.isUpdating;
+  indexUpdateNotification.otherTaskActive = () =>
+      downloadManager.isDownloading || updateManager.isUpdating;
+  indexUpdateNotification.initialize();
   downloadNotifications
     ..initialize()
     ..onOpenDownloadManager = _openDownloadManagerFromNotification;

@@ -23,7 +23,15 @@ App 主页 `ScriptureSearchPage`（类名沿用历史，实为首页状态机）
   为未被引用的旧页面（见 `lib/search/feature_logic.md`）；
 - 书签与最近阅读：`reader/reader_store.dart` 的 `loadBookmarks` /
   `readingHistoryKey`，`HomeHistorySection` 分页展示；
-- 自动更新：`app_update/app_update.dart`，检查结果喂给 `SettingsButton` 角标。
+- 自动更新：`app_update/app_update.dart`。启动时 `_checkForAppUpdate(promptIfAvailable: true)`
+  检查一次；有新版本会在首帧后自动弹窗（每次启动最多一次），弹窗展示
+  Gitee Release 描述清洗后的「更新內容」。自动弹窗点「取消」会持久关闭后续自动提示
+  （`auto_update_prompt_enabled=false`），只能从设置手动检查/更新；手动更新成功
+  下载一次后恢复自动提示。检查结果同时喂给 `SettingsButton`，设置弹层底部的
+  更新按钮常显：有新版绿色、无新版灰色，可手动复查。
+- Android 根页面返回键：不结束行程，改由 `PopScope` 调用
+  `common/app_lifecycle.dart` 的 `moveTaskToBack()` 把整个 Task 退到背景；
+  有搜尋結果時仍先清空搜尋。下載、經文更新、重建索引因此可繼續在背景執行。
 
 ## 注意
 

@@ -9,10 +9,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/material.dart' as material;
 import 'package:flutter/rendering.dart' show RenderParagraph;
-import 'package:flutter/services.dart' show SystemChannels;
+import 'package:flutter/services.dart' show MethodChannel, SystemChannels;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -264,6 +265,28 @@ void main() {
     expect(isNewerVersion('v1.0.0', '1.0'), isFalse);
     expect(isNewerVersion('1.0.0', '1.0.1'), isFalse);
     expect(isNewerVersion('2.0', '1.9.9'), isTrue);
+  });
+
+  test('release notes markdown is converted to plain text', () {
+    expect(
+      releaseNotesForDisplay(
+        '## 更新\r\n'
+        '- **新增** [說明](https://example.com)\r\n'
+        '![截圖](shot.png)\r\n'
+        '`v1.2.3`',
+      ),
+      '更新\n- 新增 說明\n\nv1.2.3',
+    );
+    expect(releaseNotesForDisplay('   '), '');
+  });
+
+  test('auto update prompt preference defaults on and persists', () async {
+    SharedPreferences.setMockInitialValues({});
+    expect(await loadAutoUpdatePromptEnabled(), isTrue);
+    await saveAutoUpdatePromptEnabled(false);
+    expect(await loadAutoUpdatePromptEnabled(), isFalse);
+    await saveAutoUpdatePromptEnabled(true);
+    expect(await loadAutoUpdatePromptEnabled(), isTrue);
   });
 
   test('scripture HTML preserves CBETA lines and decodes visible text', () {
@@ -2221,6 +2244,102 @@ void main() {
     );
   });
 
+  testWidgets('settings update button is green when a release exists', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => TextButton(
+              onPressed: () => showDisplaySettings(
+                context,
+                availableUpdate: const AppUpdateInfo(
+                  version: '9.9.9',
+                  downloadUrl: 'https://example.com/app.apk',
+                  releaseName: '9.9.9',
+                  releaseNotes: '修正問題',
+                ),
+                onUpdate: () {},
+                onCheckUpdate: () async =>
+                    const AppUpdateCheckResult.upToDate(),
+              ),
+              child: const Text('open'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    final label = find.text('更新 9.9.9');
+    await tester.scrollUntilVisible(
+      label,
+      200,
+      scrollable: find.byType(Scrollable).last,
+    );
+    expect(label, findsOneWidget);
+    final button = tester.widget<TextButton>(
+      find.ancestor(of: label, matching: find.byType(TextButton)),
+    );
+    expect(
+      button.style?.backgroundColor?.resolve(<WidgetState>{}),
+      const Color(0xFF176B67),
+    );
+  });
+
+  testWidgets('settings update button reports when already up to date', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    var checks = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => TextButton(
+              onPressed: () => showDisplaySettings(
+                context,
+                onCheckUpdate: () async {
+                  checks++;
+                  return const AppUpdateCheckResult.upToDate();
+                },
+                onUpdate: () {},
+              ),
+              child: const Text('open'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    final label = find.text('檢查更新');
+    await tester.scrollUntilVisible(
+      label,
+      200,
+      scrollable: find.byType(Scrollable).last,
+    );
+    final button = tester.widget<TextButton>(
+      find.ancestor(of: label, matching: find.byType(TextButton)),
+    );
+    expect(
+      button.style?.backgroundColor?.resolve(<WidgetState>{}),
+      isNot(const Color(0xFF176B67)),
+    );
+    await tester.tap(label);
+    await tester.pumpAndSettle();
+    expect(checks, 1);
+    expect(find.text('目前已是最新版本'), findsOneWidget);
+  });
+
   testWidgets('about dialog shows project, data source, and contact details', (
     tester,
   ) async {
@@ -3632,6 +3751,36 @@ void main() {
       );
     }, () => client);
   });
+
+  testWidgets(
+    'system back on the empty homepage moves the app to the background',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await scriptureDisplaySettings.load();
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      try {
+        const channel = MethodChannel('xuefo/app_lifecycle');
+        final messenger = tester.binding.defaultBinaryMessenger;
+        var movedToBack = 0;
+        messenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'moveTaskToBack') movedToBack++;
+          return true;
+        });
+        addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+        await tester.pumpWidget(const CbetaSearchApp());
+        await tester.pumpAndSettle();
+
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+
+        expect(movedToBack, 1);
+        expect(find.text('歡迎使用 Fodian 經典閱讀'), findsOneWidget);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    },
+  );
 
   testWidgets(
     'clearing recent reading asks for confirmation and keeps offline texts',

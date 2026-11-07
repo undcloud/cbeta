@@ -15,7 +15,11 @@
 - `ScriptDisplayScope`：`InheritedNotifier<ScriptureDisplaySettings>`，
   `dependOn(context)` 让自定义 `Text` 等组件订阅设定变化；
 - `ScriptDisplayButton`：首页/阅读器工具栏的「繁/简」快速切换按钮；
-- `SettingsButton`：首页设定按钮，带 `availableUpdate` 更新角标与回调；
+- `SettingsButton`：首页设定按钮，透传 `availableUpdate` / `onUpdate` /
+  `onCheckUpdate`；设置弹层底部的更新按钮常显（首页入口）——有新版为绿色并显示
+  版本号，无新版为灰色「檢查更新」；点击灰色按钮会重新检查并弹窗提示
+  「目前已是最新版本」或「检查更新失败」。自动提示被取消后，这里仍可手动检查/更新，
+  手动更新成功一次会恢复启动自动提示；
 - `AppVersionLabel`：弹层底部当前版本（`package_info_plus`）。
 
 ## 注意

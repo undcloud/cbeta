@@ -20,6 +20,7 @@ import java.io.FileInputStream
 class MainActivity : FlutterActivity() {
     private val channelName = "xuefo/app_updater"
     private val downloadChannelName = "xuefo/download_notifications"
+    private val lifecycleChannelName = "xuefo/app_lifecycle"
     private var downloadChannel: MethodChannel? = null
     private var pendingOpenDownloadManager = false
 
@@ -122,6 +123,15 @@ class MainActivity : FlutterActivity() {
         ) {
             intent.removeExtra(DownloadForegroundService.EXTRA_OPEN_DOWNLOAD_MANAGER)
             pendingOpenDownloadManager = true
+        }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            lifecycleChannelName,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "moveTaskToBack" -> result.success(moveTaskToBack(true))
+                else -> result.notImplemented()
+            }
         }
     }
 

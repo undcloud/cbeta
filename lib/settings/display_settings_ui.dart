@@ -13,6 +13,7 @@ Future<void> showDisplaySettings(
   BuildContext context, {
   AppUpdateInfo? availableUpdate,
   VoidCallback? onUpdate,
+  Future<AppUpdateCheckResult> Function()? onCheckUpdate,
 }) {
   return showModalBottomSheet<void>(
     context: context,
@@ -24,6 +25,7 @@ Future<void> showDisplaySettings(
           onAbout: () => showAbout(context),
           availableUpdate: availableUpdate,
           onUpdate: onUpdate,
+          onCheckUpdate: onCheckUpdate,
         ),
       ),
     ),
@@ -61,11 +63,13 @@ class _DisplaySettingsPanel extends StatelessWidget {
     required this.onAbout,
     this.availableUpdate,
     this.onUpdate,
+    this.onCheckUpdate,
   });
 
   final VoidCallback onAbout;
   final AppUpdateInfo? availableUpdate;
   final VoidCallback? onUpdate;
+  final Future<AppUpdateCheckResult> Function()? onCheckUpdate;
 
   @override
   Widget build(BuildContext context) {
@@ -247,27 +251,14 @@ class _DisplaySettingsPanel extends StatelessWidget {
                   Padding(
                     padding: const EdgeInsets.only(top: 16, bottom: 8),
                     child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Expanded(child: Center(child: const AppVersionLabel())),
-                        if (availableUpdate != null && onUpdate != null)
-                          TextButton(
-                            onPressed: onUpdate,
-                            style: TextButton.styleFrom(
-                              minimumSize: const Size(0, 28),
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                              ),
-                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                              backgroundColor: const Color(0xFF176B67),
-                              foregroundColor: Colors.white,
-                              textStyle: const TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            child: const Text('更新'),
-                          ),
+                        const Expanded(child: AppVersionLabel()),
+                        const SizedBox(width: 12),
+                        _UpdateButton(
+                          availableUpdate: availableUpdate,
+                          onUpdate: onUpdate,
+                          onCheckUpdate: onCheckUpdate,
+                        ),
                       ],
                     ),
                   ),
@@ -313,17 +304,132 @@ class _AppVersionLabelState extends State<AppVersionLabel> {
   }
 
   @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.only(top: 16, bottom: 8),
-    child: Center(
-      child: Text(
-        displayText('目前版本：${_version ?? '載入中…'}', context),
-        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-          color: Theme.of(context).colorScheme.onSurfaceVariant,
-        ),
+  Widget build(BuildContext context) => Align(
+    alignment: Alignment.centerLeft,
+    child: Text(
+      displayText('目前版本：${_version ?? '載入中…'}', context),
+      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+        color: Theme.of(context).colorScheme.onSurfaceVariant,
       ),
     ),
   );
+}
+
+/// 顯性顯示的更新入口：有新版為綠色，無新版為灰色；
+/// 點擊時重新檢查並回報「已是最新版本」或檢查失敗。
+class _UpdateButton extends StatefulWidget {
+  const _UpdateButton({
+    this.availableUpdate,
+    this.onUpdate,
+    this.onCheckUpdate,
+  });
+
+  final AppUpdateInfo? availableUpdate;
+  final VoidCallback? onUpdate;
+  final Future<AppUpdateCheckResult> Function()? onCheckUpdate;
+
+  @override
+  State<_UpdateButton> createState() => _UpdateButtonState();
+}
+
+class _UpdateButtonState extends State<_UpdateButton> {
+  AppUpdateInfo? _update;
+  bool _checking = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _update = widget.availableUpdate;
+  }
+
+  Future<void> _handlePressed() async {
+    if (_checking) return;
+    if (_update != null) {
+      widget.onUpdate?.call();
+      return;
+    }
+    final check = widget.onCheckUpdate;
+    if (check == null) {
+      await _showNotice('目前已是最新版本');
+      return;
+    }
+    setState(() => _checking = true);
+    final result = await check();
+    if (!mounted) return;
+    setState(() {
+      _checking = false;
+      _update = result.info;
+    });
+    switch (result.status) {
+      case AppUpdateCheckStatus.updateAvailable:
+        if (widget.onUpdate != null) {
+          widget.onUpdate!();
+        } else {
+          await _showNotice('發現新版本 ${result.info?.version ?? ''}');
+        }
+      case AppUpdateCheckStatus.upToDate:
+        await _showNotice('目前已是最新版本');
+      case AppUpdateCheckStatus.failed:
+        await _showNotice('檢查更新失敗，請稍後再試');
+    }
+  }
+
+  Future<void> _showNotice(String message) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('檢查更新'),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.availableUpdate == null &&
+        widget.onUpdate == null &&
+        widget.onCheckUpdate == null) {
+      return const SizedBox.shrink();
+    }
+    final theme = Theme.of(context);
+    final hasUpdate = _update != null;
+    final background = hasUpdate
+        ? const Color(0xFF176B67)
+        : theme.colorScheme.surfaceContainerHighest;
+    final foreground = hasUpdate
+        ? Colors.white
+        : theme.colorScheme.onSurfaceVariant;
+    final label = _checking
+        ? '檢查中…'
+        : hasUpdate
+        ? '更新 ${_update!.version}'
+        : '檢查更新';
+    return TextButton.icon(
+      onPressed: _checking ? null : _handlePressed,
+      icon: Icon(
+        hasUpdate ? Icons.system_update_alt_rounded : Icons.refresh_rounded,
+        size: 16,
+      ),
+      label: Text(label),
+      style: TextButton.styleFrom(
+        minimumSize: const Size(0, 30),
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        backgroundColor: background,
+        foregroundColor: foreground,
+        disabledBackgroundColor: background,
+        disabledForegroundColor: foreground,
+        textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+      ),
+    );
+  }
 }
 
 class _SettingLabel extends StatelessWidget {
@@ -393,10 +499,16 @@ class _BackgroundChip extends StatelessWidget {
 }
 
 class SettingsButton extends StatelessWidget {
-  const SettingsButton({super.key, this.availableUpdate, this.onUpdate});
+  const SettingsButton({
+    super.key,
+    this.availableUpdate,
+    this.onUpdate,
+    this.onCheckUpdate,
+  });
 
   final AppUpdateInfo? availableUpdate;
   final VoidCallback? onUpdate;
+  final Future<AppUpdateCheckResult> Function()? onCheckUpdate;
 
   @override
   Widget build(BuildContext context) => IconButton(
@@ -405,6 +517,7 @@ class SettingsButton extends StatelessWidget {
       context,
       availableUpdate: availableUpdate,
       onUpdate: onUpdate,
+      onCheckUpdate: onCheckUpdate,
     ),
     icon: const Icon(Icons.settings_outlined),
   );
