@@ -26,7 +26,10 @@ class ParsedDictionary {
   int get length => keys.length;
 }
 
-Map<String, String> _parseFodictEntries(Uint8List data) {
+Map<String, String> _parseFodictEntries(
+  Uint8List data, {
+  bool keysOnly = false,
+}) {
   if (data.length < 64) return <String, String>{};
 
   final contentStart = ByteData.sublistView(data).getUint32(32, Endian.little);
@@ -43,7 +46,12 @@ Map<String, String> _parseFodictEntries(Uint8List data) {
       FodictService._readUint32(data, contentStart + 4 + firstKwLen) == 0) {
     FodictService._loadSpecialFormat(data, contentStart, entries);
   } else {
-    FodictService._loadStandardFormat(data, contentStart, entries);
+    FodictService._loadStandardFormat(
+      data,
+      contentStart,
+      entries,
+      keysOnly: keysOnly,
+    );
   }
   return entries;
 }
@@ -65,7 +73,7 @@ ParsedDictionary parseFodictData(Uint8List data) {
 /// key 是從正文句讀切出來的，規則分叉會讓候選統計和字典分區對不上。
 /// 分開的意義只在於不必把十餘 MB 釋義跨 isolate 複製回來。
 List<String> parseFodictKeys(Uint8List data) {
-  final entries = _parseFodictEntries(data);
+  final entries = _parseFodictEntries(data, keysOnly: true);
   return [for (final key in entries.keys) key.toLowerCase()];
 }
 
@@ -124,6 +132,9 @@ class FodictService {
   /// 統計就會把字典分區剛讀進來的釋義擠出去，兩個功能互相重解析同一批 `.dat`。
   /// key 本身很小（030 丁福保 31366 條不到 1 MB），所以不需要上限。
   final Map<String, FodictKeyIndex> _keyIndexCache = {};
+
+  /// 正在載入中的 key 索引，避免預熱與查詢重複解析同一部 `.dat`。
+  final Map<String, Future<FodictKeyIndex?>> _keyIndexLoads = {};
 
   static const _dictionaryNames = {
     '001.dfb-j': '佛學大辭典',
@@ -236,11 +247,13 @@ class FodictService {
 
     dicts.sort((a, b) => a.id.compareTo(b.id));
     _dictionaries = dicts;
+    final installedIds = {for (final dict in dicts) dict.id};
+    _keyIndexCache.removeWhere((id, _) => !installedIds.contains(id));
     // sidecar 統一放在 `_keys` 目錄，詞典目錄被整包刪除時不會跟著走；
     // 只有在重新列目錄時順手清掉孤兒，卸掉的詞典才不會留殘檔。
     await fodictKeyStore.sweepOrphans(
       baseDir: baseDir,
-      installedIds: {for (final dict in dicts) dict.id},
+      installedIds: installedIds,
     );
     return dicts;
   }
@@ -309,7 +322,26 @@ class FodictService {
   ///
   /// 只有最後一條路會碰 `.dat`，所以寫過 sidecar 之後，候選統計只剩讀
   /// 幾 KB 到幾百 KB 的小檔，也不必把釋義搬進快取。
-  Future<FodictKeyIndex?> _loadKeyIndex(FodictInfo dict, String baseDir) async {
+  ///
+  /// 同一部詞典的重複請求共用同一個 Future：開頁時背景預熱與使用者當下的
+  /// 查詢可能同時要 key 索引，不共用就會把同一份 `.dat` 解析兩次。
+  Future<FodictKeyIndex?> _loadKeyIndex(FodictInfo dict, String baseDir) {
+    final inFlight = _keyIndexLoads[dict.id];
+    if (inFlight != null) return inFlight;
+    final future = _loadKeyIndexUncached(dict, baseDir);
+    _keyIndexLoads[dict.id] = future;
+    return future.whenComplete(() {
+      // clearCache 之後可能已經有新的載入在同一個 id 上，不能誤刪。
+      if (identical(_keyIndexLoads[dict.id], future)) {
+        _keyIndexLoads.remove(dict.id);
+      }
+    });
+  }
+
+  Future<FodictKeyIndex?> _loadKeyIndexUncached(
+    FodictInfo dict,
+    String baseDir,
+  ) async {
     final stamp = await _sourceStampFor(dict);
     if (stamp == null) return null;
     final cached = _keyIndexCache[dict.id];
@@ -338,11 +370,50 @@ class FodictService {
     return index;
   }
 
+  /// 這部詞典是否有 key 包含 [lowerQuery]。
+  ///
+  /// 這與 [searchByKey] 的命中規則完全相同，所以結果為 false 的詞典再怎麼
+  /// 解析也不可能貢獻條目；用它先篩掉大部分詞典是字典查詢的主要加速點。
+  Future<bool> _hasKeyMatch(
+    FodictInfo dict,
+    String baseDir,
+    String lowerQuery,
+  ) async {
+    final index = await _loadKeyIndex(dict, baseDir);
+    if (index == null) return false;
+    for (final key in index.lowerKeys) {
+      if (key.contains(lowerQuery)) return true;
+    }
+    return false;
+  }
+
+  /// 背景預熱全部詞典的 key sidecar。
+  ///
+  /// 已建好 sidecar 的詞典只做一次 `stat`，不會重讀 `.dat`；未建過的才會
+  /// 解析並寫檔。放在開頁時跑，第一次字典查詢就不必臨時逐部解析。
+  Future<void> warmKeyIndexes(String baseDir) async {
+    final List<FodictInfo> dicts;
+    try {
+      dicts = await getDictionaries(baseDir);
+    } catch (_) {
+      return;
+    }
+    for (final dict in dicts) {
+      try {
+        await _loadKeyIndex(dict, baseDir);
+      } catch (_) {
+        // 單部詞典預熱失敗不影響其他詞典。
+      }
+      await Future<void>.delayed(Duration.zero);
+    }
+  }
+
   static void _loadStandardFormat(
     Uint8List data,
     int startOffset,
-    Map<String, String> entries,
-  ) {
+    Map<String, String> entries, {
+    bool keysOnly = false,
+  }) {
     var offset = startOffset;
     while (offset + 8 <= data.length) {
       final kwLen = _readUint32(data, offset);
@@ -362,10 +433,12 @@ class FodictService {
         break;
       }
 
-      final defBytes = data.sublist(defStart, defStart + defLen);
-      final definition = _decodeUtf16LE(defBytes);
-
-      entries[keyword] = definition;
+      if (keysOnly) {
+        entries[keyword] = '';
+      } else {
+        final defBytes = data.sublist(defStart, defStart + defLen);
+        entries[keyword] = _decodeUtf16LE(defBytes);
+      }
       offset = defStart + defLen;
     }
   }
@@ -650,6 +723,10 @@ class FodictService {
     for (final dict in dicts) {
       if (results.length >= maxResults) break;
       try {
+        // 先看 key 索引再決定要不要解析釋義。字典庫常裝到 40 部以上，
+        // 對「沒有這個詞」的詞典整本解析（含跨 isolate 複製）正是數秒延遲的來源。
+        if (!await _hasKeyMatch(dict, baseDir, lowerQuery)) continue;
+
         final parsed = await _loadDictionary(dict);
         final keys = parsed.keys;
         final lowerKeys = parsed.lowerKeys;
@@ -671,9 +748,10 @@ class FodictService {
         }
       } catch (e) {
         continue;
+      } finally {
+        // 多部詞典之間讓出一幀,避免掃描串聯成不可中斷的長任務。
+        await Future<void>.delayed(Duration.zero);
       }
-      // 多部詞典之間讓出一幀,避免掃描串聯成不可中斷的長任務。
-      await Future<void>.delayed(Duration.zero);
     }
 
     return results;
@@ -702,9 +780,19 @@ class FodictService {
     return null;
   }
 
+  /// 清掉目錄與含釋義的 LRU，但保留 key 索引。
+  ///
+  /// key 索引自帶 `fodict.dat` 的來源戳記，詞典換版時會自行失效，所以列目錄、
+  /// 安裝完成這類「可能換了詞典」的時機不必讓全部 sidecar 重讀一遍。
+  void clearDictionaryCache() {
+    _cache.clear();
+    _dictionaries = null;
+  }
+
   void clearCache() {
     _cache.clear();
     _keyIndexCache.clear();
+    _keyIndexLoads.clear();
     _dictionaries = null;
   }
 }

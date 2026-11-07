@@ -638,7 +638,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 用 `searchByKey` 做 key 包含匹配，并过滤到当前选中的词典。使用第一个有结果的写法；如果发生了替换，结果提示会附带「已用「...」查询」。这个实际使用的写法就是写入 `search_selections` 的值，输入框也会同步更新为该写法。
 
-`FodictService` 会缓存已加载的词典内容；这里扫描的是词典 key，不读取经文。
+`FodictService` 会缓存已加载的词典内容；这里扫描的是词典 key，不读取经文。查询前会先用 key 索引排除没有命中的词典，只有可能命中的词典才整本解析释义；打开侧栏时后台预建 `.keys` sidecar。
 
 词典结果条目点击后在侧栏内就地展开/收起释义（不弹窗）。词条名与释义都使用 `_scriptureTextStyle(scriptureDisplaySettings)`，与首页字典结果一致跟随显示设置的字号、字体与行高。在展开的释义中选中文字会弹出自定义工具栏：**全選／查詞典／複製**；点「查詞典」会把所选文字写入输入框，并**立即以该文字执行查询**（等同按下「搜尋」按钮），侧栏结果列表随即更新为新词的搜索结果。
 
@@ -840,6 +840,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - 因此 `_loadKeywordResults` 采用 stale-while-revalidate：先发 `_searchAllInOne`，但只要 `FullTextSearchCache.get(query, offline: false)` 有上次的線上快照就立刻用它的 `results` / `nextStart` / `totalFound` / `totalTermHits` / `hasMore` 顶住画面（并把 `isLoading` 关掉），API 回来后整批取代并重新 `remember`；同一个字再查第二次时不再面对空白转圈；
 - `_FullTextSearchCache` 是静态 Map，测试之间会互相污染，所以提供 `debugReset()`，并由档案外的 `resetFullTextSearchCache()` 在 `setUp` 调用；
 - 词典候选统计（`countKeyMatches`）已改为只读 key 索引：首次建 sidecar 约 278 ms、之后重启约 30 ms、同进程重复统计约 12 ms（9 部词典、去重后 75302 条 key 实测；改写前冷启动约 435 ms）。它从来不是搜索慢的原因，改的理由是省掉「统计把辞典正文挤出 LRU → 字典分区重解析」这笔互相拖累的账。
+- 字典分区查询（`searchByKey`）同样先用 key 索引预筛：41 部词典里没有 key 命中的不再整本解析。28 部真实词典实测，无命中/冷门词从「所有词典整本解析」降到 49 ms（重启后，sidecar 已存在）/ 6 ms（同进程），命中 1 部的冷门词 38 ms；命中多部、凑满 200 笔的常见词仍需解析命中的几部（约 230–260 ms）。
 
 ### 11.6 逾时语义与经目本地回答
 

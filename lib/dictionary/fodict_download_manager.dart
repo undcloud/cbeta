@@ -297,7 +297,7 @@ class FodictDownloadManager extends ChangeNotifier {
     }
     _installedIds.remove(id);
     await _prefs?.remove('$_installedPrefix$id');
-    FodictService().clearCache();
+    FodictService().clearDictionaryCache();
     _installRevision++;
     notifyListeners();
     return true;
@@ -326,7 +326,7 @@ class FodictDownloadManager extends ChangeNotifier {
         _queue.removeWhere((item) => item.id == task.id);
         await _saveQueue();
         _installRevision++;
-        FodictService().clearCache();
+        FodictService().clearDictionaryCache();
         _currentTask = null;
 
         if (_pauseRequested) {

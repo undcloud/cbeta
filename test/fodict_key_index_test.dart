@@ -190,6 +190,20 @@ void main() {
     expect(debugFodictKeyParses, 1, reason: '只有讀回失敗的那部需要重建');
   });
 
+  test('searchByKey 先看 key 索引：沒有命中的詞典不解析釋義', () async {
+    writeDictionary(dictA, {'獨有測試詞': '第一'});
+    writeDictionary(dictB, {'另一個詞': '第二'});
+
+    final results = await service.searchByKey(baseDir.path, '獨有測試詞');
+
+    expect(results.map((entry) => entry.dictionaryId), [dictA]);
+    expect(
+      debugFodictFullDictionaryLoads,
+      1,
+      reason: 'dictB 的 key 沒有命中，不該把整本釋義搬進快取',
+    );
+  });
+
   test('詞典刪除後重新列目錄會清掉孤兒 sidecar', () async {
     writeDictionary(dictA, {'般若': '智慧'});
     writeDictionary(dictB, {'波羅蜜多': '到彼岸'});

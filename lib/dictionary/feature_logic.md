@@ -30,6 +30,20 @@
 - **三份缓存，由便宜到昂贵**：内存 `FodictKeyIndex` →
   `<词典目录>/_keys/<id>.keys` sidecar → 解析 `.dat` 重建。
   `_loadKeyIndex` 依这个顺序走；只有最后一条路才碰 `.dat`。
+- **`searchByKey` 先按 key 预筛**：解析一部词典前先查它的 key 索引；key
+  没有命中的词典不可能贡献结果，直接跳过。过去 41 部词典每次查询都逐部
+  整本解析（含跨 isolate 复制释义），这是数秒延迟的主因。预筛后，没有
+  命中的查询只扫 key，只有真正命中的词典才解析释义。
+- **开页预热**：`_refreshDictionaries` 列出词典后在后台调用
+  `warmKeyIndexes` 备妥 `.keys` sidecar（已存在只做一次 `stat`）。
+  `_keyIndexLoads` 让同一部词典的重复请求共用同一个 Future，后台预热与
+  使用者当下的查询不会把同一份 `.dat` 解析两次。
+- `parseFodictKeys` 以 `keysOnly` 模式解析标准格式词典：只解 key、跳过
+  释义解码，建 sidecar 的成本约减半；key 抽取规则仍与 `parseFodictData`
+  共用，不会分叉。
+- `clearDictionaryCache()` 只清释义 LRU 与目录、保留 key 索引：key 索引
+  自带来源戳记，词典换版时会自行失效。安装／删除词典与列目录都走这条，
+  避免每安装一部就把全部 sidecar 重读一遍。
 - **不共用语义缓存**：释义仍走 `FodictService._cache`（LRU 只有 2 条）。
   两边分开前，统计要扫全部词典，会把字典分区刚读进来的正文全部挤出 LRU，
   于是下一次搜索两边都在重解析同一批 `.dat`（冷启动的主要成本）。
@@ -55,6 +69,12 @@
 - **实测耗时**（9 部词典、去重后 75302 条 key，本机 `flutter test` 环境）：
   改写前「整本解析 + 并集 + 小写化」435 ms、每次扫描 10 ms；
   改写后首次建 sidecar 278 ms、App 重启后 30 ms、同进程重复统计 12 ms。
+- **字典查询耗时**（28 部本地词典 + 内建 030，同一台机器）：key sidecar
+  冷建 274 ms；`searchByKey` 对无命中词重启后 49 ms、同进程 6 ms；命中
+  1 部的冷门词 38 ms；命中多部、凑满 200 笔的常见词约 230–260 ms（命中
+  的几部词典仍要整本解析释义）。改动前无命中/冷门词会把所有词典都整本
+  解析一遍，本机合计 482 ms，装置上还要叠加 41 次 isolate 启动与跨
+  isolate 复制，实测量到约 6 秒。
 - 测试计数：`debugFodictKeyParses`（真的解析过几次 `.dat`）与
   `debugFodictFullDictionaryLoads`（载入过几次含释义的整本），
   由 `test/fodict_key_index_test.dart` 用来钉住「统计不读正文、sidecar 命中不再解析」。

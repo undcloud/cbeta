@@ -545,9 +545,11 @@ class _WorkPickerPageState extends State<WorkPickerPage>
     final baseDir = _fodictBaseDir;
     if (baseDir == null) return;
     try {
-      _fodictService.clearCache();
+      _fodictService.clearDictionaryCache();
       final dicts = await _fodictService.getDictionaries(baseDir);
       if (!mounted) return;
+      // 先在背景把 key sidecar 備妥，第一次字典查詢才不必逐部解析 `.dat`。
+      unawaited(_fodictService.warmKeyIndexes(baseDir));
       final ids = dicts.map((dictionary) => dictionary.id).toSet();
       final oldIds = availableDictionaries
           .map((dictionary) => dictionary.id)
