@@ -65,3 +65,6 @@
 - 词库文件较大，勿在 widget 测试里同步加载（资产加载约定见根 AGENTS.md）。
 - 单元测试要收窄范围时传 `dictionaryIds`，否则 `getDictionaries` 会连内建 030
   一起列出（枚举时要 `rootBundle.load` 那份 5.8 MB 资产以取长度）。
+- 候选命中数统计（`countKeyMatches`）只扫编号 **028 之后**的词典；
+  001–028 的词典 key 是简体，对繁体经文候选没有参考价值。`dictionaryIds`
+  只在这个范围内再收窄，不能把 001–028 重新纳入。

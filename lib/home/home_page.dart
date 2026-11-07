@@ -873,14 +873,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       } catch (_) {
         // 歷史記錄損壞時不影響搜尋。
       }
-      query = await resolveSearchQuery(
-        rawInput,
-        selections: selections,
-        keyMatchCounter: _fodictBaseDir == null
-            ? null
-            : (candidates) =>
-                  _fodictService.countKeyMatches(_fodictBaseDir!, candidates),
-      );
+      query = await resolveSearchQuery(rawInput, selections: selections);
     }
     if (query.isEmpty) return;
     if (!mounted || token != requestToken) return;

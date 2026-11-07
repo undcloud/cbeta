@@ -109,6 +109,21 @@ void main() {
     expect(counts['心經'], 0);
   });
 
+  test('候選計數跳過 001–028 的簡體 key 詞典', () async {
+    const simplifiedDict = '001.test-simplified';
+    const traditionalDict = '030.test-traditional';
+    writeDictionary(simplifiedDict, {'般若': '智慧'});
+    writeDictionary(traditionalDict, {'般若': 'prajñā'});
+
+    final counts = await service.countKeyMatches(
+      baseDir.path,
+      ['般若'],
+      dictionaryIds: {simplifiedDict, traditionalDict},
+    );
+
+    expect(counts['般若'], 1, reason: '001 的簡體 key 不計入，只算 030');
+  });
+
   test('大小寫不影響 key 命中', () async {
     writeDictionary(dictA, {'Buddha': '覺者'});
 

@@ -256,7 +256,7 @@ Future<String> preferredQueryForInput(String rawInput);
 - `convertPreferred` 不读取历史，只按词表顺序返回第一个候选；
 - `preferredQueryFor` **先查精确历史选择**，只有原始输入与 `search_selections` key 完全相同时才返回历史选中的查询词；否则返回 `convertCandidates(...).candidates.first`；
 - `preferredQueryForInput` 读取 `search_selections` 后调用 `preferredQueryFor`，读取失败时忽略历史；
-- 首页和词典的最终查询词由 `resolveSearchQuery` 决定（见 5.5），它还会比较词典 key 命中数；
+- 首页和词典的最终查询词由 `resolveSearchQuery` 决定（见 5.4）：选中候选或精确历史优先，否则取候选框第一项；
 - 「选择佛经 → 经目查询」按钮使用 `preferredQueryForInput`；
 - 作译者输入框的 `onChanged` 使用 `convertPreferred` 即时过滤列表；
 - AI 页面使用 `convert(input)`，即无历史的首选候选。
@@ -325,15 +325,15 @@ Future<String> preferredQueryForInput(String rawInput);
 
 只有调用方传入 `keyMatchCounter` 时才会统计和排序：
 
-- 首页：非 AI 模式且已取得词典目录时传入，统计范围为**全部可用词典**（不再限定内建 `assetDictionaryIds`）；AI 模式或目录不可用时不统计；
-- 词典查询：始终传入，同样统计**全部可用词典**，`countScope` 只以词典目录为准；
+- 首页：非 AI 模式且已取得词典目录时传入，统计范围为**编号 028 之后的词典**（001–028 的词典 key 是简体，对繁体经文候选没有参考价值；当前实际只有内建 030 丁福保）；AI 模式或目录不可用时不统计；
+- 词典查询：始终传入，同样只统计编号 028 之后的词典，`countScope` 只以词典目录为准；
 - 卷内搜索、经目查询、作译者查询：不传入。
 
 统计流程：
 
 1. 候选面板每次刷新时，对尚未缓存的候选去重后收集；
 2. 延迟 **180 ms** 防抖，避免每次按键都扫描词典；
-3. 调用 `FodictService.countKeyMatches`（不传 `dictionaryIds`），按全部词典 key 统计包含匹配（大小写不敏感，计数单位是条目）；
+3. 调用 `FodictService.countKeyMatches`（不传 `dictionaryIds`），按编号 028 之后的词典 key 统计包含匹配（大小写不敏感，计数单位是条目）；001–028 的简体 key 词典一律跳过；
 4. 成功后把缺失候选补 0；失败时保留原有顺序且不显示次数；
 5. 结果按候选 query 缓存；`countScope` 或 `keyMatchCounter` 可用性变化时清空缓存和防抖计时器；
 6. 空输入的历史列表不统计。
@@ -345,7 +345,7 @@ Future<String> preferredQueryForInput(String rawInput);
 - 任一非固定候选还没有命中数时，整个列表保持原顺序，避免闪烁；
 - 命中数显示在候选副标题中，如 `字典 12`。
 
-`resolveSearchQuery` 在没有用户选择而用命中数自动挑词时，遵循同样的优先级：先取繁体／混排候选中命中数最高者，其次才是简体／中性候选（`history.dart`）。
+命中数**不参与实际查询词的决定**。用户未选择候选时，`resolveSearchQuery` 直接取候选框第一项（即首選候选），并把它同步到输入框显示；命中数只影响面板中非固定候选的排序与显示。
 
 这些次数只来自**本地佛学词典的 key**，与经文正文统计无关。
 
@@ -365,7 +365,8 @@ Future<String> preferredQueryForInput(String rawInput);
 - **点击历史行**：输入框保留历史原始输入，待搜索 query 使用 `search_selections` 保存的实际搜索词；同样在填充后立即提交；
 - **按搜索按钮/键盘搜索键**：
   - 如果当前输入等于待搜索选择的 `rawInput` 或 `query`，直接提交待搜索选择；
-  - 否则用 `resolveSearchQuery` 重新解析（见 5.5）；
+  - 否则用 `resolveSearchQuery` 重新解析（见 5.5），即取候选框第一项；
+  - 实际查询词与输入框文字不同时，输入框同步显示实际查询词（AI 模式没有候选面板，不改动）；
 - **光标/选区变化**：只有文字没有变化时保留待搜索选择；
 - **修改文字**：清除待搜索选择，并通知父组件 `onSelectionChanged(null)`；
 - **清空输入**：如果仍有焦点且有历史记录，浮层切换为历史列表，而不是直接隐藏；
@@ -445,7 +446,6 @@ Future<String> resolveSearchQuery(
   String rawInput, {
   String? selectedQuery,
   Map<String, String>? selections,
-  KeyMatchCounter? keyMatchCounter,
 });
 ```
 
@@ -453,13 +453,9 @@ Future<String> resolveSearchQuery(
 
 1. `selectedQuery` 非空：直接使用（用户点击候选/历史后产生的选择）；
 2. 精确历史匹配命中：使用 `search_selections` 中与原始输入完全相同 key 对应的值；
-3. 否则取 `convertCandidates(rawInput).candidates.first`；
-4. 如果传入了 `keyMatchCounter` 且候选多于 1 个，统计全部候选的词典 key 命中数：
-   - 繁体／混排候选整体优先于简体／中性候选（与 4.4 的重排一致）；
-   - 同组内选命中数最高的候选；命中数相同或同分时保留首选；
-   - 统计抛异常时退回首选。
+3. 否则取 `convertCandidates(rawInput).candidates.first`，也就是候选框第一项（首選候选）。
 
-首页只在「非 AI 模式且 `_fodictBaseDir != null`」时传入计数器（统计范围为全部可用词典，见 9.2）；词典查询始终传入。其他 `SearchInput` 入口没有计数器，因此只执行第 1～3 步。
+词典 key 命中数不参与查询词解析，只用于候选面板的排序与显示（见 4.4）。
 
 `preferredQueryFor` 是第 1～3 步的同步版本（无用户选择、先精确历史后首选），供经目查询等入口使用。
 
@@ -469,14 +465,14 @@ Future<String> resolveSearchQuery(
 
 | 入口 | 输入组件 | 候选面板 | 实际查询 | 记录 | Goto |
 |---|---|---|---|---|---|
-| 首页关键字搜索 | `SearchInput` | 有，实时，含词典 key 命中数 | 选中候选 / 精确历史 / 首选 + key 命中统计 | history + selection | 转换前先判断并执行 |
+| 首页关键字搜索 | `SearchInput` | 有，实时，含词典 key 命中数 | 选中候选 / 精确历史 / 候选框第一项 | history + selection | 转换前先判断并执行 |
 | 首页 AI 模式 | 首页 `SearchInput` + AI 页面 `TextField` | 首页非空时关闭；AI 页无 | 首页把原始输入交给 AI 页；AI 页用 `convert` 首选 | 首页写 raw/raw | 首页在进入 AI 前判断 |
 | 首页全文/经目结果 | 同上 | 有，实时 | 选中候选 / 精确历史 / 首选 + key 命中统计 | 同上 | 同上 |
 | 卷内搜索 | `SearchInput` | 有，实时 | 选中候选 / 精确历史 / 首选 | 仅 selection | 不执行；Goto 形状输入也会抑制候选 |
 | 经目查询（选择佛经） | `SearchInput` | 有，实时 | 选中候选 / 历史 / `preferredQueryForInput` | 仅 selection | 不执行 |
 | 作译者查询（选择佛经） | `SearchInput` | 有，实时 | 选中候选；输入时用 `convertPreferred` 过滤列表 | 仅 selection | 不执行 |
 | Goto 查询（选择佛经） | 普通 `TextField` | 无 | `normalizeCbetaGotoLinehead` + `/juans/goto` | 不记录 | 始终执行 |
-| 词典查询（选择佛经） | `SearchInput` | 有，实时，含词典 key 命中数 | 选中候选 / 精确历史 / `resolveSearchQuery` + key 命中统计 | history + selection | 不执行 |
+| 词典查询（选择佛经） | `SearchInput` | 有，实时，含词典 key 命中数 | 选中候选 / 精确历史 / 候选框第一项 | history + selection | 不执行 |
 | 离线全文搜索 | 首页搜索框 | 与在线相同 | 与在线相同 | 与首页相同 | 同首页 |
 
 补充：
@@ -615,7 +611,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 `FodictService.countKeyMatches(baseDir, candidates)`：
 
-- 首页与词典查询都**不传 `dictionaryIds`**，即按全部可用词典的 key 统计（不再限定内建 030）；参数保留给测试收窄范围；
+- 首页与词典查询都**不传 `dictionaryIds`**，但无论是否传，001–028 的简体 key 词典都会被跳过；只统计编号 028 之后的词典（当前即内建 030 丁福保）。`dictionaryIds` 参数用于在这个范围内进一步收窄（主要给测试使用）；
 - 计数单位是**条目**，不是不重复术语：同一术语被两部词典各收一次算 2 笔（早期实现用 `Set` 合并 key，把这一条当成了隐含需求，既没有文档也没有测试支持，且逼着每次统计都物化整批词典的 key 并集）；
 - 对每个候选统计 `key.contains(candidate)` 的条数（大小写不敏感），外层走一遍 key、内层比对全部候选；空候选直接给 0，否则 `contains('')` 会把全部 key 算进去；
 - 返回 `candidate -> count`。
@@ -630,7 +626,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 1. 用户选中的候选（`SearchSelection.query`）；
 2. `search_selections` 的精确历史匹配；
-3. `resolveSearchQuery` 用首选 + 词典 key 命中数选出更优候选。
+3. 候选框第一项（`convertCandidates(rawInput).candidates.first`，即首選候选）。
 
 如果用户**明确点选**了候选（`SearchSelection.isExplicit == true`），词典查询只使用所选文字本身，不再尝试简繁变体；即使该写法没有 key 命中，也不会静默改用另一种写法。这样「云 → 雲」的明确选择不会被回退成简体「云」，记录和输入框也保持「雲」。
 
@@ -659,7 +655,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 - 内建词典从 `assets/fodict/030.dila-dingfubao` 加载（`FodictService.assetDictionaryIds` 目前只有这一部）；
 - 其余词典（含 001.dfb-j 佛學大辭典）都作为可下载词典，从 Gitee Release 清单取得，用户下载后存进应用文档目录下的 `fodict` 子目录；
-- 首页与词典查询的**候选 key 命中计数器对全部可用词典统计**（不再限定 `assetDictionaryIds`），并按「繁体优先、各组按命中数从大到小」重排（见 4.4）；
+- 首页与词典查询的**候选 key 命中计数器只统计编号 028 之后的词典**（001–028 是简体 key，跳过；当前实际只有内建 030），并按「繁体优先、各组按命中数从大到小」重排（见 4.4）；
 - 如果系统无法提供文档目录，工作选择器仍会加载内建词典，并使用空目录字符串查询，不会因为 `path_provider` 失败而无法打开词典页；
 - 内建词典以 App 的 `FodictService.assetDictionaryIds`（当前只有 030）为准，选择器不再相信远程清单的 `bundled` 栏位；012/013/014 已从内建改为可下载词典；
 - 词典是否「可下載」由 `FodictCatalogService._parse` 只看**是否存在受信任（gitee/github）的 `download_url`** 判定（`available = trustedUrl`），**完全忽略遠端清單的 `bundled`／`available` 欄位**（这两个栏位在线上的清单曾出现与事实相反的情况）；「內建」一律以 App 的 `FodictService.assetDictionaryIds`（`fodictDownloadManager.isBundled`）为准；因此只要词典有有效下载链接就不会再显示「尚未上傳」，012/013/014 显示 尚未上傳 的根因是**仓库里部署的 `fodict_manifest.json` 是旧版**（把 012/013/014 标成 `bundled:true/available:false`），需要重新生成并 push 到 gitee origin 与 github 两个 remote；
@@ -742,7 +738,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 - `SearchInput` 加载 `search_history` / `search_selections` 失败时按空数据继续；
 - `resolveSearchQuery` / `preferredQueryForInput` 读取 `search_selections` 失败时忽略历史；
-- `keyMatchCounter` 抛异常时退回首选候选，不阻塞搜索；
+- `keyMatchCounter` 抛异常时保留候选原顺序且不显示次数，不阻塞搜索；
 - 首页加载首页区块失败时会显示 SnackBar（「載入閱讀記錄失敗」），但搜索本身仍可继续；
 - 应用文档目录不可用时，工作选择器与首页字典分区仍使用空目录加载内建词典（见 9.5）；
 - 首页字典分区检索失败时只在该分区显示错误，关键字与经目结果继续展示；
@@ -878,7 +874,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - `homepage toggles persisted simplified text display`：`convert`、`convertCandidates`、`toSimplified`/`toSimplifiedAll`、`toTraditionalDisplay` 的典型结果与简繁显示切换；
 - `live search input shows history and candidate choices`：空输入历史、实时候选、原始输入标记、标签随显示模式转换、点击候选立即提交、光标变化后按搜索键仍提交原始输入；
 - `candidate rows show and sort by dictionary key hits`：词典命中数显示、固定候选保持前两位、其余按次数排序；
-- `search query resolution prioritizes selection, exact history, and hits`：选中候选 > 精确历史 > 首选；命中数更高时覆盖首选；统计异常退回首选；全简体候选标记；
+- `search query resolution prioritizes selection, exact history, and the first candidate`：选中候选 > 精确历史 > 候选框第一项（词典命中数不参与）；全简体候选标记；
 - `searches are saved and can be selected again`：首页写入 `search_history`、清空后重新聚焦显示历史、点击历史立即再次搜索；
 - `homepage ambiguous simplified input offers candidates`：多候选面板、点击候选立即搜索；
 - `multi-character ambiguous input offers cross-product candidates`：`厂丑` 的四个组合与延迟提交；

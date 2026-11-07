@@ -2169,6 +2169,39 @@ void main() {
     displayMode.dispose();
   });
 
+  testWidgets(
+    'submitting without choosing uses and shows the first candidate',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await SimplifiedTraditionalConverter.load();
+      final controller = TextEditingController();
+      SearchSelection? selection;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SearchInput(
+              controller: controller,
+              recentSearches: const [],
+              onSearch: (value) => selection = value,
+            ),
+          ),
+        ),
+      );
+
+      await tester.enterText(find.byType(TextField), '厂丑');
+      await tester.pumpAndSettle();
+      await tester.testTextInput.receiveAction(TextInputAction.search);
+      await tester.pumpAndSettle();
+
+      expect(selection?.rawInput, '厂丑');
+      expect(selection?.query, '廠丑');
+      expect(controller.text, '廠丑');
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      controller.dispose();
+    },
+  );
+
   group('matchHistoricalSelection 只接受精確匹配', () {
     setUp(() async {
       SharedPreferences.setMockInitialValues({});
@@ -2214,6 +2247,12 @@ void main() {
         await resolveSearchQuery('佛', selections: selections),
         (await resolveSearchQuery('佛', selections: const {})),
       );
+    });
+
+    test('未選擇候選時取候選框第一項', () async {
+      expect(await resolveSearchQuery('佛', selections: const {}), '佛');
+      expect(await resolveSearchQuery('后', selections: const {}), '后');
+      expect(await resolveSearchQuery('发', selections: const {}), '發');
     });
 
     test('preferredQueryFor 沒有精確歷史命中時改用簡繁轉換', () {

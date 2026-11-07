@@ -159,6 +159,20 @@ class FodictService {
 
   static const assetDictionaryIds = ['030.dila-dingfubao'];
 
+  /// 001–028 的詞典 key 是簡體，對繁體經文候選沒有參考價值；
+  /// 候選命中數只統計編號在 028 之後的詞典（內建 030 丁福保等）。
+  static const _lastSimplifiedKeyDictionaryNumber = 28;
+
+  static int? _dictionaryNumber(String id) {
+    final match = RegExp(r'^(\d+)').firstMatch(id);
+    return match == null ? null : int.tryParse(match.group(1)!);
+  }
+
+  static bool _countsTowardCandidates(FodictInfo dict) {
+    final number = _dictionaryNumber(dict.id);
+    return number == null || number > _lastSimplifiedKeyDictionaryNumber;
+  }
+
   static Future<String> defaultBaseDir() async {
     final directory = await getApplicationDocumentsDirectory();
     return '${directory.path}${Platform.pathSeparator}fodict';
@@ -578,15 +592,19 @@ class FodictService {
   ///
   /// 計數單位是條目而不是不重複術語：同一術語被兩部詞典各收一次算 2 筆。
   /// 這條路徑只讀 key 索引（見 [_loadKeyIndex]），不會把含釋義的詞典搬進快取。
+  /// 001–028 的簡體 key 詞典一律不計入，見 [_lastSimplifiedKeyDictionaryNumber]。
   Future<Map<String, int>> countKeyMatches(
     String baseDir,
     List<String> candidates, {
     Set<String>? dictionaryIds,
   }) async {
     final dicts = await getDictionaries(baseDir);
-    final scoped = dictionaryIds == null
-        ? dicts
-        : dicts.where((dict) => dictionaryIds.contains(dict.id)).toList();
+    final scoped = dicts
+        .where(
+          (dict) => dictionaryIds == null || dictionaryIds.contains(dict.id),
+        )
+        .where(_countsTowardCandidates)
+        .toList();
 
     // 空候選會讓 `contains('')` 命中全部 key，直接給 0。
     final needles = [

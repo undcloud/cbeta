@@ -1693,11 +1693,7 @@ class _WorkPickerPageState extends State<WorkPickerPage>
       } catch (_) {
         // 歷史記錄損壞時仍可查詢。
       }
-      query = await resolveSearchQuery(
-        raw,
-        selections: selections,
-        keyMatchCounter: _dictionaryKeyMatchCounter,
-      );
+      query = await resolveSearchQuery(raw, selections: selections);
     }
     if (query.isEmpty || !mounted) return;
     FocusScope.of(context).unfocus();

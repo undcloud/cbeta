@@ -85,12 +85,14 @@ String? matchHistoricalSelection(
 typedef KeyMatchCounter =
     Future<Map<String, int>> Function(List<String> candidates);
 
-/// 依「選中候選 → 精確歷史選擇 → 首選候選＋字典命中數」決定實際查詢詞。
+/// 依「選中候選 → 精確歷史選擇 → 候選框第一項」決定實際查詢詞。
+///
+/// 未選擇候選時直接用候選框第一項，不再依詞典命中數改選其他候選；
+/// 命中數只影響候選面板中非固定候選的排序與顯示。
 Future<String> resolveSearchQuery(
   String rawInput, {
   String? selectedQuery,
   Map<String, String>? selections,
-  KeyMatchCounter? keyMatchCounter,
 }) async {
   final raw = rawInput.trim();
   if (raw.isEmpty) return '';
@@ -109,38 +111,7 @@ Future<String> resolveSearchQuery(
   if (historical != null && historical.isNotEmpty) return historical;
 
   final conversion = SimplifiedTraditionalConverter.convertCandidates(raw);
-  if (conversion.candidates.isEmpty) return raw;
-  final preferred = conversion.candidates.first;
-  if (keyMatchCounter == null || conversion.candidates.length <= 1) {
-    return preferred;
-  }
-
-  Map<String, int> counts;
-  try {
-    counts = await keyMatchCounter(conversion.candidates);
-  } catch (_) {
-    return preferred;
-  }
-  var best = preferred;
-  var bestTraditional = SimplifiedTraditionalConverter.ranksAsTraditional(
-    preferred,
-  );
-  var bestCount = counts[preferred] ?? 0;
-  for (final candidate in conversion.candidates) {
-    final count = counts[candidate] ?? 0;
-    final isTraditional = SimplifiedTraditionalConverter.ranksAsTraditional(
-      candidate,
-    );
-    final betterGroup = isTraditional && !bestTraditional;
-    final sameGroupCount =
-        isTraditional == bestTraditional && count > bestCount;
-    if (betterGroup || sameGroupCount) {
-      best = candidate;
-      bestTraditional = isTraditional;
-      bestCount = count;
-    }
-  }
-  return best;
+  return conversion.candidates.isEmpty ? raw : conversion.candidates.first;
 }
 
 String preferredQueryFor(String rawInput, Map<String, String> selections) {

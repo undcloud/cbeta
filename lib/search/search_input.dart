@@ -331,14 +331,23 @@ class _SearchInputState extends State<SearchInput> {
       widget.onSearch(pending);
       return;
     }
-    final query = await resolveSearchQuery(
-      raw,
-      selections: _selections,
-      keyMatchCounter: widget.keyMatchCounter,
-    );
+    final query = await resolveSearchQuery(raw, selections: _selections);
     if (!mounted) return;
     _pendingSelection = null;
     _hideOverlay();
+    // 未選擇候選時實際查詢詞是候選框第一項；輸入框同步成該詞，
+    // 避免框裡留著原字、看起來卻搜了另一串字。
+    if (widget.showCandidates &&
+        query.isNotEmpty &&
+        query != widget.controller.text) {
+      _suppress = true;
+      widget.controller.value = TextEditingValue(
+        text: query,
+        selection: TextSelection.collapsed(offset: query.length),
+      );
+      _lastText = query;
+      _suppress = false;
+    }
     widget.onSearch(SearchSelection(rawInput: raw, query: query));
   }
 
