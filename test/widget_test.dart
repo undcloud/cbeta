@@ -1458,6 +1458,67 @@ void main() {
     );
   });
 
+  testWidgets('reader blocks do not accumulate note recognizers on rebuild', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    await setOfflineMode(true);
+    await scriptureDisplaySettings.update(
+      showCollation: true,
+      showLineBeginnings: false,
+      backgroundTheme: 'default',
+    );
+    await scriptureVolumeStore.write(
+      const CachedScriptureVolume(
+        work: 'T0152',
+        juan: '1',
+        html:
+            '<div id="body"><p class="juan">六度集經卷第一</p>'
+            '<p>如是我聞<a class="noteAnchor" href="#n0001001"></a>。</p></div>'
+            '<div id="back"><div class="footnote" id="n0001001">校勘</div></div>',
+        contentVersion: 'test',
+      ),
+    );
+    final client = MockClient((request) async => http.Response('{}', 404));
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: ScriptureReaderPage(
+            passage: ScripturePassage(
+              title: '六度集經',
+              reference: '卷 1',
+              text: '',
+              juan: '1',
+              work: 'T0152',
+            ),
+            query: '',
+            searchHits: [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final block = find.byWidgetPredicate(
+        (widget) => widget.runtimeType.toString() == '_ReaderPassageBlock',
+      );
+      expect(block, findsOneWidget);
+      final state = tester.state<ReaderPassageBlockState>(block);
+      expect(state.noteRecognizers, hasLength(1));
+
+      for (var index = 0; index < 3; index++) {
+        tester.element(block).markNeedsBuild();
+        await tester.pump();
+      }
+      expect(state.noteRecognizers, hasLength(1));
+    }, () => client);
+    // 先拆掉閱讀頁再切回聯網模式，否則監聽器會立刻重新抓線上經卷。
+    await tester.pumpWidget(const SizedBox.shrink());
+    await setOfflineMode(false);
+  });
+
   testWidgets('styles the byline of a downloaded volume', (
     WidgetTester tester,
   ) async {
@@ -5823,4 +5884,91 @@ void main() {
       }, () => client);
     },
   );
+
+  testWidgets('reader keeps only the current juan cached', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await scriptureDisplaySettings.load();
+    final requestedJuans = <String>[];
+    final client = MockClient((request) async {
+      if (request.url.path == '/stable/juans') {
+        final juan = request.url.queryParameters['juan'] ?? '';
+        requestedJuans.add(juan);
+        final html =
+            '<div id="body">'
+            '<span class="lb" id="T01n0009_p0001a01"></span>'
+            '<span class="t">juan-$juan</span>'
+            '</div>';
+        return http.Response(
+          jsonEncode({
+            'results': [html],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response('{}', 404);
+    });
+    const passage = ScripturePassage(
+      title: '測試經',
+      reference: '卷 1',
+      text: 'juan-1',
+      linehead: 'T01n0009_p0001a01',
+      juan: '1',
+      work: 'T0009',
+      availableJuans: [1, 2, 3, 4, 5],
+    );
+
+    await http.runWithClient(() async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ScriptureReaderPage(
+            passage: passage,
+            query: '',
+            searchHits: const [],
+            initialHitIndex: 0,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final state = tester.state<ScriptureReaderPageState>(
+        find.byType(ScriptureReaderPage),
+      );
+      Future<void> selectJuan(int juan) async {
+        await tester.tap(find.byType(DropdownButton<int>));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('第 $juan 卷').last);
+        await tester.pumpAndSettle();
+      }
+
+      expect(state.juanCache.length, 1);
+      expect(requestedJuans, ['1']);
+
+      await selectJuan(2);
+      expect(state.juanCache.length, 1);
+      expect(state.juanCache.keys, ['T0009:2:online']);
+      expect(requestedJuans, ['1', '2']);
+
+      await selectJuan(3);
+      expect(state.juanCache.length, 1);
+      expect(state.juanCache.keys, ['T0009:3:online']);
+      expect(requestedJuans, ['1', '2', '3']);
+      expect(find.text('juan-3'), findsOneWidget);
+
+      // 第 1 卷已被淘汰，切回去要重新請求。
+      await selectJuan(1);
+      expect(requestedJuans, ['1', '2', '3', '1']);
+      expect(state.juanCache.length, 1);
+      expect(state.juanCache.keys, ['T0009:1:online']);
+      expect(find.text('juan-1'), findsOneWidget);
+
+      await selectJuan(4);
+      expect(requestedJuans, ['1', '2', '3', '1', '4']);
+      expect(state.juanCache.length, 1);
+      expect(state.juanCache.keys, ['T0009:4:online']);
+      expect(find.text('juan-4'), findsOneWidget);
+    }, () => client);
+  });
 }

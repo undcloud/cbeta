@@ -731,7 +731,13 @@ class _ExpandedVolume {
 }
 
 final LinkedHashMap<String, _ExpandedVolume> _expandedVolumes = LinkedHashMap();
-const int _expandedVolumeCacheLimit = 24;
+
+/// 展開快取是「同一部經換關鍵字再搜」的加速器，不是索引本體。
+///
+/// 每個 worker isolate 各有一份；整卷展開含正規化正文與顯示位移表，
+/// 大部頭一卷就是十幾 MB。先前留 24 卷，多個 worker 同時在跑時光這份
+/// 快取就能佔掉幾百 MB，低端機沒必要為重搜省這點解析時間。
+const int _expandedVolumeCacheLimit = 4;
 
 Future<_ExpandedVolume?> _expandedVolume(OfflineScanTarget target) async {
   final path = target.path;
@@ -1282,6 +1288,9 @@ OfflineScanPool sharedOfflineScanPool() =>
 void releaseSharedOfflineScanPool() {
   _sharedScanPool?.dispose();
   _sharedScanPool = null;
+  // worker 的展開快取隨 isolate 一起結束；主 isolate 這份（池不足時退回
+  // 本地展開會用到）也要清掉，閱讀器開著時不該留著整卷的展開結果。
+  _expandedVolumes.clear();
 }
 
 /// 常駐背景工作池：掃描、建索引、展開摘要三種活都在同一批 worker 上跑。

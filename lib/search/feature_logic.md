@@ -777,7 +777,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 **第一階段只扫索引，第二階段才解析 HTML**
 
-- `runOfflineScan` 只产出 `(work, juan, linehead)`，不带正文；**每卷只生成一笔命中，出现次数另记在 `hitCount`**（同卷多處命中只留第一处的行号），否则常用字 2 万卷会产出几十万个命中对象与其行号字串。卡片按 `hitCount` 显示「找到 N 處命中」；一部经的命中先以 `pendingHits` 发布，卡片展开时才调 `expandOfflineWork()` 用 `.json` 的 HTML 重比一次（实测约 4 ms/卷），摘要与 `sourceOffset` 都取自**带标点的原文**，再点其中一条才进阅读页；展开同样派给常驻池（`runExpand`），按来源 `.json` 的戳记做**整卷解析缓存**（`_expandedVolumes`，24 卷 LRU）：换字重开同一部经不会重解析同一卷；池已释放、网页版（`path` 为空）或测试环境退回 `runOfflineExpandInline`，主 isolate 一卷一卷做、卷间让出一帧，并由呼叫端传 `shouldAbort`（`!mounted || 會話已被換掉`）——點開一部長的經再跳走，不會出現「頁面已經換了還在一卷卷解析」；
+- `runOfflineScan` 只产出 `(work, juan, linehead)`，不带正文；**每卷只生成一笔命中，出现次数另记在 `hitCount`**（同卷多處命中只留第一处的行号），否则常用字 2 万卷会产出几十万个命中对象与其行号字串。卡片按 `hitCount` 显示「找到 N 處命中」；一部经的命中先以 `pendingHits` 发布，卡片展开时才调 `expandOfflineWork()` 用 `.json` 的 HTML 重比一次（实测约 4 ms/卷），摘要与 `sourceOffset` 都取自**带标点的原文**，再点其中一条才进阅读页；展开同样派给常驻池（`runExpand`），按来源 `.json` 的戳记做**整卷解析缓存**（`_expandedVolumes`，每個 isolate 4 卷 LRU）：换字重开同一部经不会重解析最近几卷；上限压到 4 是因为展开结果含正規化正文与显示位移表，大部头一卷十几 MB，而 worker 池最多 4 个 isolate，旧上限 24 卷在低端机上会白占几百 MB；`releaseSharedOfflineScanPool()` 释池时也会清掉主 isolate 这份缓存（阅读器盖住首页后不留整卷展开结果）；池已释放、网页版（`path` 为空）或测试环境退回 `runOfflineExpandInline`，主 isolate 一卷一卷做、卷间让出一帧，并由呼叫端传 `shouldAbort`（`!mounted || 會話已被換掉`）——點開一部長的經再跳走，不會出現「頁面已經換了還在一卷卷解析」；
 - 首页的接線是 `WorkStickyHeader.onExpansionChanged` → `_expandOfflineHits()`，用 `_expandingOfflineWorks` 防重复展开，完成后 `session.applyPassages(work, passages)` 用摘要取代那一部的待展开命中；还没展开完时该列显示「找到 N 處命中，正在載入經文摘要…」占位；
 - 上下文摘要 `offlineKwicSnippet()` 会停在卷题／作译者／校勘夹注的边界（`SidxSource.excluded`）：被结构边界挡住时不加省略号，因为省略号表示删掉的是经文，不是标题；
 - 命中一律排除：卷题、作译者、校勘夹注（`inlineNotes`）、以及卷首那行就在 `#body` 裡的 `No. 1092 [cf. Nos. 1093-1099, 901(Fasc. 5)]`，否则 cf 引用会污染正文结果。

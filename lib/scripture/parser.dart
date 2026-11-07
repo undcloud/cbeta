@@ -13,6 +13,53 @@ final _noteNumberPattern = RegExp(r'n\d+(\d{3})$');
 final _trailingDigitsPattern = RegExp(r'(\d+)$');
 final _bracketNumberPattern = RegExp(r'\[\d+\]');
 
+/// 線上版把正文切成逐字／標點 token：`<span class="t" l=… w=…>`、
+/// `<span class="pc">`、`<span class="line_space">`……這些 class 對解析沒有
+/// 語意，卻能佔 DOM 節點九成以上（一卷可達 13 萬個 span）。先把它們的
+/// 開閉標籤整對拿掉再 `parseFragment`，實測同樣一卷峰值記憶體減半、
+/// 解析時間約三分之一；沒有 class 的 span 可能包著區塊元素
+/// （`<span style=…><p>…`），保留不動。
+final _spanTagPattern = RegExp(r'<span\b[^>]*>|</span>', caseSensitive: false);
+final _classAttributePattern = RegExp(
+  r'''class\s*=\s*("([^"]*)"|'([^']*)')''',
+  caseSensitive: false,
+);
+final _semanticSpanClassPattern = RegExp(
+  r'(^|\s)(lb|lineinfo|siddam|ranjana|inline-note|doube-line-note|footnote)(\s|$)',
+  caseSensitive: false,
+);
+
+String _stripInlineTokenSpans(String source) {
+  if (!source.contains('<span')) return source;
+  final out = StringBuffer();
+  final keepStack = <bool>[];
+  var cursor = 0;
+  for (final match in _spanTagPattern.allMatches(source)) {
+    out.write(source.substring(cursor, match.start));
+    cursor = match.end;
+    final tag = match.group(0)!;
+    if (tag.codeUnitAt(1) == 0x2F) {
+      // `</span>`：與對應的開標籤一起決定留或丟。
+      if (keepStack.isEmpty) {
+        out.write(tag);
+      } else if (keepStack.removeLast()) {
+        out.write(tag);
+      }
+      continue;
+    }
+    final classMatch = _classAttributePattern.firstMatch(tag);
+    final classValue = classMatch?.group(2) ?? classMatch?.group(3);
+    final keep =
+        classValue == null ||
+        classValue.trim().isEmpty ||
+        _semanticSpanClassPattern.hasMatch(classValue);
+    keepStack.add(keep);
+    if (keep) out.write(tag);
+  }
+  out.write(source.substring(cursor));
+  return out.toString();
+}
+
 /// 部分經典的行號在經號與 p 之間沒有底線（例如梵語千字文
 /// `T54n2133Ap1190a13`），解析時統一補成 `_p` 格式，
 /// 與搜尋 API／Goto 拼出的行號一致，下游引用與跳轉才可比對。
@@ -53,7 +100,7 @@ int debugScriptureHtmlParses = 0;
 
 List<ScriptureLine> parseScriptureHtml(String source) {
   debugScriptureHtmlParses += 1;
-  final fragment = parseFragment(source);
+  final fragment = parseFragment(_stripInlineTokenSpans(source));
   final root = fragment.querySelector('#body') ?? fragment;
   final footnoteContent = {
     for (final note in fragment.querySelectorAll('#back .footnote'))

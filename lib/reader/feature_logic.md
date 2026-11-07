@@ -43,6 +43,15 @@
     「改用离线阅读」（本地有副本时）或「前往下载」；
   - **离线**只读本地已下载的卷，缺卷抛 `OfflineVolumeUnavailable`，面板提供
     「前往下载」／「切换到联网」；
+  - `juanCache` 只保留当前一卷（`_juanCacheLimit = 1`）：换卷后旧卷立即从快取移除，
+    回看上一卷会重新读档解析，用这一点重解析时间换最低的常驻内存。已翻走的卷
+    若在解析完成前被替换，结果仍交还给即将卸载的 FutureBuilder，但会从快取移除；
+  - 整卷 HTML 用 `scripture/parse_runner.dart` 的 `parseScriptureHtmlAsync` 在背景
+    isolate 解析（`flutter test`／网页版回退主 isolate），避免主 isolate 的 DOM
+    与暂存字串推高 heap 高水位；
+  - 换卷（含换经、书签、来源模式、重试）会调用 `_releaseRenderedJuan` 丢掉旧卷的
+    layout、行资料与区块 key，`FutureBuilder` 以 `ObjectKey(linesFuture)` 重建，
+    旧 snapshot 不再持有上一卷经文；
 - 阅读位置记录（「上次阅读位置」/「最近阅读」用）：
   - 除进入时的搜索命中位置外，也会在「使用者自己捲动后停下」时，把
     当下**视窗顶端那一行**记为阅读锚点（`_updateReadingAnchorFromViewportTop`

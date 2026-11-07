@@ -267,6 +267,37 @@ curl -s -o T0152.zip "https://cbdata.dila.edu.tw/stable/download/html/T0152.html
 
 ---
 
+### C-18 逐字 token span 在解析前整對移除（記憶體與速度）
+
+線上 `/stable/juans` 把正文切成 token（離線 ZIP 沒有這層）：
+
+```html
+<span class="t" l="0001a03" w="1">六度集經</span><span class="pc">，</span>
+<span class="line_space">　</span>
+```
+
+- 實測（B0170 卷3，5.58M 字元）：`<span>` 共 137,780 個，其中 `pc` 89,033、`t` 24,412；
+  `parseFragment` 建出的 DOM 讓單卷解析峰值 `210MB`、耗時 `543ms`（AOT 桌面）。
+- 現況：`parser.dart` 的 `_stripInlineTokenSpans()` 在 `parseFragment` 前，把
+  **有 class 且不含語意 class**（`lb`／`lineInfo`／`siddam`／`ranjana`／
+  `inline-note`／`doube-line-note`／`footnote`）的 `<span>` 開閉標籤整對移除；
+  同一卷變成 `97MB`、`157ms`，解析結果逐欄相同。
+- ⚠️ **沒有 class 的 span 一律保留**：`<span style="margin-left:1em"><p class="form">…</p></span>`
+  是真的存在的寫法（X0223 卷54）。拿掉它會改變 `hasFollowingParagraph()` 看到的兄弟節點，
+  實測 `paragraphEnd` 由 false 變 true → 排版多空行。
+- ⚠️ 必須用堆疊配對整對刪除，不能只刪開標籤：`inline-note` 裡常有 `span.t`，
+  留著的 `</span>` 會提前關掉外層 span，夾注範圍與括號位置就錯了（C-09）。
+- 驗證：399 份真實卷（最大 50 份＋均勻抽樣）用「原字串 vs 移除後」比對
+  `role`／`headingLevel`／`paragraphEnd`／`linehead`／`text`／`footnotes`／
+  `inlineNotes`／`scriptRuns` 全等；回歸在 `test/scripture_render_test.dart`
+  （`inline token spans do not change the parsed volume`、
+  `keeps spans without a class so block nesting stays intact`）。
+- 保護的 bug：低端機線上閱讀時單卷就把 Dart heap 推高數百 MB，換卷後 GC 追不上，
+  `dumpsys meminfo` 的 Native Heap 隨卷數一路上升。改這裡不要只按 class 名稱前綴判斷，
+  也不要把沒有 class 的 span 一起拿掉。
+
+---
+
 ## 3. 用這份文件批量測試
 
 ### 3.1 每次改動後的最小驗證組合

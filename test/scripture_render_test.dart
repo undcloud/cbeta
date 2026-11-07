@@ -7,6 +7,88 @@ import 'package:xuefo/scripture/reader_blocks.dart';
 import 'package:xuefo/scripture/source_text.dart';
 
 void main() {
+  test('inline token spans do not change the parsed volume', () {
+    const tokenized =
+        '<div id="body"><div class="div-other">'
+        '<span class="lb" id="T03n0152_p0001a03"></span>'
+        '<p class=\'juan\'><span class="t" l="0001a03" w="1">六度集經</span>'
+        '<span class="t" l="0001a03" w="5">卷第一</span></p>'
+        '<p class="byline"><span class=\'lineInfo\' line=\'0001a05\'></span>'
+        '吳<a id=\'note_anchor_0001001\' class=\'noteAnchor\' '
+        'href=\'#n0001001\'>[1]</a>康居國沙門康僧會譯</p>'
+        '<p data-head-level="1" class="head">布施<span class="pc">度</span>無極'
+        '<a class="noteAnchor" href="#n0001002"></a>章第'
+        '<a class="noteAnchor" href="#n0001003"></a>一'
+        '<small class=\'inline-note doube-line-note\'>'
+        '<a class="noteAnchor" href="#n0001004"></a>'
+        '<span class="t" l="0001a06" w="9">此有</span>'
+        '<span class="pc">，</span>'
+        '<span class="t" l="0001a06" w="11">一</span>十章</small></p>'
+        '<p>如是我聞。</p></div></div>'
+        '<div id=\'back\'><div class="footnote" id="n0001001">注一</div>'
+        '<div class="footnote" id="n0001002">注二</div></div>';
+    const plain =
+        '<div id="body"><div class="div-other">'
+        '<span class="lb" id="T03n0152_p0001a03"></span>'
+        '<p class=\'juan\'>六度集經卷第一</p>'
+        '<p class="byline"><span class=\'lineInfo\' line=\'0001a05\'></span>'
+        '吳<a id=\'note_anchor_0001001\' class=\'noteAnchor\' '
+        'href=\'#n0001001\'>[1]</a>康居國沙門康僧會譯</p>'
+        '<p data-head-level="1" class="head">布施度無極'
+        '<a class="noteAnchor" href="#n0001002"></a>章第'
+        '<a class="noteAnchor" href="#n0001003"></a>一'
+        '<small class=\'inline-note doube-line-note\'>'
+        '<a class="noteAnchor" href="#n0001004"></a>此有，一十章</small></p>'
+        '<p>如是我聞。</p></div></div>'
+        '<div id=\'back\'><div class="footnote" id="n0001001">注一</div>'
+        '<div class="footnote" id="n0001002">注二</div></div>';
+
+    String signature(ScriptureLine line) => [
+      line.role.name,
+      line.headingLevel,
+      line.paragraphEnd,
+      line.linehead,
+      line.text,
+      line.footnotes
+          .map((note) => '${note.label}@${note.offset}#${note.clue}')
+          .join(','),
+      line.inlineNotes.map((note) => '${note.offset}+${note.length}').join(','),
+    ].join('|');
+
+    final tokenLines = parseScriptureHtml(tokenized);
+    final plainLines = parseScriptureHtml(plain);
+    expect(
+      tokenLines.map(signature).toList(),
+      plainLines.map(signature).toList(),
+    );
+    expect(tokenLines.map((line) => line.text).toList(), [
+      '六度集經卷第一\n',
+      '吳康居國沙門康僧會譯\n',
+      '布施度無極章第一（此有，一十章）\n',
+      '如是我聞。\n',
+    ]);
+    expect(
+      tokenLines[2].inlineNotes
+          .map((note) => '${note.offset}+${note.length}')
+          .toList(),
+      ['8+8'],
+    );
+  });
+
+  test('keeps spans without a class so block nesting stays intact', () {
+    final lines = parseScriptureHtml(
+      '<div id="body"><p>甲</p>'
+      '<span style="margin-left:1em"><p class="form">乙</p></span>'
+      '<p>丙</p></div>',
+    );
+    // 若把沒有 class 的 span 也拿掉，乙會多出「後面還有段落」的判定。
+    expect(lines.map((line) => line.paragraphEnd).toList(), [
+      false,
+      false,
+      false,
+    ]);
+  });
+
   test('adds paragraph spacing without shifting source offsets', () {
     final lines = parseScriptureHtml(
       '<div id="body"><p>第一段。</p><p>第二段。</p></div>',

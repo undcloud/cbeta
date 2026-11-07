@@ -7,7 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:share_plus/share_plus.dart';
 import '../scripture/cache.dart';
 import '../scripture/models.dart';
-import '../scripture/parser.dart';
+import '../scripture/parse_runner.dart';
 import '../scripture/reader_blocks.dart';
 import '../scripture/source_text.dart';
 import '../search/candidates.dart';
@@ -102,7 +102,12 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
   int _scrollRequestId = 0;
   ({int blockIndex, int localOffset, double delta})? _pendingScrollAnchor;
   final localSearchController = TextEditingController();
+
+  /// 目前畫面要顯示的卷；換卷時只保留當前這一卷，避免快速翻卷把整卷解析
+  /// 結果留在記憶體。回看上一卷會重新讀檔解析。
+  static const int _juanCacheLimit = 1;
   final Map<String, Future<List<ScriptureLine>>> juanCache = {};
+  String? _activeJuanKey;
   bool preferOnline = false;
   bool _lastOfflineMode = false;
 
@@ -162,9 +167,12 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
   /// 真的再打一次 API。
   void _reloadForSourceMode() {
     juanCache.clear();
+    final online = !offlineMode;
+    final nextFuture = _cachedJuan(currentPassage, preferOnline: online);
     setState(() {
-      preferOnline = !offlineMode;
-      linesFuture = _cachedJuan(currentPassage, preferOnline: preferOnline);
+      preferOnline = online;
+      _releaseRenderedJuan();
+      linesFuture = nextFuture;
     });
     _resetReadingAnchor();
     _refreshBookmarkState();
@@ -355,16 +363,19 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
 
   void _openBookmark(ReaderBookmark bookmark) {
     final passage = bookmark.toPassage();
+    final online = !offlineMode;
+    final nextFuture = _cachedJuan(passage, preferOnline: online);
     setState(() {
       currentPassage = passage;
       currentHitIndex = 0;
       showSearchNavigation = false;
       _archiveAnchorMode = true;
-      preferOnline = !offlineMode;
+      preferOnline = online;
       _currentSourceOffset = passage.sourceOffset;
       _currentSnippet = passage.snippet;
       didScrollToMatch = false;
-      linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
+      if (!identical(nextFuture, linesFuture)) _releaseRenderedJuan();
+      linesFuture = nextFuture;
     });
     _resetReadingAnchor();
     _refreshBookmarkState();
@@ -374,16 +385,19 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
   Future<void> _selectWork() async {
     final passage = await showWorkPicker(context);
     if (passage == null || !mounted) return;
+    final online = !offlineMode;
+    final nextFuture = _cachedJuan(passage, preferOnline: online);
     setState(() {
       currentPassage = passage;
       currentHitIndex = 0;
       showSearchNavigation = false;
       _archiveAnchorMode = true;
-      preferOnline = !offlineMode;
+      preferOnline = online;
       _currentSourceOffset = null;
       _currentSnippet = '';
       didScrollToMatch = false;
-      linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
+      if (!identical(nextFuture, linesFuture)) _releaseRenderedJuan();
+      linesFuture = nextFuture;
     });
     _resetReadingAnchor();
     _refreshBookmarkState();
@@ -600,6 +614,19 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
     if (_blockKeys.length > count) {
       _blockKeys.removeRange(count, _blockKeys.length);
     }
+  }
+
+  /// 換卷時放掉上一卷的整卷 layout、解析結果與區塊 key，讓 GC 能立即回收；
+  /// FutureBuilder 也會因為換了 key 而重建，不再保留舊 snapshot 的經文。
+  void _releaseRenderedJuan() {
+    _currentLayout = null;
+    _currentBodyLines = const [];
+    _blockOffsetBases = const [];
+    _blockKeys.clear();
+    localSearchLines = const [];
+    localSearchRanges = const [];
+    _selectedContentText = '';
+    _pendingScrollAnchor = null;
   }
 
   /// 區塊 `Text` 元素的渲染節點是外層 `RenderMouseRegion`，
@@ -975,36 +1002,77 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
             : '${workMatch.group(1)}${workMatch.group(2)}');
     final juan = passage.juan;
     if (work == null || juan == null) {
+      _activeJuanKey = null;
       return _loadJuan(passage, preferOnline: preferOnline);
     }
     final key = '$work:$juan:${preferOnline ? 'online' : 'local'}';
-    return juanCache.putIfAbsent(key, () async {
+    _activeJuanKey = key;
+    final existing = juanCache.remove(key);
+    if (existing != null) {
+      // 重新插入讓它成為最近使用的一卷，淘汰時才不會先丟掉剛看過的內容。
+      juanCache[key] = existing;
+      return existing;
+    }
+    final future = _loadCachedJuan(
+      work: work,
+      juan: juan,
+      preferOnline: preferOnline,
+      key: key,
+    );
+    juanCache[key] = future;
+    while (juanCache.length > _juanCacheLimit) {
+      juanCache.remove(juanCache.keys.first);
+    }
+    return future;
+  }
+
+  Future<List<ScriptureLine>> _loadCachedJuan({
+    required String work,
+    required String juan,
+    required bool preferOnline,
+    required String key,
+  }) {
+    late final Future<List<ScriptureLine>> future;
+    future = () async {
       try {
         final cached = await scriptureVolumeStore.read(work, juan);
+        final List<ScriptureLine> lines;
         if (!preferOnline) {
-          if (cached != null) return parseScriptureHtml(cached.html);
-          throw OfflineVolumeUnavailable(work: work, juan: juan);
+          if (cached == null) {
+            throw OfflineVolumeUnavailable(work: work, juan: juan);
+          }
+          lines = await parseScriptureHtmlAsync(cached.html);
+        } else {
+          try {
+            final latest = await fetchScriptureVolume(work, juan);
+            // 本地沒有這卷時才留下線上備份；已下載的經卷不被線上內容覆蓋。
+            if (cached == null) await scriptureVolumeStore.write(latest);
+            lines = await parseScriptureHtmlAsync(latest.html);
+          } catch (error) {
+            // 聯網模式不靜默回退本地；由使用者決定是否切換離線模式。
+            throw ScriptureOnlineLoadFailure(
+              work: work,
+              juan: juan,
+              hasLocalCopy: cached != null,
+              cause: error,
+            );
+          }
         }
-        try {
-          final latest = await fetchScriptureVolume(work, juan);
-          // 本地沒有這卷時才留下線上備份；已下載的經卷不被線上內容覆蓋。
-          if (cached == null) await scriptureVolumeStore.write(latest);
-          return parseScriptureHtml(latest.html);
-        } catch (error) {
-          // 聯網模式不靜默回退本地；由使用者決定是否切換離線模式。
-          throw ScriptureOnlineLoadFailure(
-            work: work,
-            juan: juan,
-            hasLocalCopy: cached != null,
-            cause: error,
-          );
-        }
+        // 使用者已翻到別的卷：結果仍交給即將卸載的 FutureBuilder，但不再
+        // 留在快取裡，避免快速翻卷時同時保留多份整卷經文。
+        if (_activeJuanKey != key) _removeJuanCacheEntry(key, future);
+        return lines;
       } catch (_) {
         // Future 失敗後留在快取裡會讓「重試」永遠拿到同一個錯誤。
-        juanCache.remove(key);
+        _removeJuanCacheEntry(key, future);
         rethrow;
       }
-    });
+    }();
+    return future;
+  }
+
+  void _removeJuanCacheEntry(String key, Future<List<ScriptureLine>> future) {
+    if (identical(juanCache[key], future)) juanCache.remove(key);
   }
 
   Future<List<ScriptureLine>> _loadJuan(
@@ -1029,13 +1097,13 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
     }
     final cached = await scriptureVolumeStore.read(work, juan);
     if (!preferOnline) {
-      if (cached != null) return parseScriptureHtml(cached.html);
+      if (cached != null) return parseScriptureHtmlAsync(cached.html);
       throw OfflineVolumeUnavailable(work: work, juan: juan);
     }
     try {
       final latest = await fetchScriptureVolume(work, juan);
       if (cached == null) await scriptureVolumeStore.write(latest);
-      return parseScriptureHtml(latest.html);
+      return parseScriptureHtmlAsync(latest.html);
     } catch (error) {
       throw ScriptureOnlineLoadFailure(
         work: work,
@@ -1049,15 +1117,18 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
   Future<void> _goToHit(int index) async {
     if (index < 0 || index >= widget.searchHits.length) return;
     final passage = widget.searchHits[index];
+    final online = !offlineMode;
+    final nextFuture = _cachedJuan(passage, preferOnline: online);
     setState(() {
       currentPassage = passage;
       currentHitIndex = index;
       _archiveAnchorMode = false;
-      preferOnline = !offlineMode;
+      preferOnline = online;
       _currentSourceOffset = passage.sourceOffset;
       _currentSnippet = passage.snippet;
       didScrollToMatch = false;
-      linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
+      if (!identical(nextFuture, linesFuture)) _releaseRenderedJuan();
+      linesFuture = nextFuture;
     });
     _resetReadingAnchor();
     _refreshBookmarkState();
@@ -1086,12 +1157,14 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
       reference: reference,
       snippet: '',
     );
+    final nextFuture = _cachedJuan(passage, preferOnline: preferOnline);
     setState(() {
       currentPassage = passage;
       _currentSourceOffset = null;
       _currentSnippet = '';
       didScrollToMatch = false;
-      linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
+      if (!identical(nextFuture, linesFuture)) _releaseRenderedJuan();
+      linesFuture = nextFuture;
     });
     _resetReadingAnchor();
     _refreshBookmarkState();
@@ -1106,12 +1179,14 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
       reference: '卷 $juan',
       snippet: '',
     );
+    final nextFuture = _cachedJuan(passage, preferOnline: preferOnline);
     setState(() {
       currentPassage = passage;
       _currentSourceOffset = null;
       _currentSnippet = '';
       didScrollToMatch = false;
-      linesFuture = _cachedJuan(passage, preferOnline: preferOnline);
+      if (!identical(nextFuture, linesFuture)) _releaseRenderedJuan();
+      linesFuture = nextFuture;
     });
     _resetReadingAnchor();
     _refreshBookmarkState();
@@ -1127,6 +1202,8 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
     WidgetsBinding.instance.removeObserver(this);
     offlineModeListenable.removeListener(_onOfflineModeChanged);
     scriptureDisplaySettings.removeListener(_onDisplaySettingsChanged);
+    juanCache.clear();
+    _activeJuanKey = null;
     readerScrollController.dispose();
     localSearchController.dispose();
     super.dispose();
@@ -1134,9 +1211,12 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
 
   void _retryLoad() {
     juanCache.clear();
+    final online = !offlineMode;
+    final nextFuture = _cachedJuan(currentPassage, preferOnline: online);
     setState(() {
-      preferOnline = !offlineMode;
-      linesFuture = _cachedJuan(currentPassage, preferOnline: preferOnline);
+      preferOnline = online;
+      _releaseRenderedJuan();
+      linesFuture = nextFuture;
     });
   }
 
@@ -1251,6 +1331,8 @@ class ScriptureReaderPageState extends State<ScriptureReaderPage>
         body: Stack(
           children: [
             FutureBuilder<List<ScriptureLine>>(
+              // 換卷時重建 state，舊 snapshot 不會繼續持有上一卷的經文。
+              key: ObjectKey(linesFuture),
               future: linesFuture,
               builder: (context, snapshot) {
                 if (snapshot.connectionState == ConnectionState.waiting) {

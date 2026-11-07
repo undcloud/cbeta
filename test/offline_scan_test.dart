@@ -583,6 +583,20 @@ void main() {
     );
   });
 
+  test('釋放常駐池時也清掉主 isolate 的展開快取', () async {
+    await seedVolumes(1);
+    final targets = await targetsFor(1);
+    final outcome = await runOfflineScan(requestFor('波羅蜜多', targets));
+    final group = outcome.groups.first;
+    await expandOfflineWork(work: group.work, hits: group.hits, query: '波羅蜜多');
+
+    debugScriptureHtmlParses = 0;
+    releaseSharedOfflineScanPool();
+    await expandOfflineWork(work: group.work, hits: group.hits, query: '波羅蜜多');
+    expect(debugScriptureHtmlParses, greaterThan(0));
+    releaseSharedOfflineScanPool();
+  });
+
   test('經卷改版後展開快取失效，摘要跟著換', () async {
     await seedVolumes(1);
     final targets = await targetsFor(1);
