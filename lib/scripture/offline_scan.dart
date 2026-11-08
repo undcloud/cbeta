@@ -68,6 +68,7 @@ class OfflineScanOutcome {
     required this.groups,
     required this.termHits,
     required this.scannedVolumes,
+    this.hitVolumes = 0,
     this.builtIndexes = 0,
     this.missingIndexes = 0,
   });
@@ -75,6 +76,9 @@ class OfflineScanOutcome {
   final List<OfflineWorkGroup> groups;
   final int termHits;
   final int scannedVolumes;
+
+  /// 有命中的卷數；與線上以「作品+卷」為一列的計數口徑一致。
+  final int hitVolumes;
 
   /// 本批中現場從 HTML 建出 `.sidx` 的卷數；首輪掃描後會一路降到 0。
   final int builtIndexes;
@@ -155,6 +159,7 @@ Future<OfflineScanOutcome> _runOfflineScan(
   final hitCountsByTarget = List<int>.filled(targets.length, 0);
   final titlesByTarget = List<String?>.filled(targets.length, null);
   var termHits = 0;
+  var hitVolumes = 0;
   var built = 0;
   var scanned = 0;
   var missing = 0;
@@ -293,6 +298,7 @@ Future<OfflineScanOutcome> _runOfflineScan(
         });
         if (matches == 0) continue;
         termHits += matches;
+        hitVolumes += 1;
         hitCountsByTarget[index] = matches;
         hitsByTarget[index] = [
           OfflineHit(juan: loaded.juan, linehead: linehead),
@@ -328,6 +334,7 @@ Future<OfflineScanOutcome> _runOfflineScan(
     ],
     termHits: termHits,
     scannedVolumes: scanned,
+    hitVolumes: hitVolumes,
     builtIndexes: built,
     missingIndexes: missing,
   );
@@ -935,6 +942,7 @@ class OfflineScanProgress {
     this.totalVolumes = 0,
     this.results = const <ScriptureSearchResult>[],
     this.termHits = 0,
+    this.hitVolumes = 0,
     this.scanning = false,
     this.finished = false,
   });
@@ -943,6 +951,7 @@ class OfflineScanProgress {
   final int totalVolumes;
   final List<ScriptureSearchResult> results;
   final int termHits;
+  final int hitVolumes;
   final bool scanning;
   final bool finished;
 
@@ -987,6 +996,7 @@ class OfflineScanSession {
   List<ScriptureSearchResult> _results = const [];
   int _cursor = 0;
   int _termHits = 0;
+  int _hitVolumes = 0;
   int _batchVolumes = 0;
   int _missingIndexes = 0;
   Directory? _volumesDirectory;
@@ -1135,6 +1145,7 @@ class OfflineScanSession {
 
   void _merge(OfflineScanOutcome outcome) {
     _termHits += outcome.termHits;
+    _hitVolumes += outcome.hitVolumes;
     _missingIndexes += outcome.missingIndexes;
     for (final group in outcome.groups) {
       final bucket = _merged.putIfAbsent(
@@ -1255,6 +1266,7 @@ class OfflineScanSession {
       totalVolumes: _refs?.length ?? 0,
       results: _results,
       termHits: _termHits,
+      hitVolumes: _hitVolumes,
       scanning: _scanning,
       finished: _finished,
     );
@@ -1356,12 +1368,14 @@ class OfflineScanPool {
       );
     }
     var termHits = 0;
+    var hitVolumes = 0;
     var scanned = 0;
     var built = 0;
     var missing = 0;
     final groups = <OfflineWorkGroup>[];
     for (final outcome in await Future.wait(futures)) {
       termHits += outcome.termHits;
+      hitVolumes += outcome.hitVolumes;
       scanned += outcome.scannedVolumes;
       built += outcome.builtIndexes;
       missing += outcome.missingIndexes;
@@ -1371,6 +1385,7 @@ class OfflineScanPool {
       groups: _mergeGroups(groups),
       termHits: termHits,
       scannedVolumes: scanned,
+      hitVolumes: hitVolumes,
       builtIndexes: built,
       missingIndexes: missing,
     );

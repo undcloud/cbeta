@@ -74,6 +74,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
   int nextStart = 0;
   int totalFound = 0;
   int totalTermHits = 0;
+  int totalHitVolumes = 0;
   int requestToken = 0;
 
   /// 分組結果的快取。分組本身是 O(命中數) 的列表重建,不該在每次
@@ -1404,6 +1405,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
       nextStart = progress.results.length;
       totalFound = progress.results.length;
       totalTermHits = progress.termHits;
+      totalHitVolumes = progress.hitVolumes;
       hasMore = !progress.finished;
       offlineScannedVolumes = progress.scannedVolumes;
       offlineTotalVolumes = progress.totalVolumes;
@@ -2498,6 +2500,8 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
                           ? '索引更新中'
                           : isKeywordSearchPending
                           ? '搜尋中…'
+                          : offlineSearchActive
+                          ? '$totalFound 部'
                           : '$totalFound 筆',
                       style: theme.textTheme.bodySmall?.copyWith(
                         color: const Color(0xFF687671),
@@ -2599,9 +2603,10 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         child: Padding(
           padding: const EdgeInsets.fromLTRB(40, 12, 24, 0),
           child: Text(
-            offlineSearchActive && hasMore
-                ? '「$submittedQuery」離線搜尋：已找到 $totalFound 筆，'
-                      '共 $totalTermHits 處出現（已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷）'
+            offlineSearchActive
+                ? '「$submittedQuery」離線搜尋：已找到 $totalFound 部、'
+                      '$totalHitVolumes 卷，共 $totalTermHits 處出現'
+                      '${hasMore ? '（已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷）' : ''}'
                 : '「$submittedQuery」搜尋結果：找到 $totalFound 筆結果，共 $totalTermHits 處出現',
             style: Theme.of(
               context,
@@ -2751,7 +2756,7 @@ class ScriptureSearchPageState extends State<ScriptureSearchPage>
         children: [
           Text(
             scanning
-                ? '離線掃描中…已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷，目前找到 $totalFound 筆'
+                ? '離線掃描中…已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷，目前找到 $totalFound 部'
                 : '已暫停掃描（已掃描 $offlineScannedVolumes/$offlineTotalVolumes 卷）',
             textAlign: TextAlign.center,
             style: Theme.of(

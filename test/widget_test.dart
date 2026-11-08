@@ -2868,7 +2868,7 @@ void main() {
 
       // 連續掃描自己推進到掃完,不需要任何捲動或按鈕觸發。
       // 掃完後離線模式不再顯示「載入更多」頁尾,改由結果統計列交代筆數。
-      expect(find.text('「般若波羅蜜」搜尋結果：找到 70 筆結果，共 70 處出現'), findsOneWidget);
+      expect(find.text('「般若波羅蜜」離線搜尋：已找到 70 部、70 卷，共 70 處出現'), findsOneWidget);
       expect(find.textContaining('離線模式'), findsWidgets);
       // 數百筆結果只渲染前 20 部作品,避免點擊最後一卷時整串卡片跟著重畫。
       expect(find.textContaining('測試經21'), findsNothing);
@@ -2980,7 +2980,7 @@ void main() {
       await tester.tap(find.byTooltip('搜尋經文'));
       await tester.pumpAndSettle();
 
-      expect(find.text('「般若波羅蜜」搜尋結果：找到 30 筆結果，共 30 處出現'), findsOneWidget);
+      expect(find.text('「般若波羅蜜」離線搜尋：已找到 30 部、30 卷，共 30 處出現'), findsOneWidget);
       // 一次只渲染前 20 部作品；分頁按鈕在清單尾端，要捲到底才看得到。
       expect(find.textContaining('測試經25'), findsNothing);
 

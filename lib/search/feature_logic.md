@@ -816,7 +816,7 @@ return scriptureDisplaySettings.showSimplifiedText
 
 ### 11.4.1 结果分页与显示
 
-- 离线结果不分页：每次发布的是会话累计的全部命中快照（`progress.results`），`hasMore` 表示「还没扫完」；扫完后统计列变成「「X」搜尋結果：找到 N 筆結果，共 M 處出現」，扫描中则是「已找到 N 筆，共 M 處出現（已掃描 X/Y 卷）」。「已載入全部 N 筆結果」页尾只属于线上模式；
+- 离线结果不分页：每次发布的是会话累计的全部命中快照（`progress.results`），`hasMore` 表示「还没扫完」；统计列固定用「已找到 N 部、V 卷，共 M 處出現」的口径（`totalFound` = 命中作品数，`hitVolumes` = 命中卷数），扫描中再追加「（已掃描 X/Y 卷）」。「已載入全部 N 筆結果」页尾只属于线上模式；线上/本地计数口径与历史快照见 `lib/search/count_alignment.md`；
 - 作品卡片上限**只作用于离线扫描模式**：扫描会自己累积几百部作品，所以正文分区只渲染前 `keywordVisibleGroups` 部（每页 `_resultSectionPageSize = 20` 部）；线上结果是使用者一頁一頁主动要来的，全部渲染，否则「載入更多結果」换来的新一批会被上限挡住、看起来像没反应；
 - 两种分页按钮互斥，不重复出现：离线模式只有「顯示更多作品（剩餘 N 部）／收合多顯示的作品」，线上模式只有「載入更多結果」；按钮排在清单尾端，画面内没有卷到底时不会被构建；
 - 向下卷动是两种模式的主要推进方式（`_onResultsScroll`）：离线模式到底就 `_revealMoreKeywordGroups()` 再放行一页卡片，线上模式到底就 `loadMore(fromScroll: true)` 发下一批请求；扫描期间每 300 ms 发布一次快照，若几百张卡片全部挂在一棵 `Column` 上，点击最后一卷时整串卡片会跟着重画而卡死；
@@ -885,7 +885,7 @@ return scriptureDisplaySettings.showSimplifiedText
 - `homepage groups results into collapsible sections`：首页经目 / 字典 / 正文三个分区、经目与字典初始各 1 条与展开全部、各分区折叠/展开；
 - `dictionary key matches keep simplified candidates`：词典 key 统计与简繁候选；
 - `Goto extracts CBETA citations from surrounding copied text`、首页/离线 Goto 测试：Goto 解析与打开；
-- `offline search ...`：离线全文/经目回退；`offline search scans local volumes incrementally` 验证不需要任何卷动就会一路扫完 70 卷（统计列变成「找到 70 筆結果，共 70 處出現」），且先只渲染前 20 部作品（第 21 部看不到），卷到底才自动放行第二页；
+- `offline search ...`：离线全文/经目回退；`offline search scans local volumes incrementally` 验证不需要任何卷动就会一路扫完 70 卷（统计列变成「已找到 70 部、70 卷，共 70 處出現」），且先只渲染前 20 部作品（第 21 部看不到），卷到底才自动放行第二页；
 - `repeat keyword search paints cached results before the API`：第二次同字查询用 `_FullTextSearchCache` 先出结果（API 被 `Completer` 挡住时画面已有结果），并断言 `all_in_one` 请求不带 `facet`；
 - `catalog section is answered locally without toc request`：经目分区由内建目录直接回答，统计 `/stable/search/toc` 请求数为 0；
 - `homepage searches keyword and catalog concurrently and prioritizes catalog matches`：用 `CatalogCache.debugLoad` 造 11 部测试经目，全文请求还被 `Completer` 挡住时经目分区已经出结果且 `toc` 请求数为 0；全文回来后断言「经目命中的作品」排在只有全文命中的作品前面，以及展开后的分页行数；
