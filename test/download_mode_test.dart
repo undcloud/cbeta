@@ -207,18 +207,18 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.textContaining('完整下載'), findsOneWidget);
-    final updateButton = find.widgetWithText(TextButton, '更新');
+    final updateButton = find.widgetWithText(TextButton, '更新經目');
     expect(updateButton, findsOneWidget);
 
     await tester.tap(updateButton);
     await tester.pumpAndSettle();
 
-    expect(find.text('更新經目與經文'), findsOneWidget);
-    expect(find.textContaining('只有遠端有變更時才會下載'), findsOneWidget);
+    expect(find.text('更新經目'), findsWidgets);
+    expect(find.textContaining('新增的佛典會在背景下載'), findsOneWidget);
 
     await tester.tap(find.widgetWithText(TextButton, '取消'));
     await tester.pumpAndSettle();
-    expect(find.text('更新經目與經文'), findsNothing);
+    expect(find.text('更新經目'), findsOneWidget);
   });
 
   testWidgets('download panel uses the home background color', (

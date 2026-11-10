@@ -4,11 +4,10 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../scripture/cache.dart';
+import '../scripture/index_update_service.dart';
 import 'catalog_cache.dart';
 import 'catalog_store.dart';
 import 'download_manager.dart';
-import 'download_models.dart';
 import 'download_notifications.dart';
 import 'scripture_update_service.dart';
 import 'work_archive.dart';
@@ -19,7 +18,6 @@ enum UpdateStage {
   idle,
   checkingCatalog,
   downloadingCatalog,
-  checkingWorks,
   downloadingWorks,
   completed,
 }
@@ -37,6 +35,7 @@ class UpdateProgress {
     required this.stageFraction,
     required this.receivedBytes,
     required this.totalBytes,
+    this.removedWorks = 0,
     this.currentWork,
     this.message,
     this.releaseVersion,
@@ -44,11 +43,21 @@ class UpdateProgress {
 
   final UpdateStatus status;
   final UpdateStage stage;
+
+  /// 本次差分出的新增作品總數；[checkedWorks] 是目前處理到第幾部。
   final int totalWorks;
   final int checkedWorks;
+
+  /// 已新增並寫入本機的作品數。
   final int updatedWorks;
+
+  /// 新增清單中沒有 HTML 版而略過的作品數。
   final int skippedWorks;
   final int failedWorks;
+
+  /// 本次經目差分偵測到、且本機曾下載過的下架作品數。
+  final int removedWorks;
+
   final double stageFraction;
   final int receivedBytes;
   final int totalBytes;
@@ -68,33 +77,39 @@ class UpdateProgress {
   }
 }
 
-enum _WorkUpdateResult { unchanged, updated, failed }
-
 class UpdateManager extends ChangeNotifier {
   UpdateManager({
     CatalogUpdateService? catalogService,
     ScriptureUpdateService? scriptureService,
     DownloadManager? downloads,
     DownloadNotificationService? notifications,
+    IndexUpdateService? indexService,
     Future<SharedPreferences> Function()? prefsProvider,
     Future<void> Function()? reloadCatalog,
   }) : _catalogService = catalogService ?? CatalogUpdateService(),
        _scriptureService = scriptureService ?? ScriptureUpdateService(),
        _downloads = downloads ?? downloadManager,
        _notifications = notifications ?? downloadNotifications,
+       _indexService = indexService ?? indexUpdateService,
        _prefsProvider = prefsProvider ?? SharedPreferences.getInstance,
        _reloadCatalog = reloadCatalog ?? CatalogCache.instance.reload;
 
   static const _prefsKey = 'cbeta_update_task';
+  static const _orphanedPrefsKey = 'cbeta_orphaned_works';
+  static const _retryPrefsKey = 'cbeta_update_retry_works';
+  static const _schemaVersion = 2;
 
   final CatalogUpdateService _catalogService;
   final ScriptureUpdateService _scriptureService;
   final DownloadManager _downloads;
   final DownloadNotificationService _notifications;
+  final IndexUpdateService _indexService;
   final Future<SharedPreferences> Function() _prefsProvider;
   final Future<void> Function() _reloadCatalog;
 
   final List<String> _pending = [];
+  final List<String> _orphanedWorks = [];
+  final List<String> _retryWorks = [];
   final List<({DateTime time, int bytes})> _speedSamples = [];
 
   SharedPreferences? _prefs;
@@ -106,9 +121,10 @@ class UpdateManager extends ChangeNotifier {
   bool _removed = false;
   int _generation = 0;
   int _checked = 0;
-  int _updated = 0;
-  int _skipped = 0;
+  int _added = 0;
+  int _noHtml = 0;
   int _failed = 0;
+  int _removedCount = 0;
   int _receivedBytes = 0;
   int _totalBytes = 0;
   int _sessionBytes = 0;
@@ -137,6 +153,9 @@ class UpdateManager extends ChangeNotifier {
       (_status == UpdateStatus.paused || _status == UpdateStatus.failed);
   bool get hasTask => _taskActive || _status != UpdateStatus.idle;
 
+  /// 本機曾下載、但新版經目已移除的作品；只提示，不會自動刪除經卷。
+  List<String> get orphanedWorks => List.unmodifiable(_orphanedWorks);
+
   int get _totalWorks => _checked + _pending.length;
 
   UpdateProgress get progress => UpdateProgress(
@@ -144,9 +163,10 @@ class UpdateManager extends ChangeNotifier {
     stage: _stage,
     totalWorks: _totalWorks,
     checkedWorks: _checked,
-    updatedWorks: _updated,
-    skippedWorks: _skipped,
+    updatedWorks: _added,
+    skippedWorks: _noHtml,
     failedWorks: _failed,
+    removedWorks: _removedCount,
     stageFraction: _stageFraction,
     receivedBytes: _receivedBytes,
     totalBytes: _totalBytes,
@@ -177,10 +197,18 @@ class UpdateManager extends ChangeNotifier {
   Future<void> initialize() async {
     try {
       _prefs = await _prefsProvider();
+      await _restoreOrphaned();
+      await _restoreRetry();
       final raw = _prefs?.getString(_prefsKey);
       if (raw == null || raw.isEmpty) return;
       final decoded = jsonDecode(raw);
       if (decoded is! Map<String, dynamic>) return;
+      final schema = (decoded['schema'] as num?)?.toInt();
+      if (schema != _schemaVersion) {
+        // 舊版任務保存的是「重新檢查全部已下載作品」的清單，與新流程不相容。
+        await _prefs?.remove(_prefsKey);
+        return;
+      }
       final pending = (decoded['pending'] as List<dynamic>? ?? const [])
           .whereType<String>()
           .where(_isValidWork)
@@ -195,15 +223,16 @@ class UpdateManager extends ChangeNotifier {
         ..addAll(pending);
       _catalogDone = decoded['catalog_done'] as bool? ?? false;
       _checked = (decoded['checked'] as num?)?.toInt() ?? 0;
-      _updated = (decoded['updated'] as num?)?.toInt() ?? 0;
-      _skipped = (decoded['skipped'] as num?)?.toInt() ?? 0;
+      _added = (decoded['added'] as num?)?.toInt() ?? 0;
+      _noHtml = (decoded['no_html'] as num?)?.toInt() ?? 0;
       _failed = (decoded['failed'] as num?)?.toInt() ?? 0;
+      _removedCount = (decoded['removed_count'] as num?)?.toInt() ?? 0;
       _releaseVersion = decoded['release'] as String?;
       _error = decoded['error'] as String?;
       _taskActive = true;
       _status = UpdateStatus.paused;
       _stage = _catalogDone
-          ? UpdateStage.checkingWorks
+          ? UpdateStage.downloadingWorks
           : UpdateStage.checkingCatalog;
       _message = '更新已暫停';
     } catch (error) {
@@ -225,9 +254,9 @@ class UpdateManager extends ChangeNotifier {
     _error = null;
     _status = UpdateStatus.running;
     _stage = _catalogDone
-        ? UpdateStage.checkingWorks
+        ? UpdateStage.downloadingWorks
         : UpdateStage.checkingCatalog;
-    _message = _catalogDone ? '準備檢查經文…' : '檢查經目更新…';
+    _message = _catalogDone ? '準備下載新增經文…' : '檢查經目更新…';
     _stageFraction = 0;
     _notify(force: true);
     unawaited(_startNotification());
@@ -236,15 +265,14 @@ class UpdateManager extends ChangeNotifier {
   }
 
   void _beginNewTask() {
-    _pending
-      ..clear()
-      ..addAll(_downloads.downloadedWorkIds.toList()..sort());
+    _pending.clear();
     _taskActive = true;
     _catalogDone = false;
     _checked = 0;
-    _updated = 0;
-    _skipped = 0;
+    _added = 0;
+    _noHtml = 0;
     _failed = 0;
+    _removedCount = 0;
     _releaseVersion = null;
     _stageFraction = 0;
   }
@@ -261,7 +289,7 @@ class UpdateManager extends ChangeNotifier {
     unawaited(start());
   }
 
-  /// 刪除更新任務；已更新的經文與經目檔案不會被還原。
+  /// 刪除更新任務；已新增的經文與經目檔案不會被還原。
   void deleteTask() {
     _generation++;
     _removed = true;
@@ -276,15 +304,28 @@ class UpdateManager extends ChangeNotifier {
     _error = null;
     _releaseVersion = null;
     _checked = 0;
-    _updated = 0;
-    _skipped = 0;
+    _added = 0;
+    _noHtml = 0;
     _failed = 0;
+    // 下架提示獨立保存，刪除更新任務不會順手清掉。
+    _removedCount = _orphanedWorks.length;
     _receivedBytes = 0;
     _totalBytes = 0;
     _stageFraction = 0;
     _speedSamples.clear();
+    _retryWorks.clear();
     _stopNotification();
     unawaited(_clearPersisted());
+    unawaited(_persistRetry());
+    notifyListeners();
+  }
+
+  /// 使用者確認後清掉下架提示；本機經卷與下載紀錄保持不動。
+  void clearOrphanedWorks() {
+    if (_orphanedWorks.isEmpty && _removedCount == 0) return;
+    _orphanedWorks.clear();
+    _removedCount = 0;
+    unawaited(_persistOrphaned());
     notifyListeners();
   }
 
@@ -295,30 +336,23 @@ class UpdateManager extends ChangeNotifier {
         if (generation != _generation || _removed) return;
       }
 
-      if (!CatalogCache.instance.isLoaded) {
-        try {
-          await CatalogCache.instance.load();
-        } catch (error) {
-          debugPrint('Catalog load before work update failed: $error');
-        }
-      }
-
       while (_pending.isNotEmpty &&
           !_pauseRequested &&
           !_removed &&
           generation == _generation) {
         final work = _pending.first;
         _currentWork = work;
-        _stage = UpdateStage.checkingWorks;
-        _message = '檢查經文：$work';
+        _stage = UpdateStage.downloadingWorks;
+        _message = '下載新增經文：$work';
         _receivedBytes = 0;
         _totalBytes = 0;
         _sessionBytes = 0;
         _speedSamples.clear();
         _notify(force: true);
 
-        await _updateWork(work, generation);
+        final completed = await _downloadNewWork(work, generation);
         if (generation != _generation || _removed) return;
+        if (!completed) break;
 
         _pending.removeAt(0);
         _checked++;
@@ -331,7 +365,7 @@ class UpdateManager extends ChangeNotifier {
       if (_pauseRequested) {
         _status = UpdateStatus.paused;
         _stage = _catalogDone
-            ? UpdateStage.checkingWorks
+            ? UpdateStage.downloadingWorks
             : UpdateStage.checkingCatalog;
         _message = '更新已暫停';
         _currentWork = null;
@@ -346,17 +380,16 @@ class UpdateManager extends ChangeNotifier {
       _taskActive = false;
       _currentWork = null;
       _stageFraction = 1;
-      _message = _failed > 0
-          ? '更新完成：共更新 $_updated 部佛經，$_skipped 部已是最新，$_failed 部失敗'
-          : '更新完成：共更新 $_updated 部佛經，$_skipped 部已是最新';
+      _message = _summary();
       _stopNotification();
       await _clearPersisted();
       _notify(force: true);
+      _refreshIndexesIfNeeded();
     } on CatalogUpdatePaused {
       if (generation == _generation) {
         _status = UpdateStatus.paused;
         _stage = _catalogDone
-            ? UpdateStage.checkingWorks
+            ? UpdateStage.downloadingWorks
             : UpdateStage.checkingCatalog;
         _message = '更新已暫停';
         _currentWork = null;
@@ -373,8 +406,16 @@ class UpdateManager extends ChangeNotifier {
         _stopNotification();
         await _persist();
         _notify(force: true);
+        _refreshIndexesIfNeeded();
       }
     }
+  }
+
+  /// 新經卷落地時已排入逐卷索引；這裡只負責觸發一次全域增量核對。
+  void _refreshIndexesIfNeeded() {
+    if (_added == 0) return;
+    _indexService.requestUpdate();
+    unawaited(_indexService.startIfNeeded());
   }
 
   Future<void> _updateCatalog(int generation) async {
@@ -382,6 +423,15 @@ class UpdateManager extends ChangeNotifier {
     _message = '檢查經目更新…';
     _stageFraction = 0;
     _notify(force: true);
+
+    Set<String>? oldWorks;
+    try {
+      oldWorks = await _catalogWorkIds();
+    } catch (error) {
+      debugPrint('Catalog snapshot failed: $error');
+    }
+    if (generation != _generation || _removed) return;
+
     final outcome = await _catalogService.update(
       onProgress: (message, fraction) {
         if (generation != _generation || _removed) return;
@@ -402,7 +452,6 @@ class UpdateManager extends ChangeNotifier {
         : outcome.releaseVersion;
     _stageFraction = 1;
     _message = outcome.changed ? '經目已更新' : '經目已是最新';
-    await _persist();
     if (outcome.changed) {
       try {
         await _reloadCatalog();
@@ -411,62 +460,106 @@ class UpdateManager extends ChangeNotifier {
         _error = '經目已下載，但重新載入失敗：$error';
       }
     }
+    if (generation != _generation || _removed) return;
+
+    Set<String>? newWorks;
+    if (outcome.changed) {
+      try {
+        newWorks = await _catalogWorkIds();
+      } catch (error) {
+        debugPrint('Catalog snapshot after update failed: $error');
+      }
+    } else {
+      newWorks = oldWorks;
+    }
+
+    // 舊經目為空時不做差分，避免把整份清單誤判成新增而下載全藏。
+    if (oldWorks != null &&
+        newWorks != null &&
+        oldWorks.isNotEmpty &&
+        newWorks.isNotEmpty) {
+      _applyCatalogDiff(oldWorks, newWorks);
+    } else {
+      _seedRetryWorks();
+    }
+
+    await _persist();
     _notify(force: true);
   }
 
-  Future<_WorkUpdateResult> _updateWork(String work, int generation) async {
-    final localVersions = _downloads.versionsForWork(work);
-    if (localVersions.isEmpty) return _WorkUpdateResult.unchanged;
-
-    String? remoteRelease;
-    Object? changesError;
-    try {
-      remoteRelease = await _scriptureService.latestChangesVersion(work);
-    } catch (error) {
-      changesError = error;
-    }
-    if (generation != _generation || _removed) {
-      return _WorkUpdateResult.unchanged;
-    }
-
-    final localRelease = _storedRelease(localVersions);
-
-    if (changesError == null) {
-      if (remoteRelease == null || remoteRelease.isEmpty) {
-        _skipped++;
-        _message = '無修訂紀錄，略過：$work';
-        return _WorkUpdateResult.unchanged;
-      }
-      if (localRelease != null &&
-          ScriptureUpdateService.normalizeRevision(remoteRelease) ==
-              ScriptureUpdateService.normalizeRevision(localRelease)) {
-        _skipped++;
-        _message = '已是最新：$work';
-        return _WorkUpdateResult.unchanged;
-      }
-    } else {
-      WorkRemoteSignature remote;
+  Future<Set<String>?> _catalogWorkIds() async {
+    final cache = CatalogCache.instance;
+    if (!cache.isLoaded) {
       try {
-        remote = await _scriptureService.headWork(work);
+        await cache.load();
       } catch (error) {
-        _failed++;
-        _error = '$work：$error';
-        return _WorkUpdateResult.failed;
-      }
-      if (generation != _generation || _removed) {
-        return _WorkUpdateResult.unchanged;
-      }
-      if (remote.matchesLocal(localVersions.map((version) => version.ver))) {
-        _skipped++;
-        _message = '已是最新：$work';
-        return _WorkUpdateResult.unchanged;
+        debugPrint('Catalog load before diff failed: $error');
+        return null;
       }
     }
+    if (!cache.isLoaded) return null;
+    return {for (final entry in cache.allWorks) entry.work};
+  }
 
-    _stage = UpdateStage.downloadingWorks;
-    _message = remoteRelease != null && remoteRelease.isNotEmpty
-        ? '更新經文：$work（$remoteRelease）'
-        : '更新經文：$work';
+  void _applyCatalogDiff(Set<String> oldWorks, Set<String> newWorks) {
+    final downloaded = _downloads.downloadedWorkIds;
+    if (_retryWorks.any((work) => !newWorks.contains(work))) {
+      _retryWorks.removeWhere((work) => !newWorks.contains(work));
+      unawaited(_persistRetry());
+    }
+    final added =
+        <String>{...newWorks.difference(oldWorks), ..._retryWorks}
+            .where(
+              (work) => newWorks.contains(work) && !downloaded.contains(work),
+            )
+            .toList()
+          ..sort();
+    final removed =
+        oldWorks.difference(newWorks).where(downloaded.contains).toList()
+          ..sort();
+    _pending
+      ..clear()
+      ..addAll(added);
+    _orphanedWorks
+      ..clear()
+      ..addAll(removed);
+    _removedCount = _orphanedWorks.length;
+    unawaited(_persistOrphaned());
+  }
+
+  /// 經目沒變時只重試上次下載失敗的新增作品。
+  void _seedRetryWorks() {
+    final downloaded = _downloads.downloadedWorkIds;
+    if (_retryWorks.any(downloaded.contains)) {
+      _retryWorks.removeWhere(downloaded.contains);
+      unawaited(_persistRetry());
+    }
+    _pending
+      ..clear()
+      ..addAll(
+        _retryWorks.where((work) => !downloaded.contains(work)).toList()
+          ..sort(),
+      );
+  }
+
+  /// 新增作品靜默下載：先用 HEAD 確認 HTML 壓縮檔存在，再整部寫入。
+  Future<bool> _downloadNewWork(String work, int generation) async {
+    WorkHeadInfo head;
+    try {
+      head = await _scriptureService.headWork(work);
+    } on ScriptureHttpException catch (error) {
+      if (generation != _generation || _removed) return false;
+      _failNewWork(work, error, notFound: error.statusCode == 404);
+      return true;
+    } catch (error) {
+      if (generation != _generation || _removed) return false;
+      _failNewWork(work, error);
+      return true;
+    }
+    if (generation != _generation || _removed) return false;
+    if (_pauseRequested) return false;
+
+    _totalBytes = head.contentLength ?? 0;
     _notify(force: true);
 
     WorkArchive? archive;
@@ -477,78 +570,79 @@ class UpdateManager extends ChangeNotifier {
         onBytesReceived: _handleBytesReceived,
       );
     } catch (error) {
-      debugPrint('Work update archive failed $work: $error');
+      debugPrint('New work download failed $work: $error');
+      _error = '$work：$error';
     }
-    if (generation != _generation || _removed) {
-      return _WorkUpdateResult.unchanged;
-    }
+    if (generation != _generation || _removed) return false;
+    if (_pauseRequested) return false;
 
-    final localJuans = localVersions.map((version) => version.juan).toSet();
-    final byJuan = <String, CachedScriptureVolume>{
-      if (archive != null)
-        for (final volume in archive.volumes) volume.juan: volume,
-    };
-    final replacements = <CachedScriptureVolume>[];
-    Object? lastError;
-    for (final juan in localJuans) {
-      final cached = byJuan[juan];
-      if (cached != null) {
-        replacements.add(cached);
-        continue;
-      }
-      try {
-        replacements.add(
-          await _scriptureService.downloadVolume(
-            work,
-            juan,
-            onBytesReceived: _handleBytesReceived,
-          ),
-        );
-      } catch (error) {
-        lastError = error;
-        debugPrint('Work update volume failed $work:$juan: $error');
-      }
-    }
-
-    if (generation != _generation || _removed) {
-      return _WorkUpdateResult.unchanged;
-    }
-    if (replacements.isEmpty) {
+    if (archive == null || archive.volumes.isEmpty) {
       _failed++;
-      _error = lastError == null ? '$work：沒有可更新的經卷' : '$work：$lastError';
-      return _WorkUpdateResult.failed;
+      _markRetry(work);
+      _error ??= '$work：沒有可下載的經卷';
+      _message = '新增經文失敗：$work';
+      return true;
     }
 
-    final replaced = await _downloads.replaceDownloadedVolumes(
-      work,
-      replacements,
-      release: remoteRelease != null && remoteRelease.isNotEmpty
-          ? remoteRelease
-          : null,
-    );
-    if (replaced == 0) {
-      _failed++;
-      _error = '$work：寫入更新經卷失敗';
-      return _WorkUpdateResult.failed;
+    var stored = 0;
+    try {
+      stored = await _downloads.storeDownloadedWork(
+        work,
+        archive.volumes,
+        release: _releaseVersion,
+      );
+    } catch (error) {
+      debugPrint('New work store failed $work: $error');
+      _error = '$work：$error';
     }
-    _updated++;
-    _message = '已更新：$work';
-    return _WorkUpdateResult.updated;
+    if (generation != _generation || _removed) return false;
+
+    if (stored == 0) {
+      _failed++;
+      _markRetry(work);
+      _error ??= '$work：寫入新增經卷失敗';
+      _message = '新增經文失敗：$work';
+      return true;
+    }
+    _added++;
+    _clearRetry(work);
+    _message = '已新增：$work';
+    _indexService.requestUpdate();
+    return true;
   }
 
-  /// 取所有經卷中最舊的版號；只要有一卷沒有記錄就視為舊資料。
-  static String? _storedRelease(Iterable<LocalVersion> versions) {
-    String? oldest;
-    for (final version in versions) {
-      final release = version.release?.trim();
-      if (release == null || release.isEmpty) return null;
-      if (oldest == null ||
-          ScriptureUpdateService.revisionRank(release) <
-              ScriptureUpdateService.revisionRank(oldest)) {
-        oldest = release;
-      }
+  void _failNewWork(String work, Object error, {bool notFound = false}) {
+    if (notFound) {
+      // 經目有這部作品，但 CBETA 沒有提供 HTML 壓縮檔。
+      _noHtml++;
+      _message = '$work：沒有 HTML 版，略過';
+      return;
     }
-    return oldest;
+    _failed++;
+    _markRetry(work);
+    _error = '$work：$error';
+    _message = '新增經文失敗：$work';
+  }
+
+  void _markRetry(String work) {
+    if (_retryWorks.contains(work)) return;
+    _retryWorks.add(work);
+    unawaited(_persistRetry());
+  }
+
+  void _clearRetry(String work) {
+    if (!_retryWorks.remove(work)) return;
+    unawaited(_persistRetry());
+  }
+
+  String _summary() {
+    final parts = <String>[
+      if (_added > 0) '新增 $_added 部',
+      if (_removedCount > 0) '下架 $_removedCount 部',
+      if (_noHtml > 0) '$_noHtml 部無 HTML 版',
+      if (_failed > 0) '$_failed 部失敗',
+    ];
+    return parts.isEmpty ? '經目已是最新' : '更新完成：${parts.join('，')}';
   }
 
   bool get _isCatalogStage =>
@@ -564,7 +658,7 @@ class UpdateManager extends ChangeNotifier {
     _lastNotification = DateTime.now();
     final progress = this.progress;
     await _notifications.start(
-      title: _isCatalogStage ? '正在更新經目' : '正在更新經文',
+      title: _notificationTitle,
       text: _notificationText(progress),
       progress: _notificationValue(progress),
       max: _notificationMax(progress),
@@ -592,7 +686,7 @@ class UpdateManager extends ChangeNotifier {
     final progress = this.progress;
     unawaited(
       _notifications.update(
-        title: _isCatalogStage ? '正在更新經目' : '正在更新經文',
+        title: _notificationTitle,
         text: _notificationText(progress),
         progress: _notificationValue(progress),
         max: _notificationMax(progress),
@@ -600,15 +694,18 @@ class UpdateManager extends ChangeNotifier {
     );
   }
 
+  String get _notificationTitle => _isCatalogStage ? '正在更新經目' : '正在下載新增經文';
+
   String _notificationText(UpdateProgress progress) {
     if (_isCatalogStage) return progress.message ?? '檢查經目更新…';
     final parts = <String>[
-      if (progress.updatedWorks > 0) '已更新 ${progress.updatedWorks} 部',
+      if (progress.updatedWorks > 0) '已新增 ${progress.updatedWorks} 部',
+      if (progress.removedWorks > 0) '下架 ${progress.removedWorks} 部',
       if (progress.totalWorks > 0)
-        '已檢查 ${progress.checkedWorks}/${progress.totalWorks} 部',
+        '已處理 ${progress.checkedWorks}/${progress.totalWorks} 部',
       if (progress.currentWork != null) '目前：${progress.currentWork}',
     ];
-    return parts.isEmpty ? '準備檢查經文…' : parts.join(' · ');
+    return parts.isEmpty ? '準備下載新增經文…' : parts.join(' · ');
   }
 
   int _notificationMax(UpdateProgress progress) => _isCatalogStage
@@ -657,19 +754,76 @@ class UpdateManager extends ChangeNotifier {
       await prefs.setString(
         _prefsKey,
         jsonEncode({
+          'schema': _schemaVersion,
           'active': _taskActive,
           'catalog_done': _catalogDone,
           'pending': _pending,
           'checked': _checked,
-          'updated': _updated,
-          'skipped': _skipped,
+          'added': _added,
+          'no_html': _noHtml,
           'failed': _failed,
+          'removed_count': _removedCount,
           'release': _releaseVersion,
           'error': _error,
         }),
       );
     } catch (error) {
       debugPrint('Failed to persist update task: $error');
+    }
+  }
+
+  Future<void> _restoreOrphaned() async {
+    final raw = _prefs?.getString(_orphanedPrefsKey);
+    if (raw == null || raw.isEmpty) return;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return;
+      _orphanedWorks
+        ..clear()
+        ..addAll(decoded.whereType<String>().where(_isValidWork));
+      _removedCount = _orphanedWorks.length;
+    } catch (error) {
+      debugPrint('Orphaned works restore failed: $error');
+    }
+  }
+
+  Future<void> _persistOrphaned() async {
+    try {
+      final prefs = _prefs ??= await _prefsProvider();
+      if (_orphanedWorks.isEmpty) {
+        await prefs.remove(_orphanedPrefsKey);
+      } else {
+        await prefs.setString(_orphanedPrefsKey, jsonEncode(_orphanedWorks));
+      }
+    } catch (error) {
+      debugPrint('Failed to persist orphaned works: $error');
+    }
+  }
+
+  Future<void> _restoreRetry() async {
+    final raw = _prefs?.getString(_retryPrefsKey);
+    if (raw == null || raw.isEmpty) return;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return;
+      _retryWorks
+        ..clear()
+        ..addAll(decoded.whereType<String>().where(_isValidWork));
+    } catch (error) {
+      debugPrint('Retry works restore failed: $error');
+    }
+  }
+
+  Future<void> _persistRetry() async {
+    try {
+      final prefs = _prefs ??= await _prefsProvider();
+      if (_retryWorks.isEmpty) {
+        await prefs.remove(_retryPrefsKey);
+      } else {
+        await prefs.setString(_retryPrefsKey, jsonEncode(_retryWorks));
+      }
+    } catch (error) {
+      debugPrint('Failed to persist retry works: $error');
     }
   }
 
@@ -692,6 +846,8 @@ class UpdateManager extends ChangeNotifier {
   ) async {
     final prefs = await prefsProvider();
     await prefs.remove(_prefsKey);
+    await prefs.remove(_orphanedPrefsKey);
+    await prefs.remove(_retryPrefsKey);
   }
 }
 

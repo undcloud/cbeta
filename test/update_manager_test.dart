@@ -15,130 +15,49 @@ import 'package:xuefo/download/scripture_update_service.dart';
 import 'package:xuefo/download/update_manager.dart';
 import 'package:xuefo/download/work_archive.dart';
 import 'package:xuefo/scripture/cache.dart';
+import 'package:xuefo/scripture/index_update_service.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
-    CatalogCache.instance.debugLoad();
+    CatalogCache.instance.debugReset();
   });
 
   tearDown(() {
     CatalogCache.instance.debugReset();
   });
 
-  group('WorkRemoteSignature', () {
-    test('prefers the etag and matches every local version', () {
-      const signature = WorkRemoteSignature(
-        etag: 'abc',
-        lastModified: 'Tue, 01 Sep 2026 00:00:00 GMT',
-        contentLength: 10,
-      );
-
-      expect(signature.signature, 'abc');
-      expect(signature.matchesLocal(['abc']), isTrue);
-      expect(signature.matchesLocal(['abc', 'abc']), isTrue);
-      expect(signature.matchesLocal(['abc', 'def']), isFalse);
-      expect(signature.matchesLocal(['def']), isFalse);
-      expect(signature.matchesLocal(const []), isFalse);
-      expect(signature.matchesLocal(['']), isFalse);
-    });
-
-    test('falls back to last-modified when no etag is available', () {
-      const signature = WorkRemoteSignature(
-        lastModified: 'Tue, 01 Sep 2026 00:00:00 GMT',
-      );
-      expect(signature.signature, 'Tue, 01 Sep 2026 00:00:00 GMT');
-      expect(signature.matchesLocal(['Tue, 01 Sep 2026 00:00:00 GMT']), isTrue);
-    });
-
-    test('never matches when the remote has no signature', () {
-      const signature = WorkRemoteSignature(contentLength: 42);
-      expect(signature.signature, isEmpty);
-      expect(signature.matchesLocal(['42']), isFalse);
-    });
-  });
-
   group('ScriptureUpdateService', () {
-    test('reads the etag and last-modified from HEAD', () async {
+    test('reads the zip content length from HEAD', () async {
       final requests = <http.Request>[];
       final client = MockClient((request) async {
         requests.add(request);
-        return http.Response(
-          '',
-          200,
-          headers: {
-            'etag': '"zip-etag"',
-            'last-modified': 'Wed, 21 Oct 2026 07:28:00 GMT',
-          },
-        );
+        return http.Response.bytes(List.filled(2048, 0), 200);
       });
       final service = ScriptureUpdateService(clientFactory: () => client);
 
-      final signature = await service.headWork('T0001');
+      final info = await service.headWork('T0001');
 
       expect(requests.single.method, 'HEAD');
       expect(requests.single.url.path, '/stable/download/html/T0001.html.zip');
-      expect(signature.etag, 'zip-etag');
-      expect(signature.lastModified, 'Wed, 21 Oct 2026 07:28:00 GMT');
-      expect(signature.matchesLocal(['zip-etag']), isTrue);
+      expect(info.contentLength, 2048);
     });
 
-    test('throws when HEAD fails', () async {
+    test('throws a typed exception when HEAD fails', () async {
       final client = MockClient((_) async => http.Response('', 404));
       final service = ScriptureUpdateService(clientFactory: () => client);
-      expect(service.headWork('T0001'), throwsException);
-    });
 
-    test('returns the highest revision from the changes API', () async {
-      final client = MockClient((request) async {
-        expect(request.url.path, '/stable/changes');
-        expect(request.url.queryParameters['work'], 'T0001');
-        return http.Response(
-          jsonEncode({
-            'results': [
-              {'ver': '2025R1'},
-              {'ver': '2026.R2'},
-              {'ver': '2024R3'},
-            ],
-          }),
-          200,
-          headers: {'content-type': 'application/json; charset=utf-8'},
-        );
-      });
-      final service = ScriptureUpdateService(clientFactory: () => client);
-
-      expect(await service.latestChangesVersion('T0001'), '2026.R2');
-    });
-
-    test('throws when the changes API fails', () async {
-      final client = MockClient((_) async => http.Response('', 500));
-      final service = ScriptureUpdateService(clientFactory: () => client);
-      expect(service.latestChangesVersion('T0001'), throwsA(isA<Exception>()));
-    });
-
-    test('returns null when the changes API has no records', () async {
-      final client = MockClient((_) async {
-        return http.Response(
-          jsonEncode({'results': []}),
-          200,
-          headers: {'content-type': 'application/json; charset=utf-8'},
-        );
-      });
-      final service = ScriptureUpdateService(clientFactory: () => client);
-
-      expect(await service.latestChangesVersion('T0001'), isNull);
-    });
-
-    test('normalizes revision format', () {
-      expect(
-        ScriptureUpdateService.normalizeRevision('2026.R2'),
-        ScriptureUpdateService.normalizeRevision('2026R2'),
-      );
-      expect(
-        ScriptureUpdateService.normalizeRevision('2023 Q4'),
-        ScriptureUpdateService.normalizeRevision('2023Q4'),
+      await expectLater(
+        service.headWork('T0001'),
+        throwsA(
+          isA<ScriptureHttpException>().having(
+            (error) => error.statusCode,
+            'statusCode',
+            404,
+          ),
+        ),
       );
     });
   });
@@ -271,45 +190,75 @@ void main() {
     late _FakeCatalogUpdateService catalog;
     late _FakeScriptureUpdateService scripture;
     late _FakeNotificationService notifications;
+    late _FakeIndexUpdateService indexes;
+    late Map<String, AllWorksEntry> catalogAfterUpdate;
     late int reloadCalls;
     late UpdateManager manager;
+
+    const initialCatalog = {
+      'T0001': AllWorksEntry(work: 'T0001', title: '長阿含經', juans: ['1']),
+      'T0002': AllWorksEntry(work: 'T0002', title: '中阿含經', juans: ['1']),
+    };
 
     UpdateManager buildManager() => UpdateManager(
       catalogService: catalog,
       scriptureService: scripture,
       downloads: downloads,
       notifications: notifications,
-      reloadCatalog: () async => reloadCalls++,
+      indexService: indexes,
+      reloadCatalog: () async {
+        reloadCalls++;
+        if (catalogAfterUpdate.isNotEmpty) {
+          CatalogCache.instance.debugLoad(allWorks: catalogAfterUpdate);
+        }
+      },
     );
+
+    void catalogChanged({required Map<String, AllWorksEntry> newWorks}) {
+      catalog.outcome = const CatalogUpdateOutcome(
+        updatedFiles: 4,
+        releaseVersion: '2026.R2',
+        releaseChanged: true,
+      );
+      catalogAfterUpdate = newWorks;
+    }
+
+    void addArchive(String work, List<String> juans) {
+      scripture.archives[work] = WorkArchive(
+        volumes: [
+          for (final juan in juans) _volume(work, juan, 'new-$work-$juan'),
+        ],
+        version: 'new-$work',
+      );
+    }
 
     setUp(() {
       downloads = _FakeDownloadManager([
         _version('T0001', '1', 'old-etag', release: '2025R1'),
-        _version('T0001', '2', 'old-etag', release: '2025R1'),
         _version('T0002', '1', 'etag-2', release: '2026.R2'),
       ]);
       catalog = _FakeCatalogUpdateService();
       scripture = _FakeScriptureUpdateService();
       notifications = _FakeNotificationService();
+      indexes = _FakeIndexUpdateService();
+      catalogAfterUpdate = {};
       reloadCalls = 0;
+      CatalogCache.instance.debugLoad(allWorks: initialCatalog);
       manager = buildManager();
     });
 
-    test('updates changed works and skips unchanged ones', () async {
-      catalog.outcome = const CatalogUpdateOutcome(
-        updatedFiles: 2,
-        releaseVersion: '2026.R2',
-        releaseChanged: true,
+    test('silently downloads only newly added works', () async {
+      catalogChanged(
+        newWorks: {
+          ...initialCatalog,
+          'T0003': const AllWorksEntry(
+            work: 'T0003',
+            title: '增壹阿含經',
+            juans: ['1', '2'],
+          ),
+        },
       );
-      scripture.releases['T0001'] = '2026.R2';
-      scripture.releases['T0002'] = '2026.R2';
-      scripture.archives['T0001'] = WorkArchive(
-        volumes: [
-          _volume('T0001', '1', 'new-1'),
-          _volume('T0001', '2', 'new-2'),
-        ],
-        version: 'new-etag',
-      );
+      addArchive('T0003', ['1', '2']);
 
       expect(await manager.start(), isTrue);
       await _waitFor(() => manager.status == UpdateStatus.completed);
@@ -317,188 +266,210 @@ void main() {
       expect(catalog.calls, 1);
       expect(reloadCalls, 1);
       expect(manager.releaseVersion, '2026.R2');
-      expect(scripture.changesCalls, ['T0001', 'T0002']);
+      expect(scripture.headCalls, ['T0003']);
       expect(scripture.archiveDownloads, 1);
-      expect(downloads.replaced['T0001'], hasLength(2));
-      expect(downloads.replaced['T0001']!.map((volume) => volume.juan), [
+      expect(downloads.stored['T0003'], hasLength(2));
+      expect(downloads.stored['T0003']!.map((volume) => volume.juan), [
         '1',
         '2',
       ]);
+      expect(downloads.storedReleases['T0003'], '2026.R2');
 
       final progress = manager.progress;
-      expect(progress.totalWorks, 2);
-      expect(progress.checkedWorks, 2);
+      expect(progress.totalWorks, 1);
+      expect(progress.checkedWorks, 1);
       expect(progress.updatedWorks, 1);
-      expect(progress.skippedWorks, 1);
+      expect(progress.removedWorks, 0);
+      expect(progress.skippedWorks, 0);
       expect(progress.failedWorks, 0);
       expect(manager.stage, UpdateStage.completed);
-      expect(progress.message, contains('更新 1 部'));
+      expect(progress.message, contains('新增 1 部'));
       expect(manager.canResume, isFalse);
+
+      expect(indexes.requestCalls, greaterThanOrEqualTo(1));
+      expect(indexes.startCalls, 1);
 
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getString('cbeta_update_task'), isNull);
-      expect(downloads.replacementReleases['T0001'], '2026.R2');
       expect(notifications.starts, 1);
       expect(notifications.stops, 1);
       expect(notifications.updates, greaterThan(0));
     });
 
-    test('skips when remote release matches local', () async {
-      downloads = _FakeDownloadManager([
-        _version('T0001', '1', 'old-etag', release: '2026.R2'),
-        _version('T0002', '1', 'etag-2', release: '2026.R2'),
-      ]);
-      manager = buildManager();
-      scripture.releases['T0001'] = '2026.R2';
-      scripture.releases['T0002'] = '2026.R2';
-
-      expect(await manager.start(), isTrue);
-      await _waitFor(() => manager.status == UpdateStatus.completed);
-
-      expect(scripture.archiveDownloads, 0);
-      expect(scripture.volumeDownloads, 0);
-      expect(manager.progress.updatedWorks, 0);
-      expect(manager.progress.skippedWorks, 2);
-    });
-
-    test('updates when remote release differs from local', () async {
-      downloads = _FakeDownloadManager([
-        _version('T0001', '1', 'old-etag', release: '2024R1'),
-      ]);
-      manager = buildManager();
-      scripture.releases['T0001'] = '2025R2';
-      scripture.archives['T0001'] = WorkArchive(
-        volumes: [_volume('T0001', '1', 'new')],
-        version: 'new-etag',
+    test('skips added works that have no HTML archive', () async {
+      catalogChanged(
+        newWorks: {
+          ...initialCatalog,
+          'T0003': const AllWorksEntry(
+            work: 'T0003',
+            title: '增壹阿含經',
+            juans: ['1'],
+          ),
+          'X0046': const AllWorksEntry(
+            work: 'X0046',
+            title: '未提供作品',
+            juans: ['1'],
+          ),
+        },
       );
+      addArchive('T0003', ['1']);
+      scripture.noHtml.add('X0046');
 
       expect(await manager.start(), isTrue);
       await _waitFor(() => manager.status == UpdateStatus.completed);
 
+      expect(scripture.headCalls, ['T0003', 'X0046']);
       expect(scripture.archiveDownloads, 1);
       expect(manager.progress.updatedWorks, 1);
-      expect(downloads.replacementReleases['T0001'], '2025R2');
-    });
-
-    test('updates legacy records without a stored release', () async {
-      downloads = _FakeDownloadManager([_version('T0001', '1', 'old-etag')]);
-      manager = buildManager();
-      scripture.releases['T0001'] = '2024R1';
-      scripture.archives['T0001'] = WorkArchive(
-        volumes: [_volume('T0001', '1', 'new')],
-        version: 'new-etag',
-      );
-
-      expect(await manager.start(), isTrue);
-      await _waitFor(() => manager.status == UpdateStatus.completed);
-
-      expect(scripture.archiveDownloads, 1);
-      expect(downloads.replacementReleases['T0001'], '2024R1');
-    });
-
-    test('skips when remote has no change records', () async {
-      downloads = _FakeDownloadManager([
-        _version('T0001', '1', 'old-etag', release: '2025R2'),
-      ]);
-      manager = buildManager();
-      scripture.releases['T0001'] = null;
-
-      expect(await manager.start(), isTrue);
-      await _waitFor(() => manager.status == UpdateStatus.completed);
-
-      expect(scripture.archiveDownloads, 0);
       expect(manager.progress.skippedWorks, 1);
-      expect(manager.progress.updatedWorks, 0);
+      expect(manager.progress.failedWorks, 0);
+      expect(manager.progress.checkedWorks, 2);
+      expect(manager.progress.message, contains('1 部無 HTML 版'));
+      expect(manager.error, isNull);
     });
 
-    test('does not reload the catalog when nothing changed', () async {
-      catalog.outcome = const CatalogUpdateOutcome(
-        updatedFiles: 0,
-        releaseVersion: '2026.R2',
-        releaseChanged: false,
-      );
-      scripture.releases['T0001'] = '2025R1';
-      scripture.releases['T0002'] = '2026.R2';
+    test('reports removed downloaded works without deleting them', () async {
+      catalogChanged(newWorks: {'T0002': initialCatalog['T0002']!});
 
+      expect(await manager.start(), isTrue);
+      await _waitFor(() => manager.status == UpdateStatus.completed);
+
+      expect(manager.progress.removedWorks, 1);
+      expect(manager.orphanedWorks, ['T0001']);
+      expect(manager.progress.updatedWorks, 0);
+      expect(scripture.headCalls, isEmpty);
+      expect(downloads.stored, isEmpty);
+      expect(manager.progress.message, contains('下架 1 部'));
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('cbeta_orphaned_works'), contains('T0001'));
+
+      manager.clearOrphanedWorks();
+      expect(manager.orphanedWorks, isEmpty);
+      await _waitFor(() => prefs.getString('cbeta_orphaned_works') == null);
+    });
+
+    test('does nothing when the catalog and release are unchanged', () async {
       expect(await manager.start(), isTrue);
       await _waitFor(() => manager.status == UpdateStatus.completed);
 
       expect(reloadCalls, 0);
+      expect(scripture.headCalls, isEmpty);
+      expect(manager.progress.totalWorks, 0);
       expect(manager.progress.updatedWorks, 0);
-      expect(manager.progress.skippedWorks, 2);
-      expect(scripture.archiveDownloads, 0);
-      expect(scripture.volumeDownloads, 0);
+      expect(manager.progress.removedWorks, 0);
+      expect(manager.progress.message, '經目已是最新');
+      expect(indexes.requestCalls, 0);
+      expect(indexes.startCalls, 0);
     });
 
-    test(
-      'falls back to per-juan downloads when the archive is empty',
-      () async {
-        scripture.releases['T0001'] = '2026.R2';
-        scripture.releases['T0002'] = '2026.R2';
-        scripture.archives['T0001'] = const WorkArchive(
-          volumes: [],
-          version: 'new',
-        );
+    test('does not mass-download when the old catalog is empty', () async {
+      CatalogCache.instance.debugReset();
+      CatalogCache.instance.debugLoad(allWorks: const {});
+      catalogChanged(newWorks: initialCatalog);
 
-        expect(await manager.start(), isTrue);
-        await _waitFor(() => manager.status == UpdateStatus.completed);
+      expect(await manager.start(), isTrue);
+      await _waitFor(() => manager.status == UpdateStatus.completed);
 
-        expect(scripture.volumeDownloads, 2);
-        expect(downloads.replaced['T0001'], hasLength(2));
-        expect(manager.progress.updatedWorks, 1);
-      },
-    );
+      expect(scripture.headCalls, isEmpty);
+      expect(downloads.stored, isEmpty);
+      expect(manager.progress.updatedWorks, 0);
+    });
 
-    test('records failures and keeps going', () async {
-      scripture.changesErrors['T0001'] = Exception('boom');
-      scripture.headErrors['T0001'] = Exception('boom');
-      scripture.releases['T0002'] = '2026.R2';
+    test('records failures and keeps downloading the rest', () async {
+      catalogChanged(
+        newWorks: {
+          ...initialCatalog,
+          'T0003': const AllWorksEntry(
+            work: 'T0003',
+            title: '增壹阿含經',
+            juans: ['1'],
+          ),
+          'T0004': const AllWorksEntry(
+            work: 'T0004',
+            title: '雜阿含經',
+            juans: ['1'],
+          ),
+        },
+      );
+      scripture.headErrors['T0003'] = Exception('boom');
+      addArchive('T0004', ['1']);
 
       expect(await manager.start(), isTrue);
       await _waitFor(() => manager.status == UpdateStatus.completed);
 
       expect(manager.progress.failedWorks, 1);
-      expect(manager.progress.skippedWorks, 1);
+      expect(manager.progress.updatedWorks, 1);
       expect(manager.progress.checkedWorks, 2);
       expect(manager.error, contains('boom'));
       expect(manager.progress.message, contains('1 部失敗'));
     });
 
-    test('falls back to HEAD when changes API fails', () async {
-      downloads = _FakeDownloadManager([
-        _version('T0001', '1', 'old-etag', release: '2025R1'),
-      ]);
-      manager = buildManager();
-      scripture.changesErrors['T0001'] = Exception('changes down');
-      scripture.signatures['T0001'] = const WorkRemoteSignature(
-        etag: 'new-etag',
+    test('retries failed new works on the next update', () async {
+      catalogChanged(
+        newWorks: {
+          ...initialCatalog,
+          'T0003': const AllWorksEntry(
+            work: 'T0003',
+            title: '增壹阿含經',
+            juans: ['1'],
+          ),
+        },
       );
-      scripture.archives['T0001'] = WorkArchive(
-        volumes: [_volume('T0001', '1', 'new')],
-        version: 'new-etag',
+      scripture.headErrors['T0003'] = Exception('boom');
+
+      expect(await manager.start(), isTrue);
+      await _waitFor(() => manager.status == UpdateStatus.completed);
+      expect(manager.progress.failedWorks, 1);
+
+      final prefs = await SharedPreferences.getInstance();
+      await _waitFor(() => prefs.getString('cbeta_update_retry_works') != null);
+      expect(prefs.getString('cbeta_update_retry_works'), contains('T0003'));
+
+      scripture.headErrors.clear();
+      addArchive('T0003', ['1']);
+      catalog.outcome = const CatalogUpdateOutcome(
+        updatedFiles: 0,
+        releaseVersion: '2026.R2',
+        releaseChanged: false,
       );
 
       expect(await manager.start(), isTrue);
       await _waitFor(() => manager.status == UpdateStatus.completed);
 
-      expect(scripture.changesCalls, ['T0001']);
-      expect(scripture.headCalls, ['T0001']);
-      expect(scripture.archiveDownloads, 1);
+      expect(scripture.headCalls, ['T0003', 'T0003']);
+      expect(downloads.stored['T0003'], hasLength(1));
       expect(manager.progress.updatedWorks, 1);
+      await _waitFor(() => prefs.getString('cbeta_update_retry_works') == null);
     });
 
-    test('pauses during work checks and resumes the remaining works', () async {
+    test('pauses during a download and resumes the remaining works', () async {
+      catalogChanged(
+        newWorks: {
+          ...initialCatalog,
+          'T0003': const AllWorksEntry(
+            work: 'T0003',
+            title: '增壹阿含經',
+            juans: ['1'],
+          ),
+          'T0004': const AllWorksEntry(
+            work: 'T0004',
+            title: '雜阿含經',
+            juans: ['1'],
+          ),
+        },
+      );
+      addArchive('T0003', ['1']);
+      addArchive('T0004', ['1']);
       final gate = Completer<void>();
       final entered = Completer<void>();
-      var gateFirst = true;
-      scripture.beforeChanges = (work) async {
-        if (!gateFirst) return;
-        gateFirst = false;
+      var gated = false;
+      scripture.beforeHead = (work) async {
+        if (gated) return;
+        gated = true;
         entered.complete();
         await gate.future;
       };
-      scripture.releases['T0001'] = '2025R1';
-      scripture.releases['T0002'] = '2026.R2';
 
       expect(await manager.start(), isTrue);
       await entered.future;
@@ -508,31 +479,34 @@ void main() {
       gate.complete();
       await _waitFor(() => manager.status == UpdateStatus.paused);
 
-      expect(manager.pendingWorkCount, 1);
-      expect(manager.progress.checkedWorks, 1);
+      expect(manager.pendingWorkCount, 2);
+      expect(manager.progress.checkedWorks, 0);
       expect(manager.canResume, isTrue);
       expect(notifications.stops, 1);
 
       manager.resume();
       await _waitFor(() => manager.status == UpdateStatus.completed);
 
-      expect(scripture.changesCalls, ['T0001', 'T0002']);
+      expect(scripture.headCalls, ['T0003', 'T0003', 'T0004']);
       expect(manager.progress.checkedWorks, 2);
+      expect(manager.progress.updatedWorks, 2);
       expect(manager.pendingWorkCount, 0);
       expect(notifications.starts, 2);
       expect(notifications.stops, 2);
     });
 
-    test('restores a persisted task as paused and deletes it', () async {
+    test('restores a schema v2 task as paused and deletes it', () async {
       SharedPreferences.setMockInitialValues({
         'cbeta_update_task': jsonEncode({
+          'schema': 2,
           'active': true,
           'catalog_done': true,
-          'pending': ['T0001', 'T0002'],
-          'checked': 3,
-          'updated': 1,
-          'skipped': 2,
+          'pending': ['T0003'],
+          'checked': 1,
+          'added': 1,
+          'no_html': 1,
           'failed': 0,
+          'removed_count': 2,
           'release': '2026.R2',
         }),
       });
@@ -542,8 +516,11 @@ void main() {
       expect(restored.status, UpdateStatus.paused);
       expect(restored.canResume, isTrue);
       expect(restored.hasTask, isTrue);
-      expect(restored.pendingWorkCount, 2);
-      expect(restored.progress.checkedWorks, 3);
+      expect(restored.pendingWorkCount, 1);
+      expect(restored.progress.checkedWorks, 1);
+      expect(restored.progress.updatedWorks, 1);
+      expect(restored.progress.skippedWorks, 1);
+      expect(restored.progress.removedWorks, 2);
       expect(restored.releaseVersion, '2026.R2');
 
       restored.deleteTask();
@@ -556,23 +533,71 @@ void main() {
       expect(restored.pendingWorkCount, 0);
     });
 
+    test('discards legacy tasks without a schema version', () async {
+      SharedPreferences.setMockInitialValues({
+        'cbeta_update_task': jsonEncode({
+          'active': true,
+          'catalog_done': false,
+          'pending': ['T0001', 'T0002'],
+          'checked': 0,
+          'updated': 0,
+          'skipped': 0,
+          'failed': 0,
+        }),
+      });
+      final restored = buildManager();
+      await restored.initialize();
+
+      expect(restored.status, UpdateStatus.idle);
+      expect(restored.pendingWorkCount, 0);
+      expect(restored.hasTask, isFalse);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('cbeta_update_task'), isNull);
+    });
+
+    test('restores orphaned works after a restart', () async {
+      SharedPreferences.setMockInitialValues({
+        'cbeta_orphaned_works': jsonEncode(['X0001', 'X0002']),
+      });
+      final restored = buildManager();
+      await restored.initialize();
+
+      expect(restored.orphanedWorks, ['X0001', 'X0002']);
+      expect(restored.progress.removedWorks, 2);
+
+      restored.clearOrphanedWorks();
+      expect(restored.orphanedWorks, isEmpty);
+      final prefs = await SharedPreferences.getInstance();
+      await _waitFor(() => prefs.getString('cbeta_orphaned_works') == null);
+    });
+
     test('resumes after the catalog phase failed', () async {
       catalog.failNext = true;
-      scripture.releases['T0001'] = '2025R1';
-      scripture.releases['T0002'] = '2026.R2';
+      catalogChanged(
+        newWorks: {
+          ...initialCatalog,
+          'T0003': const AllWorksEntry(
+            work: 'T0003',
+            title: '增壹阿含經',
+            juans: ['1'],
+          ),
+        },
+      );
 
       expect(await manager.start(), isTrue);
       await _waitFor(() => manager.status == UpdateStatus.failed);
 
       expect(catalog.calls, 1);
       expect(manager.canResume, isTrue);
-      expect(manager.pendingWorkCount, 2);
+      expect(manager.pendingWorkCount, 0);
 
+      addArchive('T0003', ['1']);
       manager.resume();
       await _waitFor(() => manager.status == UpdateStatus.completed);
 
       expect(catalog.calls, 2);
-      expect(manager.progress.checkedWorks, 2);
+      expect(manager.progress.checkedWorks, 1);
+      expect(manager.progress.updatedWorks, 1);
     });
 
     test('refuses to start while scriptures are downloading', () async {
@@ -583,10 +608,21 @@ void main() {
       expect(manager.isUpdating, isFalse);
     });
 
-    test('ignores updates after the task is deleted mid-run', () async {
+    test('ignores downloads after the task is deleted mid-run', () async {
+      catalogChanged(
+        newWorks: {
+          ...initialCatalog,
+          'T0003': const AllWorksEntry(
+            work: 'T0003',
+            title: '增壹阿含經',
+            juans: ['1'],
+          ),
+        },
+      );
+      addArchive('T0003', ['1']);
       final gate = Completer<void>();
       final entered = Completer<void>();
-      scripture.beforeChanges = (work) async {
+      scripture.beforeHead = (work) async {
         entered.complete();
         await gate.future;
       };
@@ -599,7 +635,7 @@ void main() {
 
       expect(manager.status, UpdateStatus.idle);
       expect(manager.pendingWorkCount, 0);
-      expect(downloads.replaced, isEmpty);
+      expect(downloads.stored, isEmpty);
       expect(scripture.archiveDownloads, 0);
     });
   });
@@ -640,36 +676,29 @@ class _FakeDownloadManager extends DownloadManager {
   _FakeDownloadManager(this.initialVersions);
 
   final List<LocalVersion> initialVersions;
-  final Map<String, List<CachedScriptureVolume>> replaced = {};
-  final Map<String, String?> replacementReleases = {};
+  final Map<String, List<CachedScriptureVolume>> stored = {};
+  final Map<String, String?> storedReleases = {};
   bool downloading = false;
 
   @override
   bool get isDownloading => downloading;
 
   @override
-  Set<String> get downloadedWorkIds =>
-      initialVersions.map((version) => version.work).toSet();
+  Set<String> get downloadedWorkIds => {
+    ...initialVersions.map((version) => version.work),
+    ...stored.keys,
+  };
 
   @override
-  List<LocalVersion> versionsForWork(String work) =>
-      initialVersions.where((version) => version.work == work).toList();
-
-  @override
-  Future<int> replaceDownloadedVolumes(
+  Future<int> storeDownloadedWork(
     String work,
     Iterable<CachedScriptureVolume> volumes, {
     String? release,
   }) async {
-    final localJuans = versionsForWork(
-      work,
-    ).map((version) => version.juan).toSet();
-    final incoming = volumes
-        .where((volume) => localJuans.contains(volume.juan))
-        .toList();
-    replaced[work] = incoming;
-    replacementReleases[work] = release;
-    return incoming.length;
+    final list = volumes.toList();
+    stored[work] = list;
+    storedReleases[work] = release;
+    return list.length;
   }
 }
 
@@ -739,33 +768,25 @@ class _FakeCatalogUpdateService extends CatalogUpdateService {
 }
 
 class _FakeScriptureUpdateService extends ScriptureUpdateService {
-  final Map<String, WorkRemoteSignature> signatures = {};
   final Map<String, WorkArchive> archives = {};
-  final Map<String, String?> releases = {};
-  final List<String> changesCalls = [];
-  final List<String> headCalls = [];
-  Future<void> Function(String work)? beforeChanges;
-  final Map<String, Object> changesErrors = {};
+  final Set<String> noHtml = {};
   final Map<String, Object> headErrors = {};
+  final List<String> headCalls = [];
+  Future<void> Function(String work)? beforeHead;
+  WorkHeadInfo head = const WorkHeadInfo(contentLength: 128);
   int archiveDownloads = 0;
-  int volumeDownloads = 0;
 
   @override
-  Future<WorkRemoteSignature> headWork(String work) async {
+  Future<WorkHeadInfo> headWork(String work) async {
     headCalls.add(work);
+    final hook = beforeHead;
+    if (hook != null) await hook(work);
     final error = headErrors[work];
     if (error != null) throw error;
-    return signatures[work] ?? const WorkRemoteSignature();
-  }
-
-  @override
-  Future<String?> latestChangesVersion(String work) async {
-    changesCalls.add(work);
-    final hook = beforeChanges;
-    if (hook != null) await hook(work);
-    final error = changesErrors[work];
-    if (error != null) throw error;
-    return releases[work];
+    if (noHtml.contains(work)) {
+      throw const ScriptureHttpException(404, '檢查經文失敗：HTTP 404');
+    }
+    return head;
   }
 
   @override
@@ -778,15 +799,20 @@ class _FakeScriptureUpdateService extends ScriptureUpdateService {
     onBytesReceived?.call(128);
     return archives[work] ?? const WorkArchive(volumes: [], version: 'unknown');
   }
+}
+
+class _FakeIndexUpdateService extends IndexUpdateService {
+  int requestCalls = 0;
+  int startCalls = 0;
 
   @override
-  Future<CachedScriptureVolume> downloadVolume(
-    String work,
-    String juan, {
-    void Function(int bytes)? onBytesReceived,
-  }) async {
-    volumeDownloads++;
-    onBytesReceived?.call(64);
-    return _volume(work, juan, 'downloaded');
+  void requestUpdate() {
+    requestCalls++;
+  }
+
+  @override
+  Future<bool> startIfNeeded() async {
+    startCalls++;
+    return false;
   }
 }

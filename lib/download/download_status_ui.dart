@@ -195,7 +195,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
                       icon: const Icon(Icons.sync_rounded, size: 18),
                       label: Text(
                         displayText(
-                          updateManager.canResume ? '繼續更新' : '更新',
+                          updateManager.canResume ? '繼續更新' : '更新經目',
                           context,
                         ),
                       ),
@@ -401,11 +401,12 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: Text(displayText('更新經目與經文', dialogContext)),
+        title: Text(displayText('更新經目', dialogContext)),
         content: Text(
           displayText(
-            '確定要檢查並更新部類、冊別、作譯者、年代與已下載經文嗎？\n'
-            '只有遠端有變更時才會下載。',
+            '檢查部類、冊別、作譯者、朝代清單。\n'
+            '新增的佛典會在背景下載，可在面板中暫停；'
+            '本機已下載但經目移除的作品只會提示，不會自動刪除。',
             dialogContext,
           ),
         ),
@@ -416,7 +417,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
           ),
           FilledButton(
             onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: Text(displayText('更新', dialogContext)),
+            child: Text(displayText('開始更新', dialogContext)),
           ),
         ],
       ),
@@ -433,11 +434,14 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
   List<Widget> _buildUpdateSection(BuildContext context) {
     final manager = updateManager;
     final progress = manager.progress;
-    if (manager.status == UpdateStatus.idle) return const [];
+    if (manager.status == UpdateStatus.idle && manager.orphanedWorks.isEmpty) {
+      return const [];
+    }
     final counts = progress.totalWorks == 0
         ? ''
         : '（${progress.checkedWorks}/${progress.totalWorks} 部）';
     final statusText = switch (manager.status) {
+      UpdateStatus.idle => '新版經目已移除以下作品',
       UpdateStatus.completed => progress.message ?? '更新完成',
       UpdateStatus.failed => progress.message ?? '更新中斷',
       _ => '${progress.message ?? ''}$counts',
@@ -449,7 +453,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
           const SizedBox(width: 6),
           Expanded(
             child: Text(
-              displayText('經目與經文更新', context),
+              displayText('經目更新', context),
               style: const TextStyle(fontWeight: FontWeight.bold),
             ),
           ),
@@ -481,13 +485,37 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
       const SizedBox(height: 2),
       Text(
         displayText(
-          '已更新 ${progress.updatedWorks} 部 · '
-          '已是最新 ${progress.skippedWorks} 部'
+          '已新增 ${progress.updatedWorks} 部 · '
+          '下架 ${progress.removedWorks} 部'
+          '${progress.skippedWorks > 0 ? ' · 無 HTML 版 ${progress.skippedWorks} 部' : ''}'
           '${progress.failedWorks > 0 ? ' · 失敗 ${progress.failedWorks} 部' : ''}',
           context,
         ),
         style: Theme.of(context).textTheme.bodySmall,
       ),
+      if (manager.orphanedWorks.isNotEmpty) ...[
+        const SizedBox(height: 4),
+        Text(
+          displayText(
+            '已下架但仍在本機：'
+            '${manager.orphanedWorks.take(12).join('、')}'
+            '${manager.orphanedWorks.length > 12 ? ' 等 ${manager.orphanedWorks.length} 部' : ''}',
+            context,
+          ),
+          maxLines: 3,
+          overflow: TextOverflow.ellipsis,
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+            color: Theme.of(context).colorScheme.error,
+          ),
+        ),
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton(
+            onPressed: manager.clearOrphanedWorks,
+            child: Text(displayText('知道了', context)),
+          ),
+        ),
+      ],
       if (manager.isUpdating) ...[
         const SizedBox(height: 6),
         LinearProgressIndicator(value: progress.fraction),
@@ -511,7 +539,9 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
           ),
         ],
       ],
-      if (manager.status == UpdateStatus.failed && manager.error != null) ...[
+      if (manager.error != null &&
+          (manager.status == UpdateStatus.failed ||
+              progress.failedWorks > 0)) ...[
         const SizedBox(height: 4),
         Text(
           manager.error!,

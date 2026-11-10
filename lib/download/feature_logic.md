@@ -70,6 +70,34 @@
   `completeWorkCount`（完整）與 `partialWorkCount`（部分）分開呈現，避免與
   未完成清單相加時重複計算部分下載作品（例如 4858 + 80 = 4938 的假象）。
 
+### 經目更新（只差分清單，不猜測經文內容是否變動）
+
+- 面板按鈕為「更新經目」，只刷新部類、冊別、作譯者、朝代四份清單
+  （`CatalogUpdateService`），不再逐部請求 `/stable/changes`。
+- 更新後以作品 id 做集合差分：新增的作品靜默下載，下架且本機曾下載的作品
+  只寫入提示、不刪除本機經卷。
+- 新增作品先 `HEAD` 一次 `html/<work>.html.zip`：404 代表 CBETA 沒有 HTML 版，
+  記為「無 HTML 版」略過；其餘錯誤記為失敗並繼續下一部。差分只相信集合，
+  作品在部類間移動不會被誤判成新增／下架。
+- 舊經目為空時不做差分，避免把整份清單誤判成新增而觸發全藏下載。
+- 下架提示保存在 `cbeta_orphaned_works`，使用者按「知道了」才清除。
+- 新增作品下載失敗會記在 `cbeta_update_retry_works`；下次更新即使經目清單
+  沒變，也會先重試這批作品，成功後自動移除記號。
+- 更新任務 schema 升到 v2；舊版「重新檢查全部已下載作品」的任務會被丟棄，
+  避免升級後重下既有經卷。
+- 經文內容更新暫停：清單檔沒有逐部修改時間；ZIP 頁尾的「發行日期」是
+  整包重蓋（所有作品同一月份），不能用來判斷單部是否修訂。`LocalVersion`
+  仍記錄下載當下的 etag 與 release，等 CBETA 提供可靠時間來源再接內容更新。
+
+### 搜尋索引的 dirty 記號
+
+- 下載或經目更新寫入新經卷後呼叫 `IndexUpdateService.requestUpdate()`，
+  持久化 `cbeta_sidx_dirty`。下次 `startIfNeeded()` 即使索引格式版本沒變，
+  也會做一次逐卷增量核對（已符合戳記的卷會跳過），完成後由
+  `markCurrentVersion()` 清除記號。
+- 逐卷 `.sidx` 仍由 `offlineIndexQueue` 即時建立；dirty 標記只保證離線重啟後
+  不會漏掉「格式版本未變但內容已新增」的情況。
+
 ### 数据源限制：`[＊]` 星号校勘
 
 - 网页 `/stable/juans` 的 HTML 带 `<a class="noteAnchor star">`，阅读器会

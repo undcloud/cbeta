@@ -15,6 +15,9 @@ const int currentIndexVersion = sidxFormatVersion * 1000000 + sidxNormVersion;
 /// 最後一次「完整走完全部經卷」時使用的索引版本。
 const String indexVersionPreferenceKey = 'cbeta_sidx_index_version';
 
+/// 有經卷新增或更換時留下記號；下次啟動即使版本相同也要再核對一次。
+const String indexDirtyPreferenceKey = 'cbeta_sidx_dirty';
+
 /// 背景重建每批派工的大小；比手動重建小，讓下載可以插進來。
 const int _backgroundIndexBatchSize = 64;
 
@@ -65,14 +68,18 @@ class IndexUpdateService extends ChangeNotifier {
 
   IndexUpdateProgress _progress = const IndexUpdateProgress();
   int? _localVersion;
+  bool _dirty = false;
   bool _initialized = false;
   Future<void>? _running;
   Future<bool>? _starting;
 
   bool get isActive => progress.isActive;
   bool get isInitialized => _initialized;
+  bool get isDirty => _dirty;
   bool get needsUpdate =>
-      !kIsWeb && _initialized && _localVersion != currentIndexVersion;
+      !kIsWeb &&
+      _initialized &&
+      (_localVersion != currentIndexVersion || _dirty);
   IndexUpdateProgress get progress => _progress;
 
   Future<void> initialize() async {
@@ -82,10 +89,19 @@ class IndexUpdateService extends ChangeNotifier {
     try {
       final prefs = await _prefsProvider();
       _localVersion = prefs.getInt(indexVersionPreferenceKey);
+      _dirty = _dirty || (prefs.getBool(indexDirtyPreferenceKey) ?? false);
     } catch (_) {
       // 讀不到標記就當作從未完整建置，寧可多做一次增量重建。
       _localVersion = null;
     }
+  }
+
+  /// 經卷新增或替換後呼叫：讓下次 [startIfNeeded] 重新核對本機索引。
+  void requestUpdate() {
+    if (kIsWeb) return;
+    _dirty = true;
+    unawaited(_persistDirty());
+    notifyListeners();
   }
 
   /// 版本落後時啟動一次背景重建；回傳這次呼叫是否真的開始了新工作。
@@ -140,15 +156,26 @@ class IndexUpdateService extends ChangeNotifier {
     }
   }
 
-  /// 把本機標記推進到目前版本。
+  /// 把本機標記推進到目前版本，並清掉待核對記號。
   Future<void> markCurrentVersion() async {
     _initialized = true;
     _localVersion = currentIndexVersion;
+    _dirty = false;
     try {
       final prefs = await _prefsProvider();
       await prefs.setInt(indexVersionPreferenceKey, currentIndexVersion);
+      await prefs.remove(indexDirtyPreferenceKey);
     } catch (_) {
       // 存不下就只影響下次啟動會再檢查一次，不影響本次索引。
+    }
+  }
+
+  Future<void> _persistDirty() async {
+    try {
+      final prefs = await _prefsProvider();
+      await prefs.setBool(indexDirtyPreferenceKey, true);
+    } catch (_) {
+      // 記號存不下只會讓下次啟動少做一次核對；逐卷索引仍已由下載流程建立。
     }
   }
 
@@ -245,6 +272,7 @@ class IndexUpdateService extends ChangeNotifier {
   void resetForTest() {
     _progress = const IndexUpdateProgress();
     _localVersion = null;
+    _dirty = false;
     _initialized = false;
     _running = null;
     _starting = null;

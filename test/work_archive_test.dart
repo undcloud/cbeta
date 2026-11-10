@@ -238,9 +238,34 @@ void main() {
       }, () => client);
 
       expect(requested, [
-        'https://cbdata.dila.edu.tw/stable/changes?work=T0001',
         'https://cbdata.dila.edu.tw/stable/download/html/T0001.html.zip',
       ]);
+    });
+
+    test('stores a whole new work and records the catalog release', () async {
+      final stored = await downloadManager.storeDownloadedWork('T0001', const [
+        CachedScriptureVolume(
+          work: 'T0001',
+          juan: '3',
+          html: '<p>新增卷三</p>',
+          contentVersion: 'new-etag',
+        ),
+        CachedScriptureVolume(
+          work: 'T0001',
+          juan: '4',
+          html: '<p>新增卷四</p>',
+          contentVersion: 'new-etag',
+        ),
+      ], release: '2026.R2');
+
+      expect(stored, 2);
+      expect(downloadManager.downloadedWorkIds, contains('T0001'));
+      expect(await volumeStore.read('T0001', '3'), isNotNull);
+      expect(await volumeStore.read('T0001', '4'), isNotNull);
+      expect(downloadManager.versions['T0001:3']?.release, '2026.R2');
+      expect(await store.loadWorkJuans(), {
+        'T0001': ['3', '4'],
+      });
     });
 
     test('falls back to TOC juan numbers when the archive fails', () async {
@@ -281,9 +306,7 @@ void main() {
       });
 
       await http.runWithClient(() async {
-        final manager = DownloadManager(
-          releaseVersionLoader: (_) async => null,
-        );
+        final manager = DownloadManager();
         manager.addToQueue(const [
           DownloadGroup(
             id: 'g1',
@@ -327,9 +350,7 @@ void main() {
       });
 
       await http.runWithClient(() async {
-        final manager = DownloadManager(
-          releaseVersionLoader: (_) async => null,
-        );
+        final manager = DownloadManager();
         manager.addToQueue(const [
           DownloadGroup(
             id: 'missing-work',

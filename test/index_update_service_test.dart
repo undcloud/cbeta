@@ -103,6 +103,44 @@ void main() {
     expect(maintenance.rebuildCalls, 0);
   });
 
+  test('dirty marker rebuilds even when the version is current', () async {
+    SharedPreferences.setMockInitialValues({
+      indexVersionPreferenceKey: currentIndexVersion,
+      indexDirtyPreferenceKey: true,
+    });
+    final maintenance = _FakeMaintenance(
+      store: _FakeVolumeStore(const [volume]),
+    );
+    final service = buildService(maintenance);
+    await service.initialize();
+
+    expect(service.needsUpdate, isTrue);
+    expect(await service.startIfNeeded(), isTrue);
+    await service.waitForCompletion();
+
+    expect(maintenance.rebuildCalls, 1);
+    expect(service.needsUpdate, isFalse);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getBool(indexDirtyPreferenceKey), isNull);
+  });
+
+  test('requestUpdate before initialize still triggers a rebuild', () async {
+    final maintenance = _FakeMaintenance(
+      store: _FakeVolumeStore(const [volume]),
+    );
+    final service = buildService(maintenance);
+    service.requestUpdate();
+    await service.initialize();
+
+    expect(service.isDirty, isTrue);
+    expect(service.needsUpdate, isTrue);
+    expect(await service.startIfNeeded(), isTrue);
+    await service.waitForCompletion();
+
+    expect(maintenance.rebuildCalls, 1);
+    expect(service.needsUpdate, isFalse);
+  });
+
   test('no local volumes only records the version', () async {
     final maintenance = _FakeMaintenance(store: _FakeVolumeStore(const []));
     final service = buildService(maintenance);
