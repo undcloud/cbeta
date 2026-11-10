@@ -5,6 +5,7 @@ import 'package:archive/archive.dart';
 import 'package:http/http.dart' as http;
 
 import '../cbeta_api_headers.dart';
+import '../common/cbeta_http_client.dart';
 import '../scripture/cache.dart';
 
 class WorkArchive {
@@ -32,12 +33,12 @@ Future<WorkArchive> fetchWorkArchive(
       throw Exception('經文壓縮檔 API 回傳 ${response.statusCode}');
     }
     final bytes = BytesBuilder(copy: false);
-    await response.stream
-        .forEach((chunk) {
-          bytes.add(chunk);
-          onBytesReceived?.call(chunk.length);
-        })
-        .timeout(const Duration(seconds: 90));
+    // 慢速線路下載數 MB 的壓縮檔可能要幾分鐘；用「連續 90 秒沒有資料」
+    // 判斷斷線，而不是限制整體時長（B0088 在 23 KB/s 下約需 173 秒）。
+    await response.stream.timeout(const Duration(seconds: 90)).forEach((chunk) {
+      bytes.add(chunk);
+      onBytesReceived?.call(chunk.length);
+    });
     final version = _contentVersion(response.headers);
     return WorkArchive(
       volumes: extractWorkArchive(
@@ -51,6 +52,53 @@ Future<WorkArchive> fetchWorkArchive(
   } finally {
     client.close();
   }
+}
+
+/// 從 CBETA 經目 TOC 取得作品的真實卷號。壓縮檔下載失敗時用它取代
+/// 經目標題推定的 `1..N`，避免對不存在的卷號反覆請求。
+Future<List<String>> fetchWorkTocJuans(String work) async {
+  final client = createCbetaHttpClient();
+  try {
+    final request = http.Request(
+      'GET',
+      Uri.https('cbdata.dila.edu.tw', '/stable/works/toc', {'work': work}),
+    )..headers.addAll(cbetaApiHeaders);
+    final response = await client
+        .send(request)
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode != 200) {
+      throw Exception('經目卷號 API 回傳 ${response.statusCode}');
+    }
+    final body = await response.stream.bytesToString().timeout(
+      const Duration(seconds: 30),
+    );
+    return parseTocJuans(body);
+  } finally {
+    client.close();
+  }
+}
+
+/// TOC 是樹狀結構，每個節點都帶 `juan`；去重排序後即為真實卷號。
+List<String> parseTocJuans(String body) {
+  final juans = <int>{};
+  void visit(Object? node) {
+    if (node is Map) {
+      final value = node['juan'];
+      final juan = value is int ? value : int.tryParse('$value');
+      if (juan != null) juans.add(juan);
+      for (final child in node.values) {
+        visit(child);
+      }
+    } else if (node is List) {
+      for (final child in node) {
+        visit(child);
+      }
+    }
+  }
+
+  visit(jsonDecode(body));
+  final sorted = juans.toList()..sort();
+  return [for (final juan in sorted) '$juan'];
 }
 
 String _contentVersion(Map<String, String> headers) {

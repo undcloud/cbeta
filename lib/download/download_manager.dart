@@ -19,6 +19,8 @@ class DownloadManager extends ChangeNotifier {
   final Future<String?> Function(String work) _releaseVersionLoader;
   final List<DownloadGroup> _queue = [];
   final Map<String, LocalVersion> _versions = {};
+  final Map<String, List<String>> _workJuans = {};
+  bool _workJuansDirty = false;
   final List<String> _failedWorkIds = [];
   DownloadStatus _status = DownloadStatus.pending;
   DownloadProgress? _progress;
@@ -46,6 +48,13 @@ class DownloadManager extends ChangeNotifier {
 
   Set<String> get downloadedWorkIds =>
       _versions.keys.map((key) => key.split(':').first).toSet();
+
+  /// 已完成全部經卷的作品數；與 [partialWorkCount] 分開呈現，避免和待下載
+  /// 清單相加時重複計算部分下載的作品。
+  int get completeWorkCount => downloadedWorkIds.where(isWorkDownloaded).length;
+
+  int get partialWorkCount =>
+      downloadedWorkIds.where(isWorkPartiallyDownloaded).length;
 
   List<LocalVersion> versionsForWork(String work) =>
       _versions.values.where((version) => version.work == work).toList();
@@ -97,12 +106,17 @@ class DownloadManager extends ChangeNotifier {
     await CatalogCache.instance.load();
     final savedQueue = await downloadStore.loadQueue();
     final savedVersions = await downloadStore.loadVersions();
+    final savedWorkJuans = await downloadStore.loadWorkJuans();
     _queue
       ..clear()
       ..addAll(_normalizeQueue(savedQueue));
     _versions
       ..clear()
       ..addAll(savedVersions);
+    _workJuans
+      ..clear()
+      ..addAll(savedWorkJuans);
+    _workJuansDirty = false;
     if (savedQueue.isNotEmpty) {
       await _saveQueue();
     }
@@ -114,31 +128,62 @@ class DownloadManager extends ChangeNotifier {
   }
 
   bool isWorkDownloaded(String work) {
-    final entry = CatalogCache.instance.lookupWork(work);
-    if (entry == null) return false;
-    return entry.juans.every((juan) => _versions.containsKey('$work:$juan'));
+    final juans = _expectedJuans(work);
+    if (juans.isEmpty) return false;
+    return juans.every((juan) => _versions.containsKey('$work:$juan'));
   }
 
   bool isWorkPartiallyDownloaded(String work) {
-    final entry = CatalogCache.instance.lookupWork(work);
-    if (entry == null) return false;
-    final downloaded = entry.juans.where(
-      (j) => _versions.containsKey('$work:$j'),
-    );
-    return downloaded.isNotEmpty && downloaded.length < entry.juans.length;
+    final juans = _expectedJuans(work);
+    if (juans.isEmpty) return false;
+    final downloaded = juans.where((j) => _versions.containsKey('$work:$j'));
+    return downloaded.isNotEmpty && downloaded.length < juans.length;
   }
 
-  bool _isItemComplete(DownloadItem item) {
-    return item.juans.every(
-      (juan) => _versions.containsKey('${item.work}:$juan'),
-    );
+  /// 經目卷號只是「1..N」的推定值；下載過的作品以壓縮檔解析出的真實卷號為準。
+  List<String> _expectedJuans(String work) =>
+      _workJuans[work] ??
+      CatalogCache.instance.lookupWork(work)?.juans ??
+      const [];
+
+  List<String> _expectedJuansForItem(DownloadItem item) {
+    final resolved = _workJuans[item.work];
+    if (resolved != null) return resolved;
+    if (item.juans.isNotEmpty) return item.juans;
+    return _expectedJuans(item.work);
   }
+
+  int _expectedJuanCount(DownloadItem item) {
+    final count = _expectedJuansForItem(item).length;
+    return count == 0 ? 1 : count;
+  }
+
+  List<String> _pendingJuans(String work, List<String> juans) =>
+      juans.where((juan) => !_versions.containsKey('$work:$juan')).toList();
+
+  static bool _sameJuans(List<String> left, List<String> right) {
+    if (left.length != right.length) return false;
+    for (var i = 0; i < left.length; i++) {
+      if (left[i] != right[i]) return false;
+    }
+    return true;
+  }
+
+  void _adoptWorkJuans(String work, List<String> juans) {
+    if (_sameJuans(_workJuans[work] ?? const <String>[], juans)) return;
+    _workJuans[work] = List.unmodifiable(juans);
+    _workJuansDirty = true;
+  }
+
+  bool _isItemComplete(DownloadItem item) => _expectedJuansForItem(
+    item,
+  ).every((juan) => _versions.containsKey('${item.work}:$juan'));
 
   bool isItemComplete(DownloadItem item) => _isItemComplete(item);
 
-  List<String> pendingJuans(DownloadItem item) => item.juans
-      .where((juan) => !_versions.containsKey('${item.work}:$juan'))
-      .toList();
+  List<String> pendingJuans(DownloadItem item) => _expectedJuansForItem(
+    item,
+  ).where((juan) => !_versions.containsKey('${item.work}:$juan')).toList();
 
   void addToQueue(List<DownloadGroup> groups) {
     if (groups.isEmpty) return;
@@ -255,7 +300,10 @@ class DownloadManager extends ChangeNotifier {
         attempted.add(item.work);
       }
       _totalItems += items.length;
-      _totalJuans += items.fold<int>(0, (sum, item) => sum + item.totalJuans);
+      _totalJuans += items.fold<int>(
+        0,
+        (sum, item) => sum + _expectedJuanCount(item),
+      );
       _progress = _buildProgress(
         currentWork: _progress?.currentWork,
         currentJuan: _progress?.currentJuan,
@@ -264,6 +312,8 @@ class DownloadManager extends ChangeNotifier {
       notifyListeners();
       await _processDownloadQueue(items);
     }
+
+    await _saveWorkJuansIfDirty();
 
     // 索引建置在背景 worker 裡追進度：收完才宣告結束，否則使用者以為下載好了，
     // 第一次搜還是得自己把沒建完的卷補一遍。
@@ -354,10 +404,8 @@ class DownloadManager extends ChangeNotifier {
 
   Future<void> _downloadItem(DownloadItem item) async {
     final entry = CatalogCache.instance.lookupWork(item.work);
-    final juans = entry?.juans ?? item.juans;
-    final pending = juans
-        .where((juan) => !_versions.containsKey('${item.work}:$juan'))
-        .toList();
+    var expected = _expectedJuansForItem(item);
+    var pending = _pendingJuans(item.work, expected);
     if (pending.isEmpty) {
       _completedCount++;
       notifyListeners();
@@ -387,12 +435,43 @@ class DownloadManager extends ChangeNotifier {
       debugPrint('Work archive download failed ${item.work}: $e');
     }
 
-    if (archive != null) {
+    if (archive == null || archive.volumes.isEmpty) {
+      // 壓縮檔失敗時改用經目 TOC 的真實卷號，避免拿 1..N 反覆打單卷 API。
+      try {
+        final tocJuans = await apiRateLimiter.run(
+          () => fetchWorkTocJuans(item.work),
+        );
+        if (tocJuans.isNotEmpty) {
+          if (!_sameJuans(expected, tocJuans)) {
+            _totalJuans += tocJuans.length - expected.length;
+            expected = tocJuans;
+            _adoptWorkJuans(item.work, tocJuans);
+          }
+          pending = _pendingJuans(item.work, expected);
+        }
+      } catch (e) {
+        debugPrint('Work TOC lookup failed ${item.work}: $e');
+      }
+    }
+
+    if (archive != null && archive.volumes.isNotEmpty) {
+      // 壓縮檔內的卷號才是原書真實卷次；經目標題的 (N卷) 只是卷數。
+      final archiveJuans = archive.volumes
+          .map((volume) => volume.juan)
+          .toList();
+      if (!_sameJuans(expected, archiveJuans)) {
+        _totalJuans += archiveJuans.length - expected.length;
+        expected = archiveJuans;
+        _adoptWorkJuans(item.work, archiveJuans);
+      }
+      pending = _pendingJuans(item.work, expected);
       final byJuan = {
         for (final volume in archive.volumes) volume.juan: volume,
       };
-      for (final juan in pending) {
+      // 不在 1..N 內的真實卷也要落地，否則這部作品永遠補不齊。
+      for (final juan in expected) {
         if (_cancelled) return;
+        if (_versions.containsKey('${item.work}:$juan')) continue;
         final volume = byJuan[juan];
         if (volume == null) continue;
         if (!await _storeVolume(item.work, volume, release: release)) {
@@ -556,6 +635,12 @@ class DownloadManager extends ChangeNotifier {
 
   Future<void> _saveQueue() => downloadStore.saveQueue(_queue);
   Future<void> _saveVersions() => downloadStore.saveVersions(_versions);
+
+  Future<void> _saveWorkJuansIfDirty() async {
+    if (!_workJuansDirty) return;
+    _workJuansDirty = false;
+    await downloadStore.saveWorkJuans(_workJuans);
+  }
 }
 
 /// 初次下載時以該作品的 changes 版號作為 release。

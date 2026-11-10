@@ -245,6 +245,17 @@ void main() {
       expect(loaded['T0001:1']?.ver, '2023Q4');
     });
 
+    test('saves and loads resolved work juans', () async {
+      final store = DownloadStore(directoryProvider: () async => tempDir);
+      await store.saveWorkJuans({
+        'D8679': ['4'],
+        'B0088': ['55', '56', '57'],
+      });
+      final loaded = await store.loadWorkJuans();
+      expect(loaded['D8679'], ['4']);
+      expect(loaded['B0088'], ['55', '56', '57']);
+    });
+
     test('clears queue and versions', () async {
       final store = DownloadStore(directoryProvider: () async => tempDir);
       await store.saveQueue([
@@ -276,8 +287,10 @@ void main() {
       await dir.create(recursive: true);
       await File('${dir.path}/queue.json').writeAsString('not json');
       await File('${dir.path}/versions.json').writeAsString('{bad');
+      await File('${dir.path}/work_juans.json').writeAsString('{bad');
       expect(await store.loadQueue(), isEmpty);
       expect(await store.loadVersions(), isEmpty);
+      expect(await store.loadWorkJuans(), isEmpty);
     });
   });
 
@@ -343,6 +356,8 @@ void main() {
 
         expect(manager.downloadedWorkCount, 2);
         expect(manager.downloadedJuanCount, 2);
+        expect(manager.completeWorkCount, 1);
+        expect(manager.partialWorkCount, 1);
         expect(manager.isWorkDownloaded('T0002'), isTrue);
         expect(manager.isWorkPartiallyDownloaded('T0001'), isTrue);
         expect(manager.hasQueuedItems, isTrue);
@@ -382,6 +397,83 @@ void main() {
         expect(manager.isWorkPartiallyDownloaded('T0002'), isFalse);
       },
     );
+
+    test(
+      'uses resolved archive juans for completion instead of 1..N',
+      () async {
+        CatalogCache.instance.debugLoad(
+          allWorks: const {
+            'D8679': AllWorksEntry(
+              work: 'D8679',
+              title: '佛說佛名經（存卷四）',
+              juans: ['1'],
+            ),
+          },
+        );
+        await store.saveQueue([
+          const DownloadGroup(
+            id: 'g1',
+            label: '國圖善本部類',
+            items: [
+              DownloadItem(work: 'D8679', title: '佛說佛名經（存卷四）', juans: ['1']),
+            ],
+          ),
+        ]);
+        await store.saveVersions({
+          'D8679:4': LocalVersion(
+            work: 'D8679',
+            juan: '4',
+            ver: 'v1',
+            savedAt: DateTime.utc(2026, 11, 10),
+          ),
+        });
+        await store.saveWorkJuans({
+          'D8679': ['4'],
+        });
+
+        final manager = DownloadManager();
+        await manager.initialize();
+
+        expect(manager.isWorkDownloaded('D8679'), isTrue);
+        expect(manager.isWorkPartiallyDownloaded('D8679'), isFalse);
+        expect(manager.hasQueuedItems, isFalse);
+        expect(manager.pendingWorkCount, 0);
+        expect(manager.completeWorkCount, 1);
+        expect(manager.partialWorkCount, 0);
+      },
+    );
+
+    test('reports pending volumes using resolved juan numbers', () async {
+      CatalogCache.instance.debugLoad(
+        allWorks: const {
+          'D8679': AllWorksEntry(
+            work: 'D8679',
+            title: '佛說佛名經（存卷四）',
+            juans: ['1'],
+          ),
+        },
+      );
+      await store.saveQueue([
+        const DownloadGroup(
+          id: 'g1',
+          label: '國圖善本部類',
+          items: [
+            DownloadItem(work: 'D8679', title: '佛說佛名經（存卷四）', juans: ['1']),
+          ],
+        ),
+      ]);
+      await store.saveWorkJuans({
+        'D8679': ['3', '4'],
+      });
+
+      final manager = DownloadManager();
+      await manager.initialize();
+
+      final item = manager.queue.single.items.single;
+      expect(manager.pendingJuans(item), ['3', '4']);
+      expect(manager.pendingJuanCount, 2);
+      expect(manager.isWorkPartiallyDownloaded('D8679'), isFalse);
+    });
 
     test('deduplicates queued works and juans across groups', () async {
       final manager = DownloadManager();

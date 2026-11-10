@@ -13,6 +13,7 @@ class DownloadStore {
 
   static const _webQueueKey = 'cbeta_download_queue';
   static const _webVersionsKey = 'cbeta_download_versions';
+  static const _webWorkJuansKey = 'cbeta_download_work_juans';
   final Future<Directory> Function() _directoryProvider;
 
   Future<Directory> _storeDirectory() async {
@@ -98,6 +99,32 @@ class DownloadStore {
     if (await file.exists()) await file.delete();
   }
 
+  /// 各作品在壓縮檔中的真實卷號。經目標題只給卷數，不能當作下載依據。
+  Future<void> saveWorkJuans(Map<String, List<String>> workJuans) async {
+    final json = jsonEncode(workJuans);
+    if (kIsWeb) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_webWorkJuansKey, json);
+      return;
+    }
+    final dir = await _storeDirectory();
+    final file = File('${dir.path}${Platform.pathSeparator}work_juans.json');
+    await file.writeAsString(json, flush: true);
+  }
+
+  Future<Map<String, List<String>>> loadWorkJuans() async {
+    if (kIsWeb) {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_webWorkJuansKey);
+      if (raw == null) return {};
+      return _decodeWorkJuans(raw);
+    }
+    final dir = await _storeDirectory();
+    final file = File('${dir.path}${Platform.pathSeparator}work_juans.json');
+    if (!await file.exists()) return {};
+    return _decodeWorkJuans(await file.readAsString());
+  }
+
   List<DownloadGroup> _decodeGroups(String raw) {
     try {
       final list = jsonDecode(raw) as List<dynamic>;
@@ -107,6 +134,25 @@ class DownloadStore {
           .toList();
     } catch (_) {
       return const [];
+    }
+  }
+
+  Map<String, List<String>> _decodeWorkJuans(String raw) {
+    try {
+      final map = jsonDecode(raw) as Map<String, dynamic>;
+      final result = <String, List<String>>{};
+      for (final entry in map.entries) {
+        final value = entry.value;
+        if (value is! List) continue;
+        final juans = value
+            .map((juan) => '$juan'.trim())
+            .where((juan) => juan.isNotEmpty)
+            .toList();
+        if (juans.isNotEmpty) result[entry.key] = juans;
+      }
+      return result;
+    } catch (_) {
+      return {};
     }
   }
 

@@ -447,6 +447,8 @@ class CatalogCache extends ChangeNotifier {
           .whereType<Map<String, dynamic>>()
           .toList();
 
+  // 經目標題只提供卷數，這裡先推定 1..N；實際卷號以下載壓縮檔為準
+  // （部分作品使用原書卷次，例如標題 1 卷、壓縮檔其實是第 4 卷）。
   static List<String> _juanList(int? count) =>
       List.generate(count == null || count < 1 ? 1 : count, (i) => '${i + 1}');
 

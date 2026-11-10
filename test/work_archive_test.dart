@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -51,6 +52,24 @@ void main() {
       ),
     );
     expect(normalized, isNot(contains('lineInfo')));
+  });
+
+  test('parses unique juan numbers from a nested TOC payload', () {
+    const body = '''
+    {
+      "num_found": 1,
+      "results": [
+        {
+          "mulu": [
+            {"juan": 55, "children": [{"juan": 55}, {"juan": 56}]},
+            {"juan": "57"}
+          ]
+        }
+      ]
+    }
+    ''';
+
+    expect(parseTocJuans(body), ['55', '56', '57']);
   });
 
   test('extracts html entries per juan from a work archive', () {
@@ -221,6 +240,78 @@ void main() {
       expect(requested, [
         'https://cbdata.dila.edu.tw/stable/changes?work=T0001',
         'https://cbdata.dila.edu.tw/stable/download/html/T0001.html.zip',
+      ]);
+    });
+
+    test('falls back to TOC juan numbers when the archive fails', () async {
+      CatalogCache.instance.debugLoad(
+        allWorks: const {
+          'D8679': AllWorksEntry(
+            work: 'D8679',
+            title: '佛說佛名經（存卷四）',
+            juans: ['1'],
+            file: 'D8679',
+          ),
+        },
+      );
+      final requested = <String>[];
+      final client = MockClient((request) async {
+        requested.add(request.url.toString());
+        if (request.url.path.endsWith('.html.zip')) {
+          return http.Response('not found', 404);
+        }
+        if (request.url.path == '/stable/works/toc') {
+          return http.Response(
+            '{"results":[{"mulu":[{"juan":3,"children":'
+            '[{"juan":3},{"juan":4}]}]}]}',
+            200,
+          );
+        }
+        if (request.url.path == '/stable/juans') {
+          final juan = request.url.queryParameters['juan']!;
+          return http.Response.bytes(
+            utf8.encode(
+              '{"success":true,"results":'
+              '["${scriptureHtml('卷$juan', '0001a01')}"]}',
+            ),
+            200,
+          );
+        }
+        return http.Response('unexpected', 500);
+      });
+
+      await http.runWithClient(() async {
+        final manager = DownloadManager(
+          releaseVersionLoader: (_) async => null,
+        );
+        manager.addToQueue(const [
+          DownloadGroup(
+            id: 'g1',
+            label: '國圖善本部類（1 部）',
+            items: [
+              DownloadItem(work: 'D8679', title: '佛說佛名經（存卷四）', juans: ['1']),
+            ],
+          ),
+        ]);
+
+        await manager.startDownload();
+
+        expect(manager.status, DownloadStatus.completed);
+        expect(manager.isWorkDownloaded('D8679'), isTrue);
+        expect(manager.downloadedJuanCount, 2);
+        expect(manager.hasQueuedItems, isFalse);
+        expect(await volumeStore.read('D8679', '3'), isNotNull);
+        expect(await volumeStore.read('D8679', '4'), isNotNull);
+        expect(await volumeStore.read('D8679', '1'), isNull);
+        expect(await store.loadWorkJuans(), {
+          'D8679': ['3', '4'],
+        });
+        await store.saveQueue(manager.queue);
+      }, () => client);
+
+      expect(requested.where((url) => url.contains('/stable/juans')), [
+        'https://cbdata.dila.edu.tw/stable/juans?work=D8679&juan=3',
+        'https://cbdata.dila.edu.tw/stable/juans?work=D8679&juan=4',
       ]);
     });
 

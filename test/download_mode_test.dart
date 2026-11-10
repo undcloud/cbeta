@@ -179,7 +179,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('下载管理'), findsOneWidget);
-    expect(find.text('下载队列（2 部待下载）'), findsOneWidget);
+    expect(find.text('下载队列（2 部未完成）'), findsOneWidget);
     expect(find.text('01 阿含部类（2 部）'), findsOneWidget);
     expect(find.text('2 部经典 · 3 卷'), findsOneWidget);
     expect(find.byTooltip('删除所有下载任务'), findsOneWidget);
@@ -206,7 +206,7 @@ void main() {
     await tester.tap(find.byTooltip('下載管理'));
     await tester.pumpAndSettle();
 
-    expect(find.textContaining('已下載'), findsOneWidget);
+    expect(find.textContaining('完整下載'), findsOneWidget);
     final updateButton = find.widgetWithText(TextButton, '更新');
     expect(updateButton, findsOneWidget);
 
@@ -309,4 +309,10 @@ class _InMemoryDownloadStore implements DownloadStore {
 
   @override
   Future<void> clearVersions() async {}
+
+  @override
+  Future<void> saveWorkJuans(Map<String, List<String>> workJuans) async {}
+
+  @override
+  Future<Map<String, List<String>>> loadWorkJuans() async => {};
 }

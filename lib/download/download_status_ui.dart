@@ -179,8 +179,9 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
                     Expanded(
                       child: Text(
                         displayText(
-                          '已下載 ${manager.downloadedWorkCount} 部經文 · '
-                          '${manager.downloadedJuanCount} 卷',
+                          '完整下載 ${manager.completeWorkCount} 部 · '
+                          '部分下載 ${manager.partialWorkCount} 部 · '
+                          '共 ${manager.downloadedJuanCount} 卷',
                           context,
                         ),
                         style: Theme.of(context).textTheme.bodySmall,
@@ -304,7 +305,7 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
                       Expanded(
                         child: Text(
                           displayText(
-                            '下載隊列（${manager.pendingWorkCount} 部待下載）',
+                            '下載隊列（${manager.pendingWorkCount} 部未完成）',
                             context,
                           ),
                           style: const TextStyle(fontWeight: FontWeight.bold),
