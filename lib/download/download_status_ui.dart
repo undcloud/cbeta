@@ -5,6 +5,8 @@ import '../dictionary/fodict_download_manager.dart';
 import '../download/download_manager.dart';
 import '../download/download_models.dart';
 import '../download/update_manager.dart';
+import '../mirror/mirror_importer.dart';
+import '../mirror/mirror_models.dart';
 import '../common/app_nav.dart';
 import '../scripture/index_maintenance.dart';
 import '../scripture/index_update_service.dart';
@@ -65,13 +67,15 @@ class _DownloadInfoButtonState extends State<DownloadInfoButton>
     fodictDownloadManager.addListener(_onManagerChanged);
     updateManager.addListener(_onManagerChanged);
     indexUpdateService.addListener(_onManagerChanged);
+    mirrorImporter.addListener(_onManagerChanged);
   }
 
   void _onManagerChanged() {
     if (downloadManager.isDownloading ||
         fodictDownloadManager.isDownloading ||
         updateManager.isUpdating ||
-        indexUpdateService.isActive) {
+        indexUpdateService.isActive ||
+        mirrorImporter.isImporting) {
       if (!_flashController.isAnimating) _flashController.repeat(reverse: true);
     } else {
       _flashController.stop();
@@ -86,6 +90,7 @@ class _DownloadInfoButtonState extends State<DownloadInfoButton>
     fodictDownloadManager.removeListener(_onManagerChanged);
     updateManager.removeListener(_onManagerChanged);
     indexUpdateService.removeListener(_onManagerChanged);
+    mirrorImporter.removeListener(_onManagerChanged);
     _flashController.dispose();
     super.dispose();
   }
@@ -96,7 +101,8 @@ class _DownloadInfoButtonState extends State<DownloadInfoButton>
         downloadManager.isDownloading ||
         fodictDownloadManager.isDownloading ||
         updateManager.isUpdating ||
-        indexUpdateService.isActive;
+        indexUpdateService.isActive ||
+        mirrorImporter.isImporting;
     final idleColor = Theme.of(context).colorScheme.onSurface;
     return AnimatedBuilder(
       animation: _flashController,
@@ -142,10 +148,10 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
         fodictDownloadManager,
         updateManager,
         indexUpdateService,
+        mirrorImporter,
       ]),
       builder: (context, _) {
         final manager = downloadManager;
-        final progress = manager.progress;
         final queue = manager.queue;
         final pendingGroups =
             <({DownloadGroup group, List<DownloadItem> items})>[];
@@ -189,7 +195,8 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
                     ),
                     const SizedBox(width: 8),
                     TextButton.icon(
-                      onPressed: manager.isDownloading
+                      onPressed:
+                          manager.isDownloading || mirrorImporter.isImporting
                           ? null
                           : () => _confirmUpdate(context),
                       icon: const Icon(Icons.sync_rounded, size: 18),
@@ -204,99 +211,8 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
                 ),
                 const SizedBox(height: 16),
                 ..._buildUpdateSection(context),
+                ..._buildDownloadSection(context),
                 ..._buildIndexUpdateSection(context),
-                if (manager.isDownloading && progress != null) ...[
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          displayText(
-                            '下載中：${progress.completedItems}/${progress.totalItems} 部'
-                            ' · ${progress.completedJuans}/${progress.totalJuans} 卷',
-                            context,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        displayText(
-                          '速度 ${formatDownloadSpeed(manager.downloadSpeedBytesPerSecond)}',
-                          context,
-                        ),
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 4),
-                  LinearProgressIndicator(value: progress.fraction),
-                  if (progress.currentWork != null) ...[
-                    const SizedBox(height: 4),
-                    Text(
-                      displayText(
-                        progress.currentJuan == null
-                            ? '目前：${progress.currentWork}'
-                            : '目前：${progress.currentWork} 卷 ${progress.currentJuan}',
-                        context,
-                      ),
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                  ],
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton(
-                          onPressed: manager.cancelDownload,
-                          child: Text(displayText('暫停', context)),
-                        ),
-                      ),
-                    ],
-                  ),
-                ] else ...[
-                  if (manager.status == DownloadStatus.completed)
-                    Text(
-                      displayText('下載完成', context),
-                      style: const TextStyle(color: Colors.green),
-                    )
-                  else if (manager.status == DownloadStatus.cancelled)
-                    Text(displayText('已暫停下載', context))
-                  else if (manager.status == DownloadStatus.failed)
-                    Text(
-                      displayText('下載中斷，尚有未完成的經卷', context),
-                      style: TextStyle(
-                        color: Theme.of(context).colorScheme.error,
-                      ),
-                    )
-                  else if (manager.hasQueuedItems)
-                    Text(displayText('有未完成的下載任務', context))
-                  else
-                    Text(displayText('目前沒有下載任務', context)),
-                  if (manager.status == DownloadStatus.failed &&
-                      manager.failedWorkIds.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 4),
-                      child: Text(
-                        displayText(
-                          '失敗作品：${manager.failedWorkIds.take(12).join('、')}'
-                          '${manager.failedWorkIds.length > 12 ? ' 等 ${manager.failedWorkIds.length} 部' : ''}',
-                          context,
-                        ),
-                        maxLines: 3,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: Theme.of(context).colorScheme.error,
-                        ),
-                      ),
-                    ),
-                  if (manager.canResume && !updateManager.isUpdating) ...[
-                    const SizedBox(height: 8),
-                    FilledButton.icon(
-                      onPressed: manager.resumeDownload,
-                      icon: const Icon(Icons.play_arrow_rounded),
-                      label: Text(displayText('繼續下載', context)),
-                    ),
-                  ],
-                ],
                 if (pendingGroups.isNotEmpty) ...[
                   const SizedBox(height: 16),
                   const Divider(),
@@ -388,6 +304,12 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
   }
 
   Future<void> _confirmUpdate(BuildContext context) async {
+    if (mirrorImporter.isImporting) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(displayText('鏡像下載進行中，完成後再更新', context))),
+      );
+      return;
+    }
     if (downloadManager.isDownloading) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(displayText('經文下載中，完成後再更新', context))),
@@ -429,6 +351,341 @@ class _DownloadStatusPanelState extends State<_DownloadStatusPanel> {
         SnackBar(content: Text(displayText('目前無法更新，請等經文下載完成後再試', context))),
       );
     }
+  }
+
+  /// CBETA 按部下載與鏡像全量下載互斥，共用同一個進度與暫停/續傳區。
+  List<Widget> _buildDownloadSection(BuildContext context) {
+    final importer = mirrorImporter;
+    final manager = downloadManager;
+    final mirrorActive = importer.isImporting;
+    final mirrorResumable =
+        !mirrorActive &&
+        (importer.phase == MirrorImportPhase.cancelled ||
+            importer.phase == MirrorImportPhase.failed ||
+            importer.hasPendingData ||
+            importer.receivedBytes > 0);
+    final mirrorMode = mirrorActive || mirrorResumable;
+    final cbetaActive = manager.isDownloading;
+    final cbetaResumable =
+        !mirrorMode &&
+        !cbetaActive &&
+        manager.canResume &&
+        !updateManager.isUpdating;
+
+    return [
+      const Divider(),
+      Row(
+        children: [
+          const Icon(Icons.download_rounded, size: 18),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              displayText('經文下載', context),
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ),
+          if (mirrorActive)
+            IconButton(
+              tooltip: displayText('暫停下載', context),
+              onPressed: importer.cancel,
+              icon: const Icon(Icons.pause_rounded),
+            )
+          else if (mirrorResumable)
+            IconButton(
+              tooltip: displayText(
+                importer.phase == MirrorImportPhase.failed ? '重試下載' : '繼續下載',
+                context,
+              ),
+              onPressed: updateManager.isUpdating
+                  ? null
+                  : () => unawaited(importer.start()),
+              icon: const Icon(Icons.play_arrow_rounded),
+            )
+          else if (cbetaActive)
+            IconButton(
+              tooltip: displayText('暫停下載', context),
+              onPressed: manager.cancelDownload,
+              icon: const Icon(Icons.pause_rounded),
+            )
+          else if (cbetaResumable)
+            IconButton(
+              tooltip: displayText('繼續下載', context),
+              onPressed: manager.resumeDownload,
+              icon: const Icon(Icons.play_arrow_rounded),
+            ),
+        ],
+      ),
+      if (mirrorMode)
+        ..._buildMirrorProgress(context)
+      else
+        ..._buildCbetaProgress(context),
+      const SizedBox(height: 12),
+    ];
+  }
+
+  List<Widget> _buildMirrorProgress(BuildContext context) {
+    final importer = mirrorImporter;
+    final progress = importer.progress;
+    final active = importer.isImporting;
+    final failed = progress.phase == MirrorImportPhase.failed;
+    final pending = importer.hasPendingData && !active && !failed;
+    final pausedWithBytes =
+        !active &&
+        !failed &&
+        !pending &&
+        progress.receivedBytes > 0 &&
+        (progress.totalBytes <= 0 ||
+            progress.receivedBytes < progress.totalBytes);
+    final statusText = pending && (importer.message ?? '').isEmpty
+        ? '鏡像已下載，待匯入（可繼續）'
+        : pausedWithBytes
+        ? '已暫停下載，繼續時會從這裡續傳'
+        : importer.message ?? _mirrorPhaseText(progress.phase);
+    final children = <Widget>[
+      Text(
+        displayText(statusText, context),
+        style: failed
+            ? TextStyle(color: Theme.of(context).colorScheme.error)
+            : null,
+      ),
+    ];
+
+    if (active) {
+      children.add(const SizedBox(height: 4));
+      if (progress.phase == MirrorImportPhase.downloading) {
+        children.add(
+          progress.totalBytes > 0
+              ? LinearProgressIndicator(value: progress.bytesFraction)
+              : const LinearProgressIndicator(),
+        );
+        children.add(const SizedBox(height: 4));
+        children.add(
+          Text(
+            displayText(
+              progress.totalBytes > 0
+                  ? '${formatMirrorBytes(progress.receivedBytes)} / '
+                        '${formatMirrorBytes(progress.totalBytes)}'
+                        ' · 速度 ${formatDownloadSpeed(progress.speedBytesPerSecond)}'
+                  : '已下載 ${formatMirrorBytes(progress.receivedBytes)}',
+              context,
+            ),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        );
+      } else if (progress.phase == MirrorImportPhase.extracting ||
+          progress.phase == MirrorImportPhase.indexing) {
+        children.add(
+          LinearProgressIndicator(
+            value: progress.totalWorks <= 0
+                ? null
+                : (progress.works / progress.totalWorks).clamp(0.0, 1.0),
+          ),
+        );
+        children.add(const SizedBox(height: 4));
+        children.add(
+          Text(
+            displayText(
+              '${progress.works}/${progress.totalWorks} 部 · '
+              '${progress.juans} 卷',
+              context,
+            ),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        );
+      } else {
+        children.add(const LinearProgressIndicator());
+      }
+      if (progress.currentWork != null) {
+        children.add(const SizedBox(height: 2));
+        children.add(
+          Text(
+            displayText('目前：${progress.currentWork}', context),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        );
+      }
+      return children;
+    }
+
+    if (!pending) {
+      if (progress.totalWorks > 0) {
+        children.add(const SizedBox(height: 4));
+        children.add(
+          LinearProgressIndicator(
+            value: (progress.works / progress.totalWorks).clamp(0.0, 1.0),
+          ),
+        );
+        children.add(const SizedBox(height: 4));
+        children.add(
+          Text(
+            displayText(
+              '${progress.works}/${progress.totalWorks} 部 · '
+              '${progress.juans} 卷',
+              context,
+            ),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        );
+      } else if (progress.receivedBytes > 0 && progress.totalBytes > 0) {
+        children.add(const SizedBox(height: 4));
+        children.add(LinearProgressIndicator(value: progress.bytesFraction));
+        children.add(const SizedBox(height: 4));
+        children.add(
+          Text(
+            displayText(
+              '已下載 ${formatMirrorBytes(progress.receivedBytes)} / '
+              '${formatMirrorBytes(progress.totalBytes)}，繼續時會從這裡續傳',
+              context,
+            ),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        );
+      }
+    }
+    return children;
+  }
+
+  List<Widget> _buildCbetaProgress(BuildContext context) {
+    final manager = downloadManager;
+    final progress = manager.progress;
+    final children = <Widget>[];
+    if (manager.isDownloading && progress != null) {
+      children.add(
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                displayText(
+                  '下載中：${progress.completedItems}/${progress.totalItems} 部'
+                  ' · ${progress.completedJuans}/${progress.totalJuans} 卷',
+                  context,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              displayText(
+                '速度 ${formatDownloadSpeed(manager.downloadSpeedBytesPerSecond)}',
+                context,
+              ),
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+        ),
+      );
+      children.add(const SizedBox(height: 4));
+      children.add(LinearProgressIndicator(value: progress.fraction));
+      if (progress.currentWork != null) {
+        children.add(const SizedBox(height: 4));
+        children.add(
+          Text(
+            displayText(
+              progress.currentJuan == null
+                  ? '目前：${progress.currentWork}'
+                  : '目前：${progress.currentWork} 卷 ${progress.currentJuan}',
+              context,
+            ),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        );
+      }
+    } else {
+      if (manager.status == DownloadStatus.completed) {
+        children.add(
+          Text(
+            displayText('下載完成', context),
+            style: const TextStyle(color: Colors.green),
+          ),
+        );
+      } else if (manager.status == DownloadStatus.cancelled) {
+        children.add(Text(displayText('已暫停下載', context)));
+      } else if (manager.status == DownloadStatus.failed) {
+        children.add(
+          Text(
+            displayText('下載中斷，尚有未完成的經卷', context),
+            style: TextStyle(color: Theme.of(context).colorScheme.error),
+          ),
+        );
+      } else if (manager.hasQueuedItems) {
+        children.add(Text(displayText('有未完成的下載任務', context)));
+      } else {
+        children.add(Text(displayText('目前沒有下載任務', context)));
+      }
+      if (manager.status == DownloadStatus.failed &&
+          manager.failedWorkIds.isNotEmpty) {
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              displayText(
+                '失敗作品：${manager.failedWorkIds.take(12).join('、')}'
+                '${manager.failedWorkIds.length > 12 ? ' 等 ${manager.failedWorkIds.length} 部' : ''}',
+                context,
+              ),
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.error,
+              ),
+            ),
+          ),
+        );
+      }
+    }
+
+    final local = mirrorImporter.local;
+    if (local.importCompleted) {
+      children.add(const SizedBox(height: 6));
+      children.add(
+        Text(
+          displayText(
+            '全量鏡像 ${local.release.isEmpty ? '' : local.release}'
+            ' · ${local.importedWorks} 部 · ${local.importedJuans} 卷'
+            '${local.importedAt == null ? '' : ' · ${_formatDate(local.importedAt!)}'}',
+            context,
+          ),
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+      );
+      if (local.publicZipPath.isNotEmpty) {
+        children.add(
+          Text(
+            displayText('ZIP：${local.publicZipPath}', context),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        );
+      } else if (local.zipPath.isNotEmpty) {
+        children.add(
+          Text(
+            displayText('ZIP 暫存在私有目錄；匯出成功後會移到 Downloads', context),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        );
+      }
+    }
+    return children;
+  }
+
+  String _mirrorPhaseText(MirrorImportPhase phase) => switch (phase) {
+    MirrorImportPhase.idle => '從鏡像站一次下載全部佛典',
+    MirrorImportPhase.probing => '正在檢查鏡像...',
+    MirrorImportPhase.downloading => '正在下載鏡像...',
+    MirrorImportPhase.extracting => '正在解壓經文...',
+    MirrorImportPhase.indexing => '正在建立搜尋索引...',
+    MirrorImportPhase.exporting => '正在匯出壓縮檔...',
+    MirrorImportPhase.completed => '鏡像匯入完成',
+    MirrorImportPhase.failed => '鏡像下載失敗',
+    MirrorImportPhase.cancelled => '已暫停鏡像下載',
+  };
+
+  String _formatDate(DateTime value) {
+    final local = value.toLocal();
+    String two(int number) => number.toString().padLeft(2, '0');
+    return '${local.year}-${two(local.month)}-${two(local.day)}';
   }
 
   List<Widget> _buildUpdateSection(BuildContext context) {

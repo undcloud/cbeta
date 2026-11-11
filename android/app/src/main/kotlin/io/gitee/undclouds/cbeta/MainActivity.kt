@@ -3,12 +3,18 @@ package io.gitee.undclouds.cbeta
 import android.Manifest
 import android.app.PendingIntent
 import android.content.ClipData
+import android.content.ContentUris
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.os.StatFs
+import android.provider.MediaStore
 import android.provider.Settings
+import androidx.annotation.RequiresApi
 import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -16,13 +22,16 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileInputStream
+import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
     private val channelName = "xuefo/app_updater"
     private val downloadChannelName = "xuefo/download_notifications"
     private val lifecycleChannelName = "xuefo/app_lifecycle"
+    private val mirrorStorageChannelName = "xuefo/mirror_storage"
     private var downloadChannel: MethodChannel? = null
     private var pendingOpenDownloadManager = false
+    private val mirrorIoExecutor = Executors.newSingleThreadExecutor()
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -126,6 +135,92 @@ class MainActivity : FlutterActivity() {
         }
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
+            mirrorStorageChannelName,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getTempDirectory" -> {
+                    val directory = File(getExternalFilesDir(null) ?: filesDir, "mirror")
+                    if (!directory.exists()) directory.mkdirs()
+                    result.success(directory.absolutePath)
+                }
+                "getFreeBytes" -> {
+                    val path = call.argument<String>("path")
+                    try {
+                        val stat = StatFs(
+                            path?.takeIf { it.isNotEmpty() } ?: filesDir.absolutePath,
+                        )
+                        result.success(stat.availableBytes)
+                    } catch (error: Exception) {
+                        result.success(-1L)
+                    }
+                }
+                "exportToDownloads" -> {
+                    val sourcePath = call.argument<String>("sourcePath")
+                    val fileName = call.argument<String>("fileName")
+                        ?: "cbeta_html_full.zip"
+                    if (sourcePath.isNullOrBlank()) {
+                        result.error("invalid_source", "鏡像 ZIP 路徑為空", null)
+                    } else {
+                        mirrorIoExecutor.execute {
+                            try {
+                                val location = if (Build.VERSION.SDK_INT >=
+                                    Build.VERSION_CODES.Q
+                                ) {
+                                    exportToDownloads(File(sourcePath), fileName)
+                                } else {
+                                    null
+                                }
+                                runOnUiThread { result.success(location) }
+                            } catch (error: Exception) {
+                                runOnUiThread {
+                                    result.error(
+                                        "export_failed",
+                                        error.message ?: "匯出失敗",
+                                        null,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                "publicZipLocation" -> {
+                    val fileName = call.argument<String>("fileName")
+                        ?: "cbeta_html_full.zip"
+                    mirrorIoExecutor.execute {
+                        val location = if (Build.VERSION.SDK_INT >=
+                            Build.VERSION_CODES.Q
+                        ) {
+                            publicZipLocation(fileName)
+                        } else {
+                            null
+                        }
+                        runOnUiThread { result.success(location) }
+                    }
+                }
+                "copyPublicToPrivate" -> {
+                    val destPath = call.argument<String>("destPath")
+                    val fileName = call.argument<String>("fileName")
+                        ?: "cbeta_html_full.zip"
+                    if (destPath.isNullOrBlank()) {
+                        result.error("invalid_dest", "目標路徑為空", null)
+                    } else {
+                        mirrorIoExecutor.execute {
+                            val copied = if (Build.VERSION.SDK_INT >=
+                                Build.VERSION_CODES.Q
+                            ) {
+                                copyPublicToPrivate(destPath, fileName)
+                            } else {
+                                false
+                            }
+                            runOnUiThread { result.success(copied) }
+                        }
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
             lifecycleChannelName,
         ).setMethodCallHandler { call, result ->
             when (call.method) {
@@ -151,6 +246,100 @@ class MainActivity : FlutterActivity() {
             pendingOpenDownloadManager = true
         } else {
             channel.invokeMethod("openDownloadManager", null)
+        }
+    }
+
+    private val mirrorRelativePath = "${Environment.DIRECTORY_DOWNLOADS}/Fodian/"
+
+    /**
+     * Android 10+ 用 MediaStore 寫入公有 Downloads，不需要儲存權限。
+     * 同名舊檔會先刪除，避免每次匯入都留一份 500 MB 的副本。
+     */
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun exportToDownloads(source: File, fileName: String): String? {
+        if (!source.exists()) return null
+        val resolver = contentResolver
+        val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        resolver.delete(
+            collection,
+            "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND " +
+                "${MediaStore.MediaColumns.RELATIVE_PATH}=?",
+            arrayOf(fileName, mirrorRelativePath),
+        )
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, mirrorRelativePath)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(collection, values) ?: return null
+        try {
+            val output = resolver.openOutputStream(uri)
+                ?: throw IllegalStateException("無法寫入公有 Downloads")
+            output.use { out ->
+                source.inputStream().use { input ->
+                    input.copyTo(out, 64 * 1024)
+                }
+            }
+            resolver.update(
+                uri,
+                ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                },
+                null,
+                null,
+            )
+            return "${Environment.DIRECTORY_DOWNLOADS}/Fodian/$fileName"
+        } catch (error: Exception) {
+            resolver.delete(uri, null, null)
+            throw error
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun publicZipLocation(fileName: String): String? =
+        if (findPublicZipUri(fileName) != null) {
+            "${Environment.DIRECTORY_DOWNLOADS}/Fodian/$fileName"
+        } else {
+            null
+        }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun findPublicZipUri(fileName: String): Uri? {
+        val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        val selection =
+            "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND " +
+                "${MediaStore.MediaColumns.RELATIVE_PATH}=?"
+        contentResolver.query(
+            collection,
+            arrayOf(MediaStore.MediaColumns._ID),
+            selection,
+            arrayOf(fileName, mirrorRelativePath),
+            null,
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                return ContentUris.withAppendedId(collection, cursor.getLong(0))
+            }
+        }
+        return null
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun copyPublicToPrivate(destPath: String, fileName: String): Boolean {
+        val uri = findPublicZipUri(fileName) ?: return false
+        val dest = File(destPath)
+        dest.parentFile?.mkdirs()
+        return try {
+            val input = contentResolver.openInputStream(uri) ?: return false
+            input.use { source ->
+                dest.outputStream().use { out ->
+                    source.copyTo(out, 64 * 1024)
+                }
+            }
+            dest.exists() && dest.length() > 0
+        } catch (error: Exception) {
+            dest.delete()
+            false
         }
     }
 

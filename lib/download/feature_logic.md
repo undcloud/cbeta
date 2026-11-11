@@ -13,10 +13,12 @@
   全局单例标记，重复调用不会叠两层；
 - `showOfflineDataManager(context)`：通过 `common/app_nav.dart` 的
   `navigatorKey` 取 rootContext 再打开面板（通知栏入口用）；
-- `DownloadInfoButton`：首页工具栏图标，监听 `downloadManager`，
-  进行中显示进度角标，点击打开面板；
-- `DownloadStatusPanel`：总体进度、当前经卷、暂停/继续/取消、
-  完成后可跳转已下載經卷；`formatDownloadBytes` 供各处格式化字节。
+- `DownloadInfoButton`：首页工具栏图标，监听各下载 manager，
+  进行中闪烁，点击打开面板；
+- `DownloadStatusPanel`：CBETA 与镜像两种方式互斥，共用同一个
+  「經文下載」进度区（暂停/继续/进度条）；CBETA 显示部/卷与当前经卷，
+  镜像按下载字节或解压作品数显示，完成后显示镜像版本与 ZIP 位置。
+  `formatDownloadBytes` 供各处格式化字节。
 - 下载任务失败时显示失败作品编号，便于区分 CBETA 数据服务未提供的作品。
 - 面板底部（非网页版）有「搜尋索引（除錯）」：清除索引只删派生档
   `cbeta_sidx/`（经卷 `.json` 不动），重建是逐卷增量重建，用来量测索引

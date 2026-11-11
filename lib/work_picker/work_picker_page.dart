@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart' hide Text;
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -7,6 +8,8 @@ import '../cbeta_api_headers.dart';
 import '../dictionary/fodict_catalog.dart';
 import '../dictionary/fodict_download_manager.dart';
 import '../dictionary/fodict_service.dart';
+import '../mirror/mirror_importer.dart';
+import '../mirror/mirror_models.dart';
 import '../scripture/models.dart';
 import '../search/candidates.dart';
 import '../search/conversion.dart';
@@ -27,6 +30,8 @@ import '../widgets/display_text.dart';
 import 'creator_collation.dart';
 
 const int workPickerDictionaryTab = 1;
+
+enum _DownloadChoice { cbeta, mirror }
 
 Future<ScripturePassage?> showWorkPicker(
   BuildContext context, {
@@ -1576,19 +1581,45 @@ class _WorkPickerPageState extends State<WorkPickerPage>
     );
   }
 
-  void _toggleDownloadMode() {
-    final entering = !downloadMode;
-    setState(() {
-      downloadMode = entering;
-      if (!entering) selectedDownloadWorks.clear();
-    });
-    if (entering) _autoSelectCurrentView();
+  Future<void> _toggleDownloadMode() async {
+    if (downloadMode) {
+      setState(() {
+        downloadMode = false;
+        selectedDownloadWorks.clear();
+      });
+      return;
+    }
+    if (mirrorImporter.isImporting) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(displayText('下載全部經文進行中，請到「下載管理」查看', context))),
+      );
+      return;
+    }
+    final choice = await _chooseDownloadMode(context);
+    if (!mounted || choice == null) return;
+    if (choice == _DownloadChoice.mirror) {
+      unawaited(mirrorImporter.start());
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(displayText('已開始下載全部經文，可在「下載管理」暫停或查看進度', context)),
+        ),
+      );
+      return;
+    }
+    setState(() => downloadMode = true);
+    _autoSelectCurrentView();
   }
 
   Future<void> _confirmDownload(BuildContext context) async {
     if (updateManager.isUpdating) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(displayText('更新進行中，完成後再下載經文', context))),
+      );
+      return;
+    }
+    if (mirrorImporter.isImporting) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(displayText('鏡像下載進行中，請到「下載管理」查看', context))),
       );
       return;
     }
@@ -1634,6 +1665,115 @@ class _WorkPickerPageState extends State<WorkPickerPage>
         content: Text(displayText('已加入下載隊列，共 ${groups.length} 部', context)),
       ),
     );
+  }
+
+  /// 點下載時先選方式；CBETA 進入原本的勾選流程，鏡像則下載全部。
+  Future<_DownloadChoice?> _chooseDownloadMode(BuildContext context) async {
+    if (kIsWeb) return _DownloadChoice.cbeta;
+    final probe = await _probeMirrorWithSpinner(context);
+    if (!context.mounted) return null;
+
+    final mirrorUsable = probe != null && probe.usable;
+    final upToDate = mirrorUsable && mirrorImporter.isUpToDateFor(probe);
+    final mirrorReady = mirrorUsable && !upToDate;
+    final release = mirrorImporter.release.isEmpty
+        ? '全量鏡像'
+        : '鏡像 ${mirrorImporter.release}';
+    final String mirrorDescription;
+    if (!mirrorUsable) {
+      mirrorDescription = probe?.error ?? '鏡像暫不可用，請改用 CBETA 按部下載。';
+    } else if (upToDate) {
+      final label = mirrorImporter.release.isEmpty
+          ? '全量鏡像'
+          : mirrorImporter.release;
+      mirrorDescription = '本機已匯入 $label，無需重複下載。';
+    } else {
+      mirrorDescription =
+          '$release · ${formatMirrorBytes(probe.size)}\n'
+          '從鏡像站一次取得全部佛典（約 4,900 部、22,000 卷），'
+          '不受本次選擇數量影響。';
+    }
+
+    return showDialog<_DownloadChoice>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(displayText('選擇下載方式', dialogContext)),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                displayText('CBETA 按部下載', dialogContext),
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                displayText(
+                  '進入勾選模式，按以前的流程只下載你勾選的部與卷，'
+                  '由 CBETA 官方站逐部取得。',
+                  dialogContext,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                displayText('一鍵下載全部', dialogContext),
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
+              Text(displayText(mirrorDescription, dialogContext)),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: Text(displayText('取消', dialogContext)),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.of(dialogContext).pop(_DownloadChoice.cbeta),
+            child: Text(displayText('CBETA 按部', dialogContext)),
+          ),
+          FilledButton(
+            onPressed: mirrorReady
+                ? () => Navigator.of(dialogContext).pop(_DownloadChoice.mirror)
+                : null,
+            child: Text(displayText('一鍵下載全部', dialogContext)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<MirrorProbe?> _probeMirrorWithSpinner(BuildContext context) async {
+    final navigator = Navigator.of(context, rootNavigator: true);
+    final dialog = showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          content: Row(
+            children: [
+              const SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              ),
+              const SizedBox(width: 16),
+              Expanded(child: Text(displayText('正在檢查鏡像...', dialogContext))),
+            ],
+          ),
+        ),
+      ),
+    );
+    try {
+      return await mirrorImporter.probe();
+    } finally {
+      if (navigator.canPop()) navigator.pop();
+      await dialog;
+    }
   }
 
   String get _dictionaryCountScope => _fodictBaseDir ?? '';

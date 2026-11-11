@@ -103,6 +103,8 @@ void main() {
 
     await tester.tap(find.byTooltip('下載'));
     await tester.pumpAndSettle();
+    await tester.tap(find.text('CBETA 按部'));
+    await tester.pumpAndSettle();
     expect(find.textContaining('已選 3 部'), findsOneWidget);
     expect(find.textContaining('本地缺少 3 部'), findsOneWidget);
     final checkboxes = tester.widgetList<Checkbox>(find.byType(Checkbox));
@@ -131,6 +133,8 @@ void main() {
     await tester.tap(find.byTooltip('選擇佛經'));
     await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('下載'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('CBETA 按部'));
     await tester.pumpAndSettle();
     expect(find.textContaining('已選 3 部'), findsOneWidget);
     expect(find.byTooltip('取消下載模式'), findsOneWidget);

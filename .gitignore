@@ -62,3 +62,11 @@ tool/cbeta_transfer/
 tool/image_tools/
 assets/cbeta_catalog
 /cbeta-fodict/
+
+# Server runtime data: mirror ZIP, stats DB, feedback (may contain contacts)
+/server/*.zip
+/server/mirror_stats.db
+/server/mirror_stats.db-*
+/server/feedback_data.json
+/server/__pycache__/
+/server/venv/

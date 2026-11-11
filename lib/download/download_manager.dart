@@ -572,6 +572,17 @@ class DownloadManager extends ChangeNotifier {
     String work,
     Iterable<CachedScriptureVolume> volumes, {
     String? release,
+  }) => importVolumes(work, volumes, release: release);
+
+  /// 寫入一批經卷；鏡像匯入時把 [persist] 與 [flushIndex] 關掉，
+  /// 每數十部作品再呼叫 [flushImportProgress]，避免每部都重寫整份
+  /// `versions.json`（數萬卷時會變成 O(n²)）。
+  Future<int> importVolumes(
+    String work,
+    Iterable<CachedScriptureVolume> volumes, {
+    String? release,
+    bool persist = true,
+    bool flushIndex = true,
   }) async {
     final list = volumes.toList();
     if (list.isEmpty) return 0;
@@ -594,12 +605,22 @@ class DownloadManager extends ChangeNotifier {
       }
     }
     if (stored > 0) {
-      await offlineIndexQueue.flush();
-      await _saveVersions();
-      await _saveWorkJuansIfDirty();
+      if (flushIndex) await offlineIndexQueue.flush();
+      if (persist) {
+        await _saveVersions();
+        await _saveWorkJuansIfDirty();
+      }
       notifyListeners();
     }
     return stored;
+  }
+
+  /// 鏡像匯入的階段性落盤：索引隊列、`versions.json`、`work_juans.json`。
+  Future<void> flushImportProgress() async {
+    await offlineIndexQueue.flush();
+    await _saveVersions();
+    await _saveWorkJuansIfDirty();
+    notifyListeners();
   }
 
   void cancelDownload() {

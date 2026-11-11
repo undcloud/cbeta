@@ -13,6 +13,7 @@ import 'download/download_notifications.dart';
 import 'download/download_status_ui.dart';
 import 'download/update_manager.dart';
 import 'home/home_page.dart';
+import 'mirror/mirror_importer.dart';
 import 'scripture/index_update_notification.dart';
 import 'scripture/index_update_service.dart';
 import 'search/conversion.dart';
@@ -61,11 +62,16 @@ Future<void> main() async {
   await downloadManager.initialize();
   await updateManager.initialize();
   await fodictDownloadManager.initialize();
+  await mirrorImporter.initialize();
   await indexUpdateService.initialize();
   indexUpdateService.isBusy = () =>
-      downloadManager.isDownloading || updateManager.isUpdating;
+      downloadManager.isDownloading ||
+      updateManager.isUpdating ||
+      mirrorImporter.isImporting;
   indexUpdateNotification.otherTaskActive = () =>
-      downloadManager.isDownloading || updateManager.isUpdating;
+      downloadManager.isDownloading ||
+      updateManager.isUpdating ||
+      mirrorImporter.isImporting;
   indexUpdateNotification.initialize();
   downloadNotifications
     ..initialize()
