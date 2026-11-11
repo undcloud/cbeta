@@ -37,6 +37,27 @@ bash deploy.sh --run-only
 > **必須只有 1 個 worker**：帶寬令牌桶與併發計數都在進程內存中，多 worker 會各自計數。
 > 請求併發由 gthread 線程解決，見 `deploy.sh` 的 `-w 1 --worker-class gthread`。
 
+### 更新已部署的服務
+
+```bash
+cd /home/cbeta/server
+sudo bash deploy.sh
+```
+
+腳本結尾會 `systemctl enable` 並 `systemctl restart cbeta-feedback`，
+所以已在運行的舊版本也會被替換，不需要手動先 stop。
+
+若端口 5000 被**手工啟動的** `app.py` 或舊 gunicorn 佔用，腳本會直接
+報錯並列出佔用進程；先停止它再部署：
+
+```bash
+sudo systemctl stop cbeta-feedback 2>/dev/null || true
+pkill -f 'python.*app.py'
+ss -ltnp 'sport = :5000'
+```
+
+`bash deploy.sh --run-only` 的前台進程也要先 Ctrl+C 停止，否則同樣會佔用端口。
+
 ## 1. 上傳鏡像文件
 
 ```bash

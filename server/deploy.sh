@@ -71,6 +71,18 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# 手工启动的 app.py / 旧 gunicorn 会占着端口，导致 systemd 服务起不来。
+if command -v ss >/dev/null 2>&1 &&
+    ss -ltn "sport = :${PORT}" 2>/dev/null | grep -q LISTEN &&
+    ! systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+  echo "错误：端口 ${PORT} 已被其他程序占用，systemd 服务无法启动。"
+  echo "     请先停止手工启动的 app.py 或旧进程，例如："
+  echo "       pkill -f 'python.*app.py'"
+  echo "     当前占用："
+  ss -ltnp "sport = :${PORT}" 2>/dev/null || true
+  exit 1
+fi
+
 echo "==> 生成 systemd 服务：${SERVICE_NAME}"
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
@@ -96,7 +108,9 @@ EOF
 
 echo "==> 重载 systemd 并启动服务"
 systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}"
+systemctl enable "${SERVICE_NAME}"
+# 已运行时也必须重启，否则部署后仍在跑旧代码/旧环境变量。
+systemctl restart "${SERVICE_NAME}"
 
 sleep 2
 systemctl --no-pager --lines=0 status "${SERVICE_NAME}" || true
